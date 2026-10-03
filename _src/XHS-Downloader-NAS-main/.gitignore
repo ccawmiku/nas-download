@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Runtime data mounted on NAS
+auto/
+state/
+queue/
+Volume/
+volumes/
+*.sqlite3
+*.sqlite
+secrets.json
+processed.json
+
+# Local editor files
+.idea/
+.vscode/
+.env

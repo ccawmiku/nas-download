@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  xhs-api:
+    image: ghcr.io/joeanamier/xhs-downloader:2.7
+    container_name: xhs-api
+    ports:
+      - "13001:5556"
+    volumes:
+      - /volume1/docker/xhs-downloader/volumes:/app/Volume
+      - /volume1/se/小红书:/xhs
+    tty: true
+    stdin_open: true
+    command: bash -lc "python main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
+    restart: unless-stopped
+
+  xhs-auto-worker:
+    image: ${XHS_AUTO_WORKER_IMAGE:-ghcr.io/ccawmiku/xhs-downloader-nas-worker}:${XHS_AUTO_WORKER_VERSION:-v1.3.1}
+    container_name: xhs-auto-worker
+    depends_on:
+      - xhs-api
+    working_dir: /app
+    ports:
+      - "13003:8080"
+    volumes:
+      - /volume1/docker/xhs-downloader/auto/config:/config
+      - /volume1/docker/xhs-downloader/auto/queue:/queue
+      - /volume1/docker/xhs-downloader/auto/state:/state
+      - /volume1/docker/xhs-downloader/volumes:/xhs-volume
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    command: python /app/xhs_auto_worker.py --config /config/config.json
+    restart: unless-stopped

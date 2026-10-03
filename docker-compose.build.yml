@@ -1,0 +1,12 @@
+services:
+  console:
+    build:
+      context: .
+      dockerfile: _integrated/Dockerfile
+      args:
+        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.0}
+  telegram-worker:
+    build:
+      context: services/telegram
+      args:
+        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.0}

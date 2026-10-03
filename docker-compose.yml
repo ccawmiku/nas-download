@@ -1,0 +1,64 @@
+name: nas-download
+services:
+  xhs-api:
+    image: ghcr.io/joeanamier/xhs-downloader:2.7
+    container_name: nas-download-xhs-api
+    ports:
+    - 13001:5556
+    volumes:
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/volumes:/app/Volume
+    - /volume1/se-p/小红书:/xhs
+    tty: true
+    stdin_open: true
+    command: bash -lc "python main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
+    restart: unless-stopped
+    stop_grace_period: 45s
+  console:
+    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.0}
+    container_name: nas-download
+    environment:
+      TELEGRAM_HOST: telegram-worker
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set the private internal API token}
+    depends_on:
+    - xhs-api
+    - telegram-worker
+    ports:
+    - 14001:14001
+    volumes:
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/config:/config/xhs
+    - /volume1/se-v/x-v:/downloads/x/videos
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/queue:/queue/xhs
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/douyin/f2/database:/state/douyin/f2
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/pixiv/config:/config/pixiv
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/config:/config/x
+    - /volume1/douyin:/douyin
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/volumes:/xhs-volume
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/douyin/config:/config/douyin
+    - /volume1/se-p/pixiv:/downloads/pixiv
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/downloads-metadata:/downloads/x/downloads-metadata
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/state:/state/xhs
+    - /volume1/se-p/小红书:/xhs
+    - /volume1/se-p/x-p:/downloads/x/images
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/pixiv/state:/state/pixiv
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/state:/state/x
+    restart: unless-stopped
+    stop_grace_period: 45s
+  telegram-worker:
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.0}
+    container_name: nas-download-telegram
+    environment:
+      ADMIN_PASSWORD: ${TELEGRAM_ADMIN_PASSWORD:-}
+      PUBLIC_BASE_PATH: /telegram
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set the private internal API token}
+      TZ: Asia/Shanghai
+    ports:
+    - 12010:8000
+    volumes:
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/config:/config
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/download-root:/downloads
+    - /volume1/se-v/tele-files:/downloads/files
+    - /volume1/se-p/tele-p:/downloads/images
+    - /volume1/se-v/tele-v:/downloads/videos
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/sessions:/sessions
+    restart: unless-stopped
+    stop_grace_period: 45s

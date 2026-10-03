@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta name="app-base" content="{{ base_path }}" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>媒体下载 Bot 控制台</title>
+    <style>
+      :root {
+        --bg: #f7f8fa;
+        --panel: #ffffff;
+        --text: #17202a;
+        --muted: #667085;
+        --line: #d9dee7;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --danger: #b42318;
+        --ok: #15803d;
+        --warn: #a16207;
+        --shadow: 0 12px 28px rgba(18, 27, 38, 0.08);
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .bar {
+        width: min(1560px, calc(100% - 40px));
+        margin: 0 auto;
+        min-height: 72px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.2;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+
+      main {
+        width: min(1560px, calc(100% - 40px));
+        margin: 20px auto 40px;
+        display: grid;
+        gap: 16px;
+      }
+
+      .status-row {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .panel, .metric {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+      }
+
+      .metric {
+        min-height: 104px;
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0;
+      }
+
+      .value {
+        font-size: 22px;
+        font-weight: 750;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(300px, 320px) minmax(0, 1fr);
+        gap: 16px;
+        align-items: start;
+      }
+
+      .workspace-panel { min-width: 0; overflow: hidden; }
+
+      .panel h2 {
+        margin: 0;
+        padding: 18px 18px 0;
+        font-size: 16px;
+        letter-spacing: 0;
+      }
+
+      form {
+        display: grid;
+        gap: 12px;
+        padding: 16px 18px 18px;
+      }
+
+      .field {
+        display: grid;
+        gap: 6px;
+      }
+
+      .field span {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      input {
+        width: 100%;
+        height: 38px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 10px;
+        font: inherit;
+        background: #fff;
+        color: var(--text);
+      }
+
+      input:focus {
+        outline: 2px solid rgba(15, 118, 110, 0.18);
+        border-color: var(--accent);
+      }
+
+      .actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        min-height: 38px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 13px;
+        font: inherit;
+        font-weight: 700;
+        background: #fff;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: white;
+      }
+
+      button.primary:hover { background: var(--accent-strong); }
+      button.danger { color: var(--danger); }
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+      button.small { min-height: 30px; padding: 0 9px; font-size: 12px; }
+      .subline { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+      .transfer { line-height: 1.4; }
+      .progress-label { margin-top: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+      .tabs {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--line);
+        padding: 12px 14px 0;
+      }
+
+      .tab-list, .tab-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+
+      .tab-actions {
+        padding-bottom: 8px;
+      }
+
+      .tab {
+        border-bottom-left-radius: 0;
+        border-bottom-right-radius: 0;
+        border-bottom-color: transparent;
+      }
+
+      .tab.active {
+        color: var(--accent);
+        border-color: var(--line);
+        border-bottom-color: var(--panel);
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+      }
+
+      .downloads-table { min-width: 920px; }
+      .files-table { min-width: 760px; }
+      .downloads-table .col-preview, .files-table .col-preview { width: 132px; }
+      .downloads-table .col-status { width: 82px; }
+      .downloads-table .col-progress { width: 158px; }
+      .downloads-table .col-transfer { width: 168px; }
+      .downloads-table .col-time, .files-table .col-time { width: 132px; }
+      .downloads-table .col-action, .files-table .col-action { width: 78px; }
+      .files-table .col-type { width: 92px; }
+      .files-table .col-size { width: 118px; }
+
+      tbody tr {
+        height: 96px;
+        transition: background-color 120ms ease;
+      }
+
+      tbody tr:hover { background: #f8fafc; }
+
+      th, td {
+        padding: 12px 12px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: middle;
+        font-size: 14px;
+      }
+
+      th {
+        height: 48px;
+        background: #f9fafb;
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        border-radius: 999px;
+        padding: 0 9px;
+        font-size: 12px;
+        font-weight: 750;
+        background: #eef2f6;
+        color: #344054;
+        white-space: nowrap;
+      }
+
+      .badge.complete { background: #dcfce7; color: var(--ok); }
+      .badge.downloading, .badge.queued, .badge.retrying, .badge.verifying { background: #fef3c7; color: var(--warn); }
+      .badge.paused { background: #e0e7ff; color: #4338ca; }
+      .badge.failed, .badge.interrupted, .badge.cancelled { background: #fee4e2; color: var(--danger); }
+      .badge.running { background: #ccfbf1; color: var(--accent-strong); }
+
+      .progress {
+        width: 100%;
+        max-width: 142px;
+        height: 8px;
+        background: #e5e7eb;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .progress div {
+        height: 100%;
+        background: var(--accent);
+      }
+
+      .hidden { display: none !important; }
+      .muted { color: var(--muted); }
+      .error { color: var(--danger); }
+      .file-name {
+        display: -webkit-box;
+        max-width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        overflow: hidden;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
+        line-height: 1.45;
+      }
+
+      .preview-frame {
+        position: relative;
+        width: 112px;
+        height: 68px;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #eef2f6;
+        color: var(--muted);
+        text-decoration: none;
+      }
+
+      .preview-image {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .preview-fallback { font-size: 24px; }
+
+      .timestamp {
+        display: grid;
+        gap: 3px;
+        white-space: nowrap;
+        line-height: 1.25;
+      }
+
+      .cell-actions { white-space: nowrap; }
+
+      .login-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgba(247, 248, 250, 0.92);
+      }
+
+      .login-box {
+        width: min(380px, 100%);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        padding: 20px;
+        display: grid;
+        gap: 14px;
+      }
+
+      .login-box h2 {
+        margin: 0;
+        padding: 0;
+        font-size: 18px;
+      }
+
+      .log-list {
+        height: 430px;
+        overflow: auto;
+        padding: 12px 14px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .log-row {
+        display: grid;
+        grid-template-columns: 165px 68px minmax(0, 1fr);
+        gap: 10px;
+        padding: 6px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .log-message {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      @media (max-width: 1080px) {
+        .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .grid { grid-template-columns: 1fr; }
+      }
+
+      @media (max-width: 760px) {
+        .tabs { align-items: stretch; flex-direction: column; }
+        .tab-actions { padding-bottom: 10px; }
+      }
+
+      @media (max-width: 560px) {
+        .bar { align-items: flex-start; flex-direction: column; padding: 16px 0; }
+        .status-row { grid-template-columns: 1fr; }
+        main, .bar { width: calc(100% - 20px); }
+        .preview-frame { width: 96px; height: 58px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loginOverlay" class="login-overlay hidden">
+      <form id="loginForm" class="login-box">
+        <h2>登录控制台</h2>
+        <label class="field">
+          <span>控制台密码</span>
+          <input id="loginPassword" type="password" autocomplete="current-password" />
+        </label>
+        <button class="primary" type="submit">登录</button>
+        <div id="bootstrapHint" class="muted hidden">首次启动请使用容器日志中的“一次性初始化口令”登录，然后立即设置控制台密码。</div>
+        <div id="loginMessage" class="muted"></div>
+      </form>
+    </div>
+
+    <header>
+      <div class="bar">
+        <div class="brand">
+          <h1>媒体下载 Bot 控制台</h1>
+          <span class="badge">v{{ version }}</span>
+        </div>
+        <div class="actions">
+          <button id="startBtn" class="primary">启动</button>
+          <button id="restartBtn">重启</button>
+          <button id="stopBtn" class="danger">停止</button>
+          <button id="resumeBtn">恢复下载</button>
+          <button id="limitOffBtn">取消限速</button>
+          <button id="logoutBtn">退出</button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="status-row">
+        <div class="metric">
+          <div class="label">Bot 状态</div>
+          <div id="botStatus" class="value">加载中</div>
+        </div>
+        <div class="metric">
+          <div class="label">用户名</div>
+          <div id="botUser" class="value muted">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">下载记录</div>
+          <div id="downloadCount" class="value">0</div>
+        </div>
+        <div class="metric">
+          <div class="label">文件数量</div>
+          <div id="fileCount" class="value">0</div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel settings-panel">
+          <h2>设置</h2>
+          <form id="settingsForm">
+            <label class="field">
+              <span>API ID</span>
+              <input id="apiId" name="api_id" inputmode="numeric" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>API Hash</span>
+              <input id="apiHash" name="api_hash" autocomplete="off" placeholder="留空表示保留已保存的值" />
+            </label>
+            <label class="field">
+              <span>Bot Token</span>
+              <input id="botToken" name="bot_token" autocomplete="off" placeholder="留空表示保留已保存的值" />
+            </label>
+            <label class="field">
+              <span>允许用户 ID</span>
+              <input id="allowedUserIds" name="allowed_user_ids" autocomplete="off" placeholder="多个 ID 用逗号分隔" />
+            </label>
+            <label class="field">
+              <span>管理员用户 ID</span>
+              <input id="adminUserIds" name="admin_user_ids" autocomplete="off" placeholder="留空时允许用户均为管理员" />
+            </label>
+            <label class="field">
+              <span>控制台密码</span>
+              <input id="adminPassword" name="admin_password" type="password" autocomplete="new-password" placeholder="留空表示不修改密码" />
+            </label>
+            <label class="field">
+              <span>下载根目录</span>
+              <input id="downloadDir" name="download_dir" />
+            </label>
+            <label class="field">
+              <span>图片目录</span>
+              <input id="imageDownloadDir" name="image_download_dir" />
+            </label>
+            <label class="field">
+              <span>视频目录</span>
+              <input id="videoDownloadDir" name="video_download_dir" />
+            </label>
+            <label class="field">
+              <span>其他文件目录</span>
+              <input id="fileDownloadDir" name="file_download_dir" />
+            </label>
+            <label class="field">
+              <span>Session 目录</span>
+              <input id="sessionDir" name="session_dir" />
+            </label>
+            <label class="field">
+              <span>Session 名称</span>
+              <input id="sessionName" name="session_name" pattern="[A-Za-z0-9_.-]+" />
+            </label>
+            <label class="field">
+              <span>进度更新间隔秒数</span>
+              <input id="progressInterval" name="progress_interval_seconds" type="number" min="1" step="1" />
+            </label>
+            <label class="field">
+              <span>进度更新百分比步长</span>
+              <input id="progressStep" name="progress_percent_step" type="number" min="1" max="100" step="1" />
+            </label>
+            <label class="field">
+              <span>自动重试次数</span>
+              <input id="maxAutoRetries" name="max_auto_retries" type="number" min="0" max="10" step="1" />
+            </label>
+            <label class="field">
+              <span>最大排队数量</span>
+              <input id="queueMaxsize" name="queue_maxsize" type="number" min="1" max="1000" step="1" />
+            </label>
+            <label class="field">
+              <span>历史落盘间隔秒数</span>
+              <input id="historyFlushInterval" name="history_flush_interval_seconds" type="number" min="0.5" max="60" step="0.5" />
+            </label>
+            <div class="actions">
+              <button class="primary" type="submit">保存设置</button>
+            </div>
+            <div id="formMessage" class="muted"></div>
+          </form>
+        </div>
+
+        <div class="panel workspace-panel">
+          <div class="tabs">
+            <div class="tab-list">
+              <button class="tab active" data-tab="downloads" type="button">下载记录</button>
+              <button class="tab" data-tab="files" type="button">文件</button>
+              <button class="tab" data-tab="logs" type="button">日志</button>
+            </div>
+            <div class="tab-actions">
+              <button id="retryAllBtn" class="small" type="button">重试全部失败</button>
+              <button id="cleanupBtn" class="small danger" type="button">清理失败/中断记录</button>
+            </div>
+          </div>
+
+          <div id="downloadsTab" class="table-wrap">
+            <table class="downloads-table">
+              <colgroup>
+                <col class="col-preview" />
+                <col class="col-status" />
+                <col class="col-file" />
+                <col class="col-progress" />
+                <col class="col-transfer" />
+                <col class="col-time" />
+                <col class="col-action" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>预览</th>
+                  <th>状态</th>
+                  <th>文件</th>
+                  <th>进度</th>
+                  <th>传输</th>
+                  <th>更新时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="downloadsBody"></tbody>
+            </table>
+          </div>
+
+          <div id="filesTab" class="table-wrap hidden">
+            <table class="files-table">
+              <colgroup>
+                <col class="col-preview" />
+                <col class="col-file" />
+                <col class="col-type" />
+                <col class="col-size" />
+                <col class="col-time" />
+                <col class="col-action" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>预览</th>
+                  <th>文件</th>
+                  <th>类型</th>
+                  <th>大小</th>
+                  <th>修改时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="filesBody"></tbody>
+            </table>
+          </div>
+
+          <div id="logsTab" class="hidden">
+            <div id="logsBody" class="log-list"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="{{ base_path }}/static/app.js?v={{ version }}"></script>
+  </body>
+</html>
