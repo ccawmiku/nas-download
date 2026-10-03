@@ -14,6 +14,9 @@ for source in "$OLD_PLATFORMS" "$OLD_TELEGRAM"; do
 done
 test ! -e "$NEW/platforms" && test ! -e "$NEW/telegram"
 test -f "$NEW/compose.yaml" && test -f "$NEW/.env"
+# DSM inherited ACLs require the parent to remain traversable by the bot user.
+chmod 755 "$NEW"
+chmod 600 "$NEW/.env"
 "$DOCKER" image inspect ghcr.io/ccawmiku/nas-download:v3.0.0 ghcr.io/ccawmiku/nas-download-telegram:v3.0.0 >/dev/null
 mkdir -p "$BACKUP"
 "$DOCKER" inspect nas-auto-download xhs-api telethon-media-bot > "$BACKUP/container-inspect.json"
