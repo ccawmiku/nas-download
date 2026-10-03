@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  x-auto-downloader:
+    image: ghcr.io/ccawmiku/x-auto-download-nas:1.0.3
+    container_name: x-auto-downloader
+    ports:
+      - "13003:8080"
+    volumes:
+      - /volume2/docker/x-auto-download/config:/config
+      - /volume2/docker/x-auto-download/state:/state
+      - /volume2/docker/x-auto-download/downloads-metadata:/downloads
+      - /volume2/docker/x-auto-download/images:/downloads/images
+      - /volume2/docker/x-auto-download/videos:/downloads/videos
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    command: >
+      sh -c "python /app/x_auto_worker.py --config /config/config.json"
+    restart: unless-stopped

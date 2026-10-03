@@ -12,3 +12,5 @@ frontend/dist/
 *.db
 *.log
 deploy/private/
+*.tsbuildinfo
+.pytest_cache/
