@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+frontend/dist/
+.runtime/
+*.session*
+*.sqlite*
+*.db
+*.log
+deploy/private/
