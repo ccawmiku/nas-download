@@ -16,6 +16,11 @@ test ! -e "$NEW/platforms" && test ! -e "$NEW/telegram"
 test -f "$NEW/compose.yaml" && test -f "$NEW/.env"
 # DSM inherited ACLs require the parent to remain traversable by the bot user.
 chmod 755 "$NEW"
+# DSM recalculates inherited ACLs when directories move. Keep the original
+# Docker parent ACL so existing container users retain session write access.
+if test -x /usr/syno/bin/synoacltool; then
+  /usr/syno/bin/synoacltool -enforce-inherit "$NEW" >/dev/null
+fi
 chmod 600 "$NEW/.env"
 "$DOCKER" image inspect ghcr.io/ccawmiku/nas-download:v3.0.0 ghcr.io/ccawmiku/nas-download-telegram:v3.0.0 >/dev/null
 mkdir -p "$BACKUP"
