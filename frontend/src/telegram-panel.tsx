@@ -14,7 +14,7 @@ const activeStatuses = new Set(["queued", "downloading", "paused", "retrying", "
 function size(value: number) { return value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(2)} GiB` : `${(value / 1024 ** 2).toFixed(1)} MiB`; }
 
 export function TelegramPanel({ service }: { service: Service }) {
-  const [authenticated, setAuthenticated] = useState(false);
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [password, setPassword] = useState("");
   const [state, setState] = useState<State | null>(null);
   const [error, setError] = useState("");
@@ -51,7 +51,7 @@ export function TelegramPanel({ service }: { service: Service }) {
   return <div className="page-body platform-page">
     <div className="page-intro"><div><span className="section-kicker">平台管理 / Telegram</span><h2>Telegram 下载</h2><p>发送图片、视频或文件到现有机器人，下载任务会显示在这里。</p></div><a className="secondary-button" href={service.path} target="_blank" rel="noreferrer">完整设置</a></div>
     {error && <div className="platform-alert" role="alert">{error}<button onClick={() => { setError(""); refresh(); }}>刷新</button></div>}
-    {!authenticated ? <section className="card telegram-login"><LockKeyhole size={30} /><h3>登录 Telegram 控制台</h3><p>使用原来 Telegram 控制台的密码。</p><form onSubmit={async event => { event.preventDefault(); await action("api/auth/login", { password }); setPassword(""); }}><input aria-label="控制台密码" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required /><button className="primary-button" disabled={busy}>登录</button></form></section> : <>
+    {authenticated === false ? <section className="card telegram-login"><LockKeyhole size={30} /><h3>登录 Telegram 控制台</h3><p>使用原来 Telegram 控制台的密码。</p><form onSubmit={async event => { event.preventDefault(); await action("api/auth/login", { password }); setPassword(""); }}><input aria-label="控制台密码" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} required /><button className="primary-button" disabled={busy}>登录</button></form></section> : authenticated === null ? <section className="card platform-info">正在载入 Telegram…</section> : <>
       <section className="platform-hero card"><div className="platform-hero-title"><div className="service-avatar large">TG</div><div><span className="section-kicker">连接状态</span><h3>{bot?.running ? "机器人已连接" : "机器人未连接"}</h3><p>{current?.file_name || "等待新的媒体消息"}</p></div></div><div className="platform-actions">
         <button className="primary-button" disabled={busy} onClick={() => action("api/bot/start")}><Play size={14} />启动</button>
         <button className="secondary-button" disabled={busy} onClick={() => action("api/bot/stop")}><Pause size={14} />停止</button>

@@ -22,7 +22,8 @@ if test -x /usr/syno/bin/synoacltool; then
   /usr/syno/bin/synoacltool -enforce-inherit "$NEW" >/dev/null
 fi
 chmod 600 "$NEW/.env"
-"$DOCKER" image inspect ghcr.io/ccawmiku/nas-download:v3.0.0 ghcr.io/ccawmiku/nas-download-telegram:v3.0.0 >/dev/null
+images=$("$DOCKER" compose -f "$NEW/compose.yaml" --env-file "$NEW/.env" config --images)
+while IFS= read -r image; do "$DOCKER" image inspect "$image" >/dev/null; done <<< "$images"
 mkdir -p "$BACKUP"
 "$DOCKER" inspect nas-auto-download xhs-api telethon-media-bot > "$BACKUP/container-inspect.json"
 chmod 600 "$BACKUP/container-inspect.json"

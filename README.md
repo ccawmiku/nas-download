@@ -2,16 +2,17 @@
 
 统一管理小红书、X、Pixiv、抖音和 Telegram 的 NAS 下载控制台。
 
-当前版本：`v3.0.0`。项目由原 NAS 下载集成服务 v2.0.2 和 Telegram v1.9 迁移而来，保留已有平台实现、配置与状态格式。
+当前版本：`v3.0.1`。项目由原 NAS 下载集成服务 v2.0.2 和 Telegram v1.9 迁移而来，保留已有平台实现、配置与状态格式。
 
 ## 功能
 
 - 五个平台的服务状态、运行任务与日志。
-- Telegram 原控制台密码登录，下载队列、进度、速率、ETA、历史和媒体预览。
+- Telegram 直接访问，下载队列、进度、速率、ETA、历史和媒体预览。
 - Telegram 启动、停止、重启、暂停、恢复、限速、取消与失败重试。
 - 原有小红书链接队列、X 点赞、Pixiv 收藏和抖音 f2 下载。
 - 平台 worker 退出后的退避重启，流式媒体代理及视频 Range 请求。
 - Telegram 独立容器，单实例复用现有 session，集成 cryptg 加速。
+- 小红书保留自动重试，页面只展示失败记录与重试状态。
 
 ## 访问
 
@@ -31,8 +32,8 @@
 准备私有 `.env`，可参考 `.env.example`。发布后的两个镜像分别为：
 
 ```text
-ghcr.io/ccawmiku/nas-download:v3.0.0
-ghcr.io/ccawmiku/nas-download-telegram:v3.0.0
+ghcr.io/ccawmiku/nas-download:v3.0.1
+ghcr.io/ccawmiku/nas-download-telegram:v3.0.1
 ```
 
 ```bash

@@ -71,6 +71,21 @@ def test_login_is_rate_limited(monkeypatch, tmp_path):
     assert limited.status_code == 429
 
 
+def test_passwordless_panel_allows_existing_state_and_controls_but_protects_internal_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("PANEL_AUTH_REQUIRED", "false")
+    main = load_main(monkeypatch, tmp_path)
+    with TestClient(main.app) as client:
+        assert client.get("/api/auth/status").json() == {
+            "password_enabled": False, "bootstrap_required": False, "authenticated": True,
+        }
+        assert client.get("/api/state").status_code == 200
+        assert client.get("/api/logs").status_code == 200
+        assert client.post("/api/controls/pause").status_code == 200
+        assert client.post("/api/controls/resume").status_code == 200
+        assert client.get("/internal/status").status_code == 401
+        assert not client.cookies.get(main.SESSION_COOKIE)
+
+
 def test_settings_validation_rejects_relative_paths(monkeypatch, tmp_path):
     main = load_main(monkeypatch, tmp_path)
     with TestClient(main.app) as client:

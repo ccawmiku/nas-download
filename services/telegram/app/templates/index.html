@@ -435,7 +435,7 @@
           <button id="stopBtn" class="danger">停止</button>
           <button id="resumeBtn">恢复下载</button>
           <button id="limitOffBtn">取消限速</button>
-          <button id="logoutBtn">退出</button>
+          <button id="logoutBtn" {% if not panel_auth_required %}class="hidden"{% endif %}>退出</button>
         </div>
       </div>
     </header>
@@ -484,7 +484,7 @@
               <span>管理员用户 ID</span>
               <input id="adminUserIds" name="admin_user_ids" autocomplete="off" placeholder="留空时允许用户均为管理员" />
             </label>
-            <label class="field">
+            <label class="field{% if not panel_auth_required %} hidden{% endif %}">
               <span>控制台密码</span>
               <input id="adminPassword" name="admin_password" type="password" autocomplete="new-password" placeholder="留空表示不修改密码" />
             </label>

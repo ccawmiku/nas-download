@@ -46,6 +46,7 @@ preview_generator = PreviewGenerator(settings.config_dir / "previews")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 PUBLIC_BASE_PATH = os.getenv("PUBLIC_BASE_PATH", "").rstrip("/")
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+PANEL_AUTH_REQUIRED = os.getenv("PANEL_AUTH_REQUIRED", "true").lower() not in {"0", "false", "no"}
 
 SESSION_COOKIE = "telethon_media_bot_session"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -229,7 +230,7 @@ def _valid_session(token: str | None) -> bool:
 
 
 def require_panel_auth(request: Request) -> None:
-    if not _valid_session(request.cookies.get(SESSION_COOKIE)):
+    if PANEL_AUTH_REQUIRED and not _valid_session(request.cookies.get(SESSION_COOKIE)):
         raise HTTPException(status_code=401, detail="请先登录控制面板")
 
 
@@ -240,7 +241,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     recovery = history.recover_incomplete()
     if recovery["recovered"] or recovery["interrupted"]:
         logger.warning("启动时恢复完成 %s 条，标记中断 %s 条", recovery["recovered"], recovery["interrupted"])
-    if not current.admin_password_hash:
+    if PANEL_AUTH_REQUIRED and not current.admin_password_hash:
         logger.warning("控制台尚未设置密码。一次性初始化口令：%s", BOOTSTRAP_TOKEN)
     auto_start = os.getenv("AUTO_START_BOT", "true").lower() not in {"0", "false", "no"}
     if current.ready and auto_start:
@@ -297,7 +298,8 @@ async def index(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={"version": __version__, "base_path": PUBLIC_BASE_PATH},
+        context={"version": __version__, "base_path": PUBLIC_BASE_PATH,
+                 "panel_auth_required": PANEL_AUTH_REQUIRED},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -305,9 +307,9 @@ async def index(request: Request):
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
     return {
-        "password_enabled": bool(settings_store.settings.admin_password_hash),
-        "bootstrap_required": not bool(settings_store.settings.admin_password_hash),
-        "authenticated": _valid_session(request.cookies.get(SESSION_COOKIE)),
+        "password_enabled": PANEL_AUTH_REQUIRED and bool(settings_store.settings.admin_password_hash),
+        "bootstrap_required": PANEL_AUTH_REQUIRED and not bool(settings_store.settings.admin_password_hash),
+        "authenticated": not PANEL_AUTH_REQUIRED or _valid_session(request.cookies.get(SESSION_COOKIE)),
     }
 
 

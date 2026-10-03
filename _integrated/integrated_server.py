@@ -26,7 +26,7 @@ from nas_auto.proxy import stream_proxy
 
 PORT = int(os.environ.get("PORT", "14001"))
 ROOT = Path("/opt/nas-auto")
-APP_VERSION = os.environ.get("APP_VERSION", "v3.0.0")
+APP_VERSION = os.environ.get("APP_VERSION", "v3.0.1")
 _frontend_candidates = (
     Path(__file__).resolve().parent / "frontend" / "dist",
     Path(__file__).resolve().parents[1] / "frontend" / "dist",
