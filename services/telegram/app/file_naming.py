@@ -98,4 +98,3 @@ def unique_media_path(message: Message, download_dir: Path, max_stem_length: int
     descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(descriptor)
     return target
-

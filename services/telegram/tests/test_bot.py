@@ -224,4 +224,3 @@ async def test_worker_survives_unexpected_job_exception(tmp_path):
     await asyncio.gather(worker, return_exceptions=True)
 
     assert second_finished.is_set()
-
