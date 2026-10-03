@@ -114,7 +114,7 @@ export function ServicePanel({ service }: { service: Service }) {
       <a className="secondary-button" href={base} target="_blank" rel="noreferrer">完整设置 <ExternalLink size={14} /></a>
     </div>
 
-    {error && <div className="platform-alert"><AlertCircle size={16} />{error}<button onClick={refresh}>重试</button></div>}
+    {error && <div className="platform-alert"><AlertCircle size={16} />{error}<button onClick={refresh}>刷新</button></div>}
     <section className="platform-hero card">
       <div className="platform-hero-title"><div className={`platform-indicator ${service.ready ? "online" : "offline"}`}><span className="status-dot" /></div><div><span className="section-kicker">服务概况</span><h3>{service.name} Worker</h3><p>{data?.last_run_message || data?.notice || (service.ready ? "服务在线，等待任务" : "服务正在启动")}</p></div></div>
       <div className="platform-actions">
@@ -140,7 +140,7 @@ export function ServicePanel({ service }: { service: Service }) {
       </section>
       <aside className="platform-side">
         <section className="card platform-info"><span className="section-kicker">当前运行</span><h3>任务详情</h3><div className="info-line"><span>当前任务</span><strong>{data?.current_job || textValue(data?.progress?.current_url)}</strong></div><div className="info-line"><span>下次运行</span><strong>{displayDate(data?.next_run_at)}</strong></div><div className="info-line"><span>最近记录</span><strong>{records.length} 条</strong></div></section>
-        {service.key === "xhs" && <section className="card platform-info"><span className="section-kicker">小红书队列</span><h3>失败与重试</h3><p>失败记录 {data?.error_notes?.length ?? 0} 条。重试和队列清理可以在完整设置中操作。</p><button className="secondary-button" disabled={!!busy} onClick={() => runAction("api/retry-errors", "重试失败任务")}>重试全部失败任务</button></section>}
+        {service.key === "xhs" && <section className="card platform-info"><span className="section-kicker">小红书队列</span><h3>失败记录</h3><p>失败记录 {data?.error_notes?.length ?? 0} 条。符合条件的任务会按原有策略自动重试。</p></section>}
         {service.key === "douyin" && <section className="card platform-info"><span className="section-kicker">依赖版本</span><h3>f2 状态</h3><div className="info-line"><span>当前</span><strong>{textValue(data?.f2_version?.installed)}</strong></div><div className="info-line"><span>最新</span><strong>{textValue(data?.f2_version?.latest)}</strong></div><button className="secondary-button" disabled={!!busy} onClick={() => runAction("check-version", "检查 f2 版本")}>检查版本</button></section>}
         <section className="card platform-info"><span className="section-kicker">平台边界</span><h3>独立维护</h3><p>此页面只通过公开状态接口读取数据。下载器配置与状态文件仍保留在对应平台目录中。</p><a className="text-button" href={base} target="_blank" rel="noreferrer">打开完整管理页面 <ExternalLink size={14} /></a></section>
       </aside>

@@ -14,7 +14,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
   console:
-    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.0}
+    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.1}
     container_name: nas-download
     environment:
       TELEGRAM_HOST: telegram-worker
@@ -44,11 +44,12 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
   telegram-worker:
-    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.0}
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.1}
     container_name: nas-download-telegram
     environment:
       ADMIN_PASSWORD: ${TELEGRAM_ADMIN_PASSWORD:-}
       PUBLIC_BASE_PATH: /telegram
+      PANEL_AUTH_REQUIRED: "false"
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set the private internal API token}
       TZ: Asia/Shanghai
     ports:

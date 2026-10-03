@@ -135,7 +135,7 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <button className="nav-item" onClick={() => select("settings")} title="设置"><Settings2 size={18} /><span>设置</span></button>
-          <div className="version">{status.version || "v3.0.0"}</div>
+          <div className="version">{status.version || "v3.0.1"}</div>
         </div>
       </aside>
 

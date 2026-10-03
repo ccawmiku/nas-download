@@ -881,8 +881,7 @@ pre{max-height:680px}
     </section>
     <section>
       <h2>错误列表</h2>
-      <div class="actions"><button class="secondary" id="retryAllErrors" type="button">全部重试</button></div>
-      <div class="wide-table"><table><thead><tr><th>作品</th><th>状态</th><th>次数</th><th>下次重试</th><th>更新时间</th><th>错误</th><th>操作</th></tr></thead><tbody id="errorsBody"></tbody></table></div>
+      <div class="wide-table"><table><thead><tr><th>作品</th><th>状态</th><th>次数</th><th>下次重试</th><th>更新时间</th><th>错误</th></tr></thead><tbody id="errorsBody"></tbody></table></div>
     </section>
     <section>
       <h2>最近链接</h2>
@@ -921,19 +920,6 @@ pre{max-height:680px}
           <td>${{esc((n.last_error || "").slice(0, 240))}}</td>
         </tr>`).join("");
     }}
-    async function postJson(url, payload) {{
-      const resp = await fetch(url, {{
-        method: "POST",
-        headers: {{"Content-Type": "application/json"}},
-        body: JSON.stringify(payload || {{}})
-      }});
-      if (!resp.ok) throw new Error(await resp.text());
-      return resp.json();
-    }}
-    async function retryNote(noteId, url) {{
-      await postJson("/api/retry-note", {{note_id: noteId, url}});
-      await refreshStatus();
-    }}
     function renderErrors(notes) {{
       $("errorsBody").innerHTML = (notes || []).map((n) => `
         <tr class="status-${{esc(n.status)}}">
@@ -943,7 +929,6 @@ pre{max-height:680px}
           <td>${{esc(retryTime(n.retry_after))}}</td>
           <td>${{esc(n.updated_at || "")}}</td>
           <td>${{esc((n.last_error || "").slice(0, 360))}}</td>
-          <td><button class="secondary retry-note" type="button" data-note-id="${{esc(n.note_id)}}" data-url="${{esc(n.url)}}">重试</button></td>
         </tr>`).join("");
     }}
     function renderCookie(summary) {{
@@ -973,25 +958,6 @@ pre{max-height:680px}
         $("runningPill").textContent = `刷新失败：${{error}}`;
       }}
     }}
-    document.addEventListener("click", async (event) => {{
-      const target = event.target;
-      if (!(target instanceof HTMLElement)) return;
-      if (target.classList.contains("retry-note")) {{
-        target.setAttribute("disabled", "disabled");
-        try {{ await retryNote(target.dataset.noteId || "", target.dataset.url || ""); }} catch (error) {{ alert(`重试失败：${{error}}`); }}
-        target.removeAttribute("disabled");
-      }}
-      if (target.id === "retryAllErrors") {{
-        target.setAttribute("disabled", "disabled");
-        try {{
-          await postJson("/api/retry-errors", {{}});
-          await refreshStatus();
-        }} catch (error) {{
-          alert(`批量重试失败：${{error}}`);
-        }}
-        target.removeAttribute("disabled");
-      }}
-    }});
     refreshStatus();
     setInterval(refreshStatus, 3000);
   </script>
