@@ -449,10 +449,9 @@ class Store:
                 result.append(item)
             return result
 
-    def manual_failed_tweets(self, limit: int = 200) -> list[dict[str, Any]]:
+    def manual_failed_tweets(self, limit: int | None = 200, tweet_id: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 select tweet_id, url, author, media_hint, status, attempts, error, updated_at
                 from tweets
                 where status='failed'
@@ -460,12 +459,21 @@ class Store:
                     media_hint='manual_check'
                     or error like '%No video could be found%'
                   )
-                order by updated_at desc
-                limit ?
-                """,
-                (limit,),
-            ).fetchall()
+                """
+            params: list[Any] = []
+            if tweet_id is not None:
+                query += " and tweet_id=?"
+                params.append(tweet_id)
+            query += " order by updated_at desc"
+            if limit is not None:
+                query += " limit ?"
+                params.append(limit)
+            rows = conn.execute(query, params).fetchall()
             return [dict(row) for row in rows]
+
+    def keep_manual_failure(self, tweet_id: str) -> None:
+        with self._lock, self.connection() as conn:
+            conn.execute("update tweets set media_hint='manual_check' where tweet_id=? and status='failed'", (tweet_id,))
 
     def delete_tweet(self, tweet_id: str) -> bool:
         with self._lock, self.connection() as conn:
@@ -1716,6 +1724,83 @@ class App:
     def start_manual_download_thread(self, url: str) -> None:
         threading.Thread(target=lambda: self.run_manual_download(url), daemon=True).start()
 
+    def start_manual_retry_thread(self, tweet_id: str | None = None) -> int:
+        # Reserve the run before returning HTTP success, including queued threads.
+        if not self._acquire_run("retrying_manual"):
+            raise RuntimeError("已有任务正在运行，请结束后重试")
+        try:
+            rows = self.store.manual_failed_tweets(limit=None, tweet_id=tweet_id)
+            if not rows:
+                if tweet_id is not None:
+                    raise ValueError("该失败记录不存在或已处理")
+                self._release_run("没有需要重试的记录")
+                return 0
+            threading.Thread(target=lambda: self._run_manual_retries(rows), daemon=True).start()
+            return len(rows)
+        except Exception:
+            self._release_run()
+            raise
+
+    def _run_manual_retries(self, rows: list[dict[str, Any]]) -> None:
+        run_id = None
+        downloader: Downloader | None = None
+        stats = {"discovered": len(rows), "downloaded": 0, "skipped": 0, "failed": 0}
+        message = ""
+        try:
+            self.reload_config()
+            run_id = self.store.begin_run()
+            downloader = Downloader(self.config, self.store, self.log)
+            collector = BrowserCollector(self.config, self.log, self.store)
+            self.set_progress({"download_total": len(rows), "collected": len(rows)})
+            for index, row in enumerate(rows, start=1):
+                if self.stop_event.is_set():
+                    message = "重试已停止，未处理记录保持原状态"
+                    break
+                current_row = self.store.get_tweet(row["tweet_id"])
+                files: list[str] = []
+                self.set_progress({"phase": "retrying_manual", "current_url": row["url"]})
+                if current_row is None or current_row["status"] != "failed":
+                    status = "skipped"
+                else:
+                    try:
+                        item = asyncio.run(collector.collect_single(row["url"]))
+                        status, files, error = downloader.download_item(item, force=True)
+                        if status == "failed":
+                            self.store.keep_manual_failure(row["tweet_id"])
+                            self.log.write(f"重试失败 {row['url']}: {error}")
+                    except Exception as error:
+                        status = "failed"
+                        try:
+                            saved_files = json.loads(current_row["files_json"] or "[]")
+                        except json.JSONDecodeError:
+                            saved_files = []
+                        self.store.mark_result(row["tweet_id"], "failed", saved_files, str(error), "manual_check")
+                        self.log.write(f"重试媒体探测失败 {row['url']}: {error}")
+                stats[{"done": "downloaded", "skipped": "skipped"}.get(status, "failed")] += 1
+                counts = self._count_media_files(files)
+                progress = self.get_progress()
+                self.set_progress({"download_done": index, **{k: stats[k] for k in ("downloaded", "skipped", "failed")},
+                                   **{k: int(progress.get(k, 0)) + counts[k] for k in counts}})
+                self.log.write(f"手动失败重试 {index}/{len(rows)}: {status} {row['url']}")
+                delay = max(0.0, float(self.config.get("request_delay_seconds", 3)))
+                jitter = max(0.0, float(self.config.get("jitter_seconds", 2)))
+                if index < len(rows) and self.stop_event.wait(delay + random.random() * jitter):
+                    message = "重试已停止，未处理记录保持原状态"
+                    break
+            message = message or f"重试结束：成功 {stats['downloaded']}，跳过 {stats['skipped']}，失败 {stats['failed']}"
+            self.store.finish_run(run_id, "failed" if stats["failed"] or self.stop_event.is_set() else "done", stats, message)
+            self.set_progress({"phase": "finished", "current_url": ""})
+        except Exception as error:
+            message = str(error)
+            self.log.write(f"重试任务异常：{message}")
+            if run_id is not None:
+                self.store.finish_run(run_id, "failed", stats, message)
+            self.set_progress({"phase": "failed", "current_url": ""})
+        finally:
+            if downloader is not None:
+                downloader.close()
+            self._release_run(message)
+
     def start_cookie_test_thread(self, url: str) -> None:
         threading.Thread(target=lambda: self.run_cookie_test(url), daemon=True).start()
 
@@ -1797,7 +1882,8 @@ __APP_STYLE__
     </section>
     <section>
       <h2>需要手动处理的视频失败链接</h2>
-      <div class="help">这里只列出 yt-dlp 明确返回 “No video could be found in this tweet” 的失败项；你手动下载后可以删除对应记录。</div>
+      <div class="help">可重新探测并重试这些失败链接；全部重试会逐条处理所有记录。下载成功后自动移出列表，也可保留原有删除操作。</div>
+      <div class="actions"><form method="post" action="/manual-failed/retry-all"><button id="retryAllManual" type="submit">全部重试</button></form></div>
       <table><thead><tr><th>Tweet</th><th>作者</th><th>次数</th><th>更新时间</th><th>错误</th><th>操作</th></tr></thead><tbody id="manualFailedBody"></tbody></table>
     </section>
     <section>
@@ -1849,7 +1935,7 @@ __APP_STYLE__
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     let filledForm = false;
     function phaseName(phase) {
-      return {idle:"空闲", starting:"准备运行", collecting:"正在滚动采集 Likes", downloading:"正在下载媒体", manual_download:"手动单条下载", testing_cookie:"正在测试 Cookie", finished:"已完成", failed:"运行失败"}[phase] || phase || "未知";
+      return {idle:"空闲", starting:"准备运行", collecting:"正在滚动采集 Likes", downloading:"正在下载媒体", manual_download:"手动单条下载", retrying_manual:"正在重试失败链接", testing_cookie:"正在测试 Cookie", finished:"已完成", failed:"运行失败"}[phase] || phase || "未知";
     }
     function typeName(type) {
       return {image:"图片", video:"视频", gif:"GIF", mixed:"混合", unknown:"未知", manual_check:"需手动检查"}[type] || type || "未知";
@@ -1872,8 +1958,9 @@ __APP_STYLE__
         `<tr><td>${r.id}</td><td>${esc(r.started_at)}</td><td>${esc(r.status)}</td><td>${r.discovered}</td><td>${r.downloaded}</td><td>${r.skipped}</td><td>${r.failed}</td></tr>`
       ).join("");
       $("manualFailedBody").innerHTML = (data.manual_failed || []).map((t) =>
-        `<tr><td><a href="${esc(t.url)}" target="_blank">${esc(t.tweet_id)}</a></td><td>${esc(t.author)}</td><td>${esc(t.attempts)}</td><td>${esc(t.updated_at || "")}</td><td>${esc((t.error || "").slice(0, 180))}</td><td><form method="post" action="/manual-failed/delete"><input type="hidden" name="tweet_id" value="${esc(t.tweet_id)}"><button class="secondary" type="submit">删除</button></form></td></tr>`
+        `<tr><td><a href="${esc(t.url)}" target="_blank">${esc(t.tweet_id)}</a></td><td>${esc(t.author)}</td><td>${esc(t.attempts)}</td><td>${esc(t.updated_at || "")}</td><td>${esc((t.error || "").slice(0, 180))}</td><td><form method="post" action="/manual-failed/retry"><input type="hidden" name="tweet_id" value="${esc(t.tweet_id)}"><button ${data.running ? "disabled" : ""} type="submit">重试</button></form><form method="post" action="/manual-failed/delete"><input type="hidden" name="tweet_id" value="${esc(t.tweet_id)}"><button class="secondary" ${data.running ? "disabled" : ""} type="submit">删除</button></form></td></tr>`
       ).join("") || `<tr><td colspan="6" class="muted">暂无需要手动处理的失败链接。</td></tr>`;
+      $("retryAllManual").disabled = !!data.running || !(data.manual_failed || []).length;
       $("tweetsBody").innerHTML = (data.tweets || []).map((t) =>
         `<tr><td><a href="${esc(t.url)}" target="_blank">${esc(t.tweet_id)}</a></td><td>${esc(t.author)}</td><td>${esc(typeName(t.media_hint))}</td><td>${esc(t.status)}</td><td>${t.files_count || 0}</td><td>${esc(t.attempts)}</td><td>${esc((t.error || "").slice(0, 120))}</td></tr>`
       ).join("");
@@ -1965,6 +2052,21 @@ def make_handler(app: App):
                 if tweet_id:
                     deleted = app.store.delete_tweet(tweet_id)
                     app.log.write(f"手动失败列表删除 {tweet_id}: {'ok' if deleted else 'not found'}")
+                redirect(self)
+                return
+            if self.path in {"/manual-failed/retry", "/manual-failed/retry-all"}:
+                tweet_id = (form.get("tweet_id") or [""])[0].strip() if self.path.endswith("/retry") else None
+                if tweet_id == "":
+                    self.send_error(HTTPStatus.BAD_REQUEST, "tweet_id required")
+                    return
+                try:
+                    app.start_manual_retry_thread(tweet_id)
+                except RuntimeError:
+                    self.send_error(HTTPStatus.CONFLICT, "a run is already active")
+                    return
+                except ValueError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "failed tweet not found")
+                    return
                 redirect(self)
                 return
             if self.path == "/reload":

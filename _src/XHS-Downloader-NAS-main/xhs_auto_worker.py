@@ -879,7 +879,7 @@ pre{max-height:680px}
     <section>
       <h2>XHS-Downloader Cookie</h2>
       <form method="post" action="/settings-cookie">
-        <div class="help">这里写入的是 JoeanAmier/XHS-Downloader 2.7 使用的 <code>settings.json</code> 里的 <code>cookie</code> 字段，不再使用旧的自动采集 Cookie。</div>
+        <div class="help">这里写入的是 XHS-Downloader 使用的 <code>settings.json</code> 里的 <code>cookie</code> 字段，不再使用旧的自动采集 Cookie。</div>
         <label>Cookie Header</label>
         <textarea name="cookie_text" placeholder="a1=...; web_session=..."></textarea>
         <div class="actions"><button type="submit">保存到 settings.json</button></div>

@@ -16,6 +16,7 @@ type PlatformStatus = {
   notes?: Record<string, unknown>[];
   error_notes?: Record<string, unknown>[];
   tweets?: Record<string, unknown>[];
+  manual_failed?: Record<string, unknown>[];
   artworks?: Record<string, unknown>[];
   last_results?: Record<string, unknown>[];
   cookie_present?: boolean;
@@ -77,13 +78,13 @@ export function ServicePanel({ service }: { service: Service }) {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const runAction = async (path: string, label: string) => {
+  const runAction = async (path: string, label: string, fields: Record<string, string> = {}) => {
     setBusy(label);
     try {
       const response = await fetch(`${base}${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: "",
+        body: new URLSearchParams(fields).toString(),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await refresh();
@@ -145,6 +146,16 @@ export function ServicePanel({ service }: { service: Service }) {
         <section className="card platform-info"><span className="section-kicker">平台边界</span><h3>独立维护</h3><p>此页面只通过公开状态接口读取数据。下载器配置与状态文件仍保留在对应平台目录中。</p><a className="text-button" href={base} target="_blank" rel="noreferrer">打开完整管理页面 <ExternalLink size={14} /></a></section>
       </aside>
     </div>
+    {service.key === "x" && <section className="card platform-main-card">
+      <div className="page-intro"><div><h3>需要手动处理的视频失败链接</h3><p>逐条重新探测并下载，成功后自动移出列表。全部重试覆盖所有记录。</p></div>
+        <button className="secondary-button" disabled={!!busy || !!data?.running || !(data?.manual_failed?.length)} onClick={() => runAction("manual-failed/retry-all", "全部重试")}>全部重试</button></div>
+      {(data?.manual_failed ?? []).map(row => <div className="record-row" key={String(row.tweet_id)}>
+        <div className="record-main"><a href={String(row.url)} target="_blank" rel="noreferrer">{String(row.tweet_id)}</a><small>{textValue(row.error)}</small></div>
+        <button className="text-button" disabled={!!busy || !!data?.running} onClick={() => runAction("manual-failed/retry", "重试", {tweet_id: String(row.tweet_id)})}>重试</button>
+        <button className="text-button" disabled={!!busy || !!data?.running} onClick={() => runAction("manual-failed/delete", "删除", {tweet_id: String(row.tweet_id)})}>删除</button>
+      </div>)}
+      {!data?.manual_failed?.length && <p>暂无需要手动处理的失败链接。</p>}
+    </section>}
   </div>;
 }
 

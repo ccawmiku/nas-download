@@ -2,7 +2,7 @@
 
 统一管理小红书、X、Pixiv、抖音和 Telegram 的 NAS 下载控制台。
 
-当前版本：`v3.0.2`。项目由原 NAS 下载集成服务 v2.0.2 和 Telegram v1.9 迁移而来，保留已有平台实现、配置与状态格式。
+当前版本：`v3.0.3`。项目由原 NAS 下载集成服务 v2.0.2 和 Telegram v1.9 迁移而来，保留已有平台实现、配置与状态格式。
 
 ## 功能
 
@@ -32,9 +32,9 @@
 准备私有 `.env`，可参考 `.env.example`。发布镜像分别为：
 
 ```text
-ghcr.io/ccawmiku/nas-download:v3.0.2
-ghcr.io/ccawmiku/nas-download-telegram:v3.0.2
-ghcr.io/joeanamier/xhs-downloader:2.8
+ghcr.io/ccawmiku/nas-download:v3.0.3
+ghcr.io/ccawmiku/nas-download-telegram:v3.0.3
+ghcr.io/ccawmiku/xhs-downloader:2.8-nas.2
 ```
 
 ```bash
@@ -44,7 +44,7 @@ docker compose -f docker-compose.yml up -d
 
 已有部署先执行迁移流程；上述命令不能替代迁移。NAS 运行文件命名为 `compose.yaml`。
 
-小红书直接使用未修改的上游 2.8 镜像，默认 JPEG。Docker 数据目录仍为 `/app/Volume`，升级保留现有挂载；独立程序版需把旧 `_internal/Volume` 复制至新程序旁。新增配置默认超时 30 秒、队列间隔 1 秒；已有显式配置继续保留。
+小红书使用 [ccawmiku/XHS-Downloader](https://github.com/ccawmiku/XHS-Downloader) 的 2.8-nas.2 镜像，只补齐 PyYAML 非法控制字符范围，修复 U+0083；默认 JPEG。Docker 数据目录仍为 `/app/Volume`，升级保留现有挂载；独立程序版需把旧 `_internal/Volume` 复制至新程序旁。新增配置默认超时 30 秒、队列间隔 1 秒；已有显式配置继续保留。
 
 ## 开发与验证
 
@@ -72,6 +72,8 @@ npm audit --audit-level=high
 ```
 
 `.github/workflows/ci.yml` 在 PR 上用独立作业验证两个 Python 环境、真实浏览器采集与前端，并构建两个自有镜像检查 worker 和工具能否导入。正式版本标签全部验证通过后发布。测试直接使用对应镜像的锁定依赖，f2 使用明确 commit。
+
+X 的手动失败列表支持单条重试、全部重试和删除，同一时间只运行一个任务。详情见 [v3.0.3 升级说明](docs/UPGRADE_3.0.3.md)。
 
 X 图片下载和其他兼容性修复的验证记录见 [修复说明](docs/FIX_X_IMAGES_ISSUE.md)。
 

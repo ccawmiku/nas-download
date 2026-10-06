@@ -1,7 +1,7 @@
 name: nas-download
 services:
   xhs-api:
-    image: ghcr.io/joeanamier/xhs-downloader:2.8
+    image: ghcr.io/ccawmiku/xhs-downloader:2.8-nas.2
     dns:
     - 223.5.5.5
     - 119.29.29.29
@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
   console:
-    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.2}
+    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.3}
     container_name: nas-download
     environment:
       TELEGRAM_HOST: telegram-worker
@@ -47,7 +47,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
   telegram-worker:
-    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.2}
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.3}
     container_name: nas-download-telegram
     environment:
       ADMIN_PASSWORD: ${TELEGRAM_ADMIN_PASSWORD:-}

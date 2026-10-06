@@ -42,4 +42,4 @@ worker 页面会同时显示队列日志和 `xhs-api` 日志。
 
 ## 图片格式
 
-直接使用未修改的上游 2.8 镜像，新配置默认 JPEG。请求超时默认 30 秒，队列基础间隔默认 1 秒，已有显式配置继续保留。Docker 继续挂载 `/app/Volume`；独立程序版升级时，将旧 `_internal/Volume` 复制至新程序旁的 `Volume`。
+使用自有 fork 的 `ghcr.io/ccawmiku/xhs-downloader:2.8-nas.2` 镜像，修复 U+0083 解析异常，新配置默认 JPEG。请求超时默认 30 秒，队列基础间隔默认 1 秒，已有显式配置继续保留。Docker 继续挂载 `/app/Volume`；独立程序版升级时，将旧 `_internal/Volume` 复制至新程序旁的 `Volume`。

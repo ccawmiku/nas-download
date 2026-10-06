@@ -4,6 +4,8 @@ import unittest
 import zipfile
 import json
 import sqlite3
+import threading
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -43,6 +45,7 @@ from xhs_auto_worker import (
     xhs_api_segment_has_failure,
 )
 from x_auto_worker import (
+    App as XApp, make_handler as x_make_handler, html_page as x_html_page,
     BrowserCollector, Downloader, DEFAULT_CONFIG as X_DEFAULT_CONFIG,
     RingLog as XRingLog, Store as XStore, browser_scroll_limit, item_from_url,
 )
@@ -519,6 +522,124 @@ class XDownloadTests(unittest.TestCase):
         self.assertEqual(attempted, ['https://pbs.twimg.com/media/abc?format=jpg&name=orig'])
 
 
+class XManualRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        config = json.loads(json.dumps(X_DEFAULT_CONFIG))
+        config.update(database=str(self.root / 'state.sqlite3'), download_dir=str(self.root / 'downloads'),
+                      cookie_file=str(self.root / 'cookies.txt'), request_delay_seconds=0, jitter_seconds=0,
+                      retry_failed=False, max_download_attempts=1)
+        config_path = self.root / 'config.json'
+        config_path.write_text(json.dumps(config), encoding='utf-8')
+        self.app = XApp(config_path)
+
+    def failed(self, number, files=None):
+        item = item_from_url(f'https://x.com/test/status/{number}')
+        self.app.store.upsert_seen(item)
+        self.app.store.mark_result(item['tweet_id'], 'failed', files or [], 'No video could be found in this tweet', 'manual_check')
+        return item
+
+    def test_bulk_retry_includes_records_beyond_display_limit_and_reserves_run(self):
+        for number in range(1, 202):
+            self.failed(number)
+        self.assertEqual(len(self.app.store.manual_failed_tweets()), 200)
+        with patch('x_auto_worker.threading.Thread') as thread, patch.object(self.app, '_run_manual_retries') as run:
+            self.assertEqual(self.app.start_manual_retry_thread(), 201)
+            self.assertTrue(self.app.run_lock.locked())
+            with self.assertRaises(RuntimeError):
+                self.app.start_manual_retry_thread('1')
+            thread.call_args.kwargs['target']()
+            self.assertEqual(len(run.call_args.args[0]), 201)
+        self.app._release_run()
+
+    def test_single_retry_rejects_missing_or_completed_records(self):
+        self.failed(1)
+        self.failed(2)
+        self.app.store.mark_result('2', 'done', [], '', 'video')
+        for tweet_id in ('2', 'missing'):
+            with self.assertRaises(ValueError):
+                self.app.start_manual_retry_thread(tweet_id)
+            self.assertFalse(self.app.run_lock.locked())
+        with patch('x_auto_worker.threading.Thread') as thread, patch.object(self.app, '_run_manual_retries') as run:
+            self.assertEqual(self.app.start_manual_retry_thread('1'), 1)
+            thread.call_args.kwargs['target']()
+            self.assertEqual([row['tweet_id'] for row in run.call_args.args[0]], ['1'])
+        self.app._release_run()
+
+    def test_batch_continues_after_probe_failure_and_preserves_partial_files(self):
+        saved = self.root / 'partial.jpg'
+        saved.write_bytes(b'partial fixture')
+        failed = self.failed(1, [str(saved)])
+        success = self.failed(2)
+        output = self.root / 'done.jpg'
+        output.write_bytes(b'image fixture')
+        def probe(url):
+            if url == failed['url']:
+                raise RuntimeError('probe unavailable')
+            return {**success, 'media_ids': ['one'], '_detail_checked': True}
+        downloader = Downloader(self.app.config, self.app.store, self.app.log)
+        with patch('x_auto_worker.Downloader', return_value=downloader), \
+             patch.object(BrowserCollector, 'collect_single', new=AsyncMock(side_effect=probe)) as collect, \
+             patch.object(downloader, 'download_images', return_value=[str(output)]), \
+             patch.object(downloader, 'download_video') as video:
+            self.app._acquire_run('retrying_manual')
+            self.app._run_manual_retries(self.app.store.manual_failed_tweets(limit=None))
+        self.assertEqual(collect.await_count, 2)
+        video.assert_not_called()
+        self.assertFalse(self.app.run_lock.locked())
+        self.assertEqual(self.app.store.get_tweet('2')['status'], 'done')
+        row = self.app.store.get_tweet('1')
+        self.assertEqual(row['attempts'], 2)
+        self.assertEqual(json.loads(row['files_json']), [str(saved)])
+        self.assertEqual(row['error'], 'probe unavailable')
+        self.assertEqual(len(self.app.store.manual_failed_tweets()), 1)
+        self.assertEqual(self.app.get_progress()['download_done'], 2)
+
+    def test_unsolved_download_stays_in_manual_list_and_deleted_rows_are_not_recreated(self):
+        item = self.failed(1)
+        self.failed(2)
+        rows = self.app.store.manual_failed_tweets(limit=None)
+        self.app.store.delete_tweet('2')
+        with patch.object(BrowserCollector, 'collect_single', new=AsyncMock(return_value={**item, '_detail_checked': True})), \
+             patch.object(Downloader, 'download_images', return_value=[]), \
+             patch.object(Downloader, 'download_video') as video:
+            self.app._acquire_run('retrying_manual')
+            self.app._run_manual_retries(rows)
+        self.assertIsNone(self.app.store.get_tweet('2'))
+        self.assertEqual([r['tweet_id'] for r in self.app.store.manual_failed_tweets()], ['1'])
+        self.assertEqual(self.app.get_progress()['skipped'], 1)
+        video.assert_not_called()
+
+    def test_http_retry_endpoints_and_delete_button(self):
+        self.failed(1)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), x_make_handler(self.app))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f'http://127.0.0.1:{server.server_port}'
+            with patch.object(self.app, 'start_manual_retry_thread') as start:
+                self.assertEqual(requests.post(base+'/manual-failed/retry', data={'tweet_id':'1'}, allow_redirects=False).status_code, 303)
+                start.assert_called_with('1')
+                self.assertEqual(requests.post(base+'/manual-failed/retry-all', allow_redirects=False).status_code, 303)
+                start.assert_called_with(None)
+                start.side_effect = RuntimeError('busy')
+                self.assertEqual(requests.post(base+'/manual-failed/retry-all').status_code, 409)
+                start.side_effect = ValueError('missing')
+                self.assertEqual(requests.post(base+'/manual-failed/retry', data={'tweet_id':'999'}).status_code, 404)
+            self.assertEqual(requests.post(base+'/manual-failed/retry', data={}).status_code, 400)
+            self.assertEqual(requests.post(base+'/manual-failed/delete', data={'tweet_id':'1'}, allow_redirects=False).status_code, 303)
+            self.assertIsNone(self.app.store.get_tweet('1'))
+            page = x_html_page(self.app)
+            for action in ('/manual-failed/retry-all', '/manual-failed/retry', '/manual-failed/delete'):
+                self.assertIn(action, page)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
 class XBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.collector = BrowserCollector(json.loads(json.dumps(X_DEFAULT_CONFIG)), XRingLog())
@@ -532,6 +653,32 @@ class XBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.route('https://x.com/fixture', lambda route: route.fulfill(
             content_type='text/html', body=contents))
         await self.page.goto('https://x.com/fixture')
+
+    async def test_manual_retry_buttons_submit_and_disable_during_runs(self):
+        state = {'running': False, 'manual_failed': [{'tweet_id': '123', 'url': 'https://x.com/test/status/123', 'author': 'test', 'attempts': 1, 'error': 'No video could be found'}]}
+        submitted = []
+        await self.page.route('https://x.com/api/status', lambda route: route.fulfill(content_type='application/json', body=json.dumps(state)))
+        async def submit(route):
+            submitted.append((route.request.url, route.request.post_data))
+            await route.fulfill(content_type='text/html', body=x_html_page(None))
+        await self.page.route('https://x.com/manual-failed/*', submit)
+        await self.load(x_html_page(None))
+        single = self.page.locator('form[action="/manual-failed/retry"] button')
+        await single.wait_for()
+        self.assertTrue(await single.is_enabled())
+        self.assertTrue(await self.page.locator('#retryAllManual').is_enabled())
+        self.assertTrue(await self.page.locator('form[action="/manual-failed/delete"] button').is_enabled())
+        await single.click()
+        await self.page.wait_for_url('https://x.com/manual-failed/retry')
+        self.assertEqual(submitted[-1], ('https://x.com/manual-failed/retry', 'tweet_id=123'))
+        await self.page.locator('#retryAllManual').click()
+        await self.page.wait_for_url('https://x.com/manual-failed/retry-all')
+        self.assertEqual(submitted[-1][0], 'https://x.com/manual-failed/retry-all')
+        state['running'] = True
+        await self.page.evaluate('refreshStatus()')
+        self.assertTrue(await self.page.locator('#retryAllManual').is_disabled())
+        self.assertTrue(await self.page.locator('form[action="/manual-failed/retry"] button').is_disabled())
+        self.assertTrue(await self.page.locator('form[action="/manual-failed/delete"] button').is_disabled())
 
     async def test_responsive_multi_photos_survive_image_error_handlers(self):
         await self.load('''<article><a href="/test/status/123"><time>now</time></a>

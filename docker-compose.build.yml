@@ -4,9 +4,9 @@ services:
       context: .
       dockerfile: _integrated/Dockerfile
       args:
-        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.2}
+        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.3}
   telegram-worker:
     build:
       context: services/telegram
       args:
-        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.2}
+        APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v3.0.3}
