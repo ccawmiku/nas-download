@@ -1,6 +1,7 @@
 import importlib
 import sys
 from unittest.mock import AsyncMock
+import os
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -22,9 +23,83 @@ def load_main(monkeypatch, tmp_path):
     return importlib.import_module("app.main")
 
 
+def test_file_listing_keeps_newest_200_across_categories(monkeypatch, tmp_path):
+    main = load_main(monkeypatch, tmp_path)
+    dirs = main.configured_download_dirs(main.settings_store.settings)
+    for category, directory in dirs.items():
+        directory.mkdir(parents=True, exist_ok=True)
+        for index in range(110):
+            path = directory / f"测试 {category}-{index}.bin"
+            path.write_bytes(b"data")
+            os.utime(path, (1000 + index, 1000 + index))
+        (directory / "empty").touch()
+        (directory / ".partial").write_bytes(b"hidden")
+        (directory / "subdirectory").mkdir()
+    reference = []
+    for category, directory in dirs.items():
+        for path in directory.iterdir():
+            if path.is_file() and not path.name.startswith(".") and path.stat().st_size:
+                stat = path.stat()
+                reference.append({
+                    "category": category, "name": path.name, "size_bytes": stat.st_size,
+                    "modified_at": stat.st_mtime,
+                    **main._media_urls(category, path.name, stat.st_mtime_ns),
+                })
+    reference.sort(key=lambda row: row["modified_at"], reverse=True)
+    original_urls = main._media_urls
+    calls = []
+
+    def counted_urls(*args):
+        calls.append(args)
+        return original_urls(*args)
+
+    monkeypatch.setattr(main, "_media_urls", counted_urls)
+    assert main.list_downloaded_files(dirs) == reference[:200]
+    assert len(calls) == 200
+
+
 def login(client, main):
     response = client.post("/api/auth/login", json={"password": main.BOOTSTRAP_TOKEN})
     assert response.status_code == 200
+
+
+def test_file_listing_cache_expires_and_does_not_expose_mutable_rows(monkeypatch, tmp_path):
+    main = load_main(monkeypatch, tmp_path)
+    dirs = main.configured_download_dirs(main.settings_store.settings)
+    dirs['images'].mkdir(parents=True)
+    (dirs['images'] / 'first.jpg').write_bytes(b'first')
+    clock = [100.0]
+    monkeypatch.setattr(main.time, 'monotonic', lambda: clock[0])
+    original_scan = main._scan_downloaded_files
+    scans = []
+    def scan(paths):
+        scans.append(paths)
+        return original_scan(paths)
+    monkeypatch.setattr(main, '_scan_downloaded_files', scan)
+    first = main.list_downloaded_files(dirs)
+    first[0]['name'] = 'caller mutation'
+    (dirs['images'] / 'second.jpg').write_bytes(b'second')
+    cached = main.list_downloaded_files(dirs)
+    assert [row['name'] for row in cached] == ['first.jpg']
+    assert len(scans) == 1
+    clock[0] += main.FILE_LIST_CACHE_SECONDS
+    assert {row['name'] for row in main.list_downloaded_files(dirs)} == {'first.jpg', 'second.jpg'}
+    assert len(scans) == 2
+    (dirs['images'] / 'second.jpg').unlink()
+    clock[0] += main.FILE_LIST_CACHE_SECONDS
+    assert [row['name'] for row in main.list_downloaded_files(dirs)] == ['first.jpg']
+
+
+def test_file_listing_cache_reloads_when_configured_directory_changes(monkeypatch, tmp_path):
+    main = load_main(monkeypatch, tmp_path)
+    old = tmp_path / 'old'
+    new = tmp_path / 'new'
+    old.mkdir()
+    new.mkdir()
+    (old / 'old.jpg').write_bytes(b'old')
+    (new / 'new.jpg').write_bytes(b'new')
+    assert main.list_downloaded_files({'images': old})[0]['name'] == 'old.jpg'
+    assert main.list_downloaded_files({'images': new})[0]['name'] == 'new.jpg'
 
 
 def test_panel_requires_auth_and_bootstrap_login_sets_security_headers(monkeypatch, tmp_path):

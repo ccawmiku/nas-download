@@ -14,11 +14,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r services/telegram/requirements-dev.txt requests PyYAML pixivpy3 gallery-dl playwright
+      - run: python -m pip install -r _integrated/requirements.txt PyYAML
+      - run: python -m playwright install --with-deps chromium
       - run: python -m compileall -q _integrated _common _src services/telegram/app
       - run: python -m unittest test_integrated.py test_integration.py
-      - run: python -m pytest -q
-        working-directory: services/telegram
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -26,9 +25,49 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci && npm run build && npm audit --audit-level=high
         working-directory: frontend
+  verify-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r services/telegram/requirements-dev.txt
+      - run: python -m compileall -q services/telegram/app
+      - run: python -m pytest -q
+        working-directory: services/telegram
+  verify-images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: console
+            context: .
+            file: _integrated/Dockerfile
+            smoke: "import sys; sys.path[:0] = ['/opt/nas-auto/x', '/opt/nas-auto/pixiv', '/opt/nas-auto/douyin', '/opt/nas-auto/xhs']; import integrated_server, x_auto_worker, pixiv_auto_worker, douyin_f2_worker, xhs_auto_worker, gallery_dl, yt_dlp, f2"
+          - image: telegram
+            context: services/telegram
+            file: services/telegram/Dockerfile
+            smoke: "import app.bot, app.previews, app.preview_worker, fastapi, telethon, cryptg"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          load: true
+          push: false
+          tags: nas-download-${{ matrix.image }}:verify
+          cache-from: type=gha,scope=${{ matrix.image }}-verify
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-verify
+      - name: Import workers using the packaged dependencies
+        env:
+          SMOKE_CODE: ${{ matrix.smoke }}
+        run: docker run --rm --entrypoint python nas-download-${{ matrix.image }}:verify -c "$SMOKE_CODE"
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: verify
+    needs: [verify, verify-telegram, verify-images]
     runs-on: ubuntu-latest
     permissions:
       contents: read

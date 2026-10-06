@@ -1014,12 +1014,24 @@ class PixivDownloader:
             frame_paths = [(path, fallback_delay) for path in images]
         if not frame_paths:
             raise RuntimeError("ugoira zip did not contain image frames")
+        # FFmpeg resolves relative file entries against frames.txt, not cwd.
+        # Resolve first, then escape quotes according to the concat grammar.
+        def concat_path(path: Path) -> str:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(tmp_dir.resolve()) or not resolved.is_file():
+                raise RuntimeError("ugoira metadata references an invalid frame path")
+            value = resolved.as_posix()
+            if "\n" in value or "\r" in value:
+                raise RuntimeError("ugoira frame path contains a line break")
+            return value.replace("'", "'\\''")
+
+        escaped_frames = [(concat_path(path), delay) for path, delay in frame_paths]
         concat = tmp_dir / "frames.txt"
         with concat.open("w", encoding="utf-8") as file:
-            for frame_path, delay_ms in frame_paths:
-                file.write(f"file '{frame_path.as_posix()}'\n")
+            for frame_path, delay_ms in escaped_frames:
+                file.write(f"file '{frame_path}'\n")
                 file.write(f"duration {max(1, delay_ms) / 1000:.3f}\n")
-            file.write(f"file '{frame_paths[-1][0].as_posix()}'\n")
+            file.write(f"file '{escaped_frames[-1][0]}'\n")
         command = [
             "ffmpeg",
             "-y",

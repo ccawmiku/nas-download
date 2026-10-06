@@ -5,7 +5,7 @@ import zipfile
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
 import yaml
@@ -28,8 +28,9 @@ from douyin_f2_worker import (
     normalize_cookie_text,
     render_cookie_block,
     render_douyin_job_yaml,
+    f2_network_hint,
 )
-from pixiv_auto_worker import classify_error, safe_extract_zip
+from pixiv_auto_worker import PixivDownloader, classify_error, safe_extract_zip
 from xhs_auto_worker import (
     RingLog as XhsRingLog,
     Store as XhsStore,
@@ -40,7 +41,10 @@ from xhs_auto_worker import (
     xhs_api_response_has_failure,
     xhs_api_segment_has_failure,
 )
-from x_auto_worker import browser_scroll_limit
+from x_auto_worker import (
+    BrowserCollector, Downloader, DEFAULT_CONFIG as X_DEFAULT_CONFIG,
+    RingLog as XRingLog, Store as XStore, browser_scroll_limit, item_from_url,
+)
 
 
 class IntegratedPageTests(unittest.TestCase):
@@ -101,6 +105,29 @@ class IntegratedPageTests(unittest.TestCase):
 
 
 class DouyinCookieTests(unittest.TestCase):
+    def test_new_cookie_fields_survive_normalization_and_yaml_rendering(self):
+        cookie = 'verify_fp=new; sessionid=old; future_security_token=abc==; sessionid=current; ttwid=present'
+        normalized = normalize_cookie_text(cookie)
+        self.assertEqual(normalized, 'sessionid=current; ttwid=present; verify_fp=new; future_security_token=abc==')
+        self.assertEqual(normalize_cookie_text(render_cookie_block(normalized)), normalized)
+        rendered = yaml.safe_load(render_douyin_job_yaml({'cookie': normalized, 'mode': 'like'}))
+        self.assertEqual(rendered['douyin']['cookie'], normalized)
+        self.assertEqual(integrated_server.extract_douyin_cookie_text(render_cookie_block(normalized)), normalized)
+        integrated_yaml = yaml.safe_load(integrated_server.render_douyin_job_yaml({'cookie': normalized}))
+        self.assertEqual(integrated_yaml['douyin']['cookie'], normalized)
+
+    def test_netscape_cookies_keep_new_douyin_fields_only(self):
+        cookie = ('# Netscape HTTP Cookie File\n'
+                  '.douyin.com\tTRUE\t/\tTRUE\t0\tverify_fp\tnew\n'
+                  '.example.com\tTRUE\t/\tTRUE\t0\tforeign_token\tignored\n')
+        self.assertEqual(normalize_cookie_text(cookie), 'verify_fp=new')
+
+    def test_network_hint_recognizes_redirects_without_login_keyword_false_positives(self):
+        self.assertIn('重定向', f2_network_hint("Redirect response '301 Moved Permanently' for url"))
+        self.assertIn('网络认证', f2_network_hint('https://gportal.example.net/login'))
+        self.assertEqual(f2_network_hint('login_time=123; record_force_login=1'), '')
+        self.assertEqual(f2_network_hint('normal request HTTP 200'), '')
+
     def test_default_max_job_runtime_is_300_seconds(self) -> None:
         self.assertEqual(DOUYIN_DEFAULT_CONFIG["max_job_runtime_seconds"], 300)
 
@@ -119,9 +146,9 @@ class DouyinCookieTests(unittest.TestCase):
             "  random_key=keepme;\n"
             "naming: ignored\n"
         )
-        self.assertEqual(normalized, "sessionid=abc; ttwid=def")
+        self.assertEqual(normalized, "sessionid=abc; ttwid=def; msToken=ghi; random_key=keepme")
         summary = cookie_summary(normalized)
-        self.assertEqual(summary["fields"], 2)
+        self.assertEqual(summary["fields"], 4)
         self.assertEqual(summary["missing_required"], [])
         self.assertEqual(summary["status"], "高风险")
         self.assertEqual(summary["reference_present"], 2)
@@ -272,6 +299,11 @@ class XhsSettingsTests(unittest.TestCase):
         )
         self.assertTrue(is_transient_xhs_failure("错误信息: ReadTimeout('') 网络异常"))
         self.assertTrue(is_transient_xhs_failure("RemoteProtocolError('peer closed connection')"))
+        self.assertTrue(is_transient_xhs_failure("ConnectError('[Errno -3] Temporary failure in name resolution')"))
+        self.assertTrue(is_transient_xhs_failure("RequestException('Failed to perform, curl: (6) Could not resolve host')"))
+        self.assertTrue(is_transient_xhs_failure("RequestException('Failed to perform, curl: (18) transfer closed')"))
+        self.assertTrue(is_transient_xhs_failure("RequestException('Failed to perform, curl: (28) Operation timed out')"))
+        self.assertFalse(is_transient_xhs_failure("笔记不存在"))
         self.assertTrue(xhs_api_response_has_failure({"message": "获取小红书作品数据失败", "data": None}))
         self.assertTrue(xhs_api_response_has_failure({"message": "unknown", "data": None}))
         self.assertFalse(xhs_api_response_has_failure({"message": "获取小红书作品数据成功", "data": {"作品ID": "abc"}}))
@@ -319,7 +351,261 @@ class XhsSettingsTests(unittest.TestCase):
                 integrated_server.XHS_QUEUE_FILE = old_queue_file
 
 
+class XDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.config = json.loads(json.dumps(X_DEFAULT_CONFIG))
+        self.config['download_dir'] = str(self.root / 'downloads')
+        self.log = XRingLog()
+        self.store = XStore(self.root / 'state.sqlite3', self.log)
+        self.downloader = Downloader(self.config, self.store, self.log)
+        self.addCleanup(self.downloader.close)
+        self.item = item_from_url('https://x.com/_Nag1chan/status/2104881580913426735')
+
+    def image(self, name='one.jpg'):
+        path = self.root / name
+        path.write_bytes(b'fixture media')
+        return str(path)
+
+    def test_image_only_tweet_never_calls_yt_dlp(self):
+        item = {**self.item, 'media_ids': ['HTYKoXTbMAEToXI']}
+        with patch.object(self.downloader, 'download_images', return_value=[self.image()]), \
+             patch.object(self.downloader, 'download_video') as video, \
+             patch.object(BrowserCollector, 'collect_single') as probe:
+            status, files, error = self.downloader.download_item(item)
+        self.assertEqual((status, error), ('done', ''))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self.store.get_tweet(item['tweet_id'])['media_hint'], 'image')
+        video.assert_not_called()
+        probe.assert_not_called()
+
+    def test_missing_list_media_recovered_from_detail_page(self):
+        detail = {**self.item, 'media_ids': ['HTYKoXTbMAEToXI'], '_detail_checked': True}
+        with patch.object(self.downloader, 'download_images', side_effect=[[], [self.image()]]), \
+             patch.object(BrowserCollector, 'collect_single', new_callable=AsyncMock, return_value=detail) as probe, \
+             patch.object(self.downloader, 'download_video') as video:
+            self.assertEqual(self.downloader.download_item(self.item)[0], 'done')
+        probe.assert_awaited_once_with(self.item['url'])
+        video.assert_not_called()
+
+    def test_no_media_is_failed_without_video_error_or_repeat_probe(self):
+        with patch.object(self.downloader, 'download_images', return_value=[]), \
+             patch.object(BrowserCollector, 'collect_single', new_callable=AsyncMock,
+                          return_value={**self.item, '_detail_checked': True}) as probe, \
+             patch.object(self.downloader, 'download_video') as video:
+            result = self.downloader.download_item(self.item)
+        self.assertEqual(result, ('failed', [], 'no downloadable media found in tweet'))
+        probe.assert_awaited_once()
+        video.assert_not_called()
+        with patch.object(BrowserCollector, 'collect_single') as probe:
+            self.downloader.download_item({**self.item, '_detail_checked': True}, force=True)
+        probe.assert_not_called()
+
+    def test_unparsed_single_tweet_does_not_invent_video(self):
+        collector = BrowserCollector(self.config, self.log)
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        from contextlib import asynccontextmanager
+        @asynccontextmanager
+        async def fake_page(_cookies):
+            yield page
+        with patch.object(collector, '_load_cookies', return_value=([], None)), \
+             patch.object(collector, '_browser_page', fake_page), \
+             patch.object(collector, '_collect_visible', new_callable=AsyncMock, return_value=[]):
+            import asyncio
+            item = asyncio.run(collector.collect_single(self.item['url']))
+        self.assertFalse(item['has_video'])
+        self.assertTrue(item['_detail_checked'])
+
+    def test_video_and_mixed_tweets_still_use_video_downloader(self):
+        for media_ids in ([], ['photo']):
+            with self.subTest(media_ids=media_ids), \
+                 patch.object(self.downloader, 'download_images', return_value=[self.image()] if media_ids else []), \
+                 patch.object(self.downloader, 'download_video', return_value=[self.image('video.mp4')]) as video, \
+                 patch.object(BrowserCollector, 'collect_single') as probe:
+                item = {**self.item, 'media_ids': media_ids, 'has_video': True}
+                self.assertEqual(self.downloader.download_item(item, force=True)[0], 'done')
+                video.assert_called_once_with(item)
+                probe.assert_not_called()
+
+    def test_incomplete_multi_image_tweet_keeps_files_and_remains_retryable(self):
+        file = self.image()
+        item = {**self.item, 'media_ids': ['one', 'two']}
+        with patch.object(self.downloader, 'download_images', return_value=[file]), \
+             patch.object(self.downloader, 'download_video') as video:
+            status, files, error = self.downloader.download_item(item)
+        self.assertEqual(status, 'failed')
+        self.assertEqual(files, [file])
+        self.assertIn('1/2', error)
+        self.assertEqual(json.loads(self.store.get_tweet(item['tweet_id'])['files_json']), [file])
+        self.assertTrue(self.store.should_download(item['tweet_id'], True, 0, False))
+        video.assert_not_called()
+
+    def test_video_failure_retains_successful_images(self):
+        file = self.image()
+        with patch.object(self.downloader, 'download_images', return_value=[file]), \
+             patch.object(self.downloader, 'download_video', side_effect=RuntimeError('video unavailable')):
+            result = self.downloader.download_item({**self.item, 'media_ids': ['one'], 'has_video': True})
+        self.assertEqual(result, ('failed', [file], 'video unavailable'))
+
+    def test_skip_existing_done_tweet_does_not_probe_or_download(self):
+        self.store.upsert_seen(self.item)
+        self.store.mark_result(self.item['tweet_id'], 'done', [self.image()])
+        with patch.object(self.downloader, 'download_images') as images, \
+             patch.object(BrowserCollector, 'collect_single') as probe:
+            self.assertEqual(self.downloader.download_item(self.item), ('skipped', [], ''))
+        images.assert_not_called()
+        probe.assert_not_called()
+
+    def test_store_connections_commit_roll_back_and_close(self):
+        with self.store.connection() as conn:
+            conn.execute("insert into tweets(tweet_id, url, first_seen_at, updated_at) values('test', 'url', '', '')")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute('select 1')
+        with self.assertRaisesRegex(RuntimeError, 'rollback'):
+            with self.store.connection() as conn:
+                conn.execute("delete from tweets where tweet_id='test'")
+                raise RuntimeError('rollback')
+        self.assertIsNotNone(self.store.get_tweet('test'))
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute('select 1')
+
+    def test_image_download_cleans_interrupted_and_empty_parts(self):
+        target = self.root / 'test.jpg'
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {'content-type': 'image/jpeg'}
+        response.__enter__.return_value = response
+        def interrupted(*args, **kwargs):
+            yield b'partial'
+            raise requests.ConnectionError('interrupted')
+        response.iter_content.side_effect = interrupted
+        with patch.object(self.downloader.session, 'get', return_value=response):
+            with self.assertRaises(requests.ConnectionError):
+                self.downloader._download_image('https://pbs.twimg.com/media/test', target)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_suffix('.jpg.part').exists())
+            response.iter_content.side_effect = None
+            response.iter_content.return_value = iter([])
+            self.assertFalse(self.downloader._download_image('https://pbs.twimg.com/media/test', target))
+        self.assertFalse(target.exists())
+        self.assertFalse(target.with_suffix('.jpg.part').exists())
+
+    def test_image_candidates_stop_after_success_and_keep_custom_config(self):
+        custom = ['{media_id}.png?name=orig']
+        self.config['media']['image_candidates'] = custom
+        self.assertEqual(self.downloader._image_candidates('abc'), [('https://pbs.twimg.com/media/abc.png?name=orig', 'png')])
+        self.config['media']['image_candidates'] = X_DEFAULT_CONFIG['media']['image_candidates']
+        attempted = []
+        def download(url, target):
+            attempted.append(url)
+            target.write_bytes(b'complete')
+            return True
+        with patch.object(self.downloader, '_download_image', side_effect=download):
+            self.assertEqual(len(self.downloader.download_images({**self.item, 'media_ids': ['abc']})), 1)
+        self.assertEqual(attempted, ['https://pbs.twimg.com/media/abc?format=jpg&name=orig'])
+
+
+class XBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.collector = BrowserCollector(json.loads(json.dumps(X_DEFAULT_CONFIG)), XRingLog())
+        self.page_manager = self.collector._browser_page([])
+        self.page = await self.page_manager.__aenter__()
+
+    async def asyncTearDown(self):
+        await self.page_manager.__aexit__(None, None, None)
+
+    async def load(self, contents):
+        await self.page.route('https://x.com/fixture', lambda route: route.fulfill(
+            content_type='text/html', body=contents))
+        await self.page.goto('https://x.com/fixture')
+
+    async def test_responsive_multi_photos_survive_image_error_handlers(self):
+        await self.load('''<article><a href="/test/status/123"><time>now</time></a>
+          <p>Watch my Cosplay, 播放量</p>
+          <div data-testid="tweetPhoto"><a href="/test/status/123/photo/1">
+            <img src="https://pbs.twimg.com/media/HTYKoXTbMAEToXI.jpg?name=small"
+                 onerror="this.remove()" onload="this.dataset.loaded='yes'">
+          </a></div>
+          <picture><source srcset="https://pbs.twimg.com/media/second_ID?format=png&amp;name=small 1x,
+                        https://pbs.twimg.com/media/second_ID?format=png&amp;name=orig 2x">
+            <img src="https://pbs.twimg.com/media/second_ID?format=png&amp;name=small"></picture>
+          <img data-src="https://pbs.twimg.com/media/third-ID.png?name=orig">
+          <img src="https://pbs.twimg.com/profile_images/avatar.jpg">
+          </article>''')
+        await self.page.wait_for_function("document.querySelector('img').dataset.loaded === 'yes'")
+        rows = await self.collector._collect_visible(self.page)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['media_ids'], ['HTYKoXTbMAEToXI', 'second_ID', 'third-ID'])
+        self.assertFalse(rows[0]['has_video'])
+        self.assertTrue(await self.page.evaluate("document.querySelector('img').naturalWidth === 1"))
+
+    async def test_sensitive_content_button_mounts_media_before_scan(self):
+        await self.load('''<article><a href="/test/status/123"><time>now</time></a>
+          <div data-testid="tweetPhoto">Sensitive content
+          <button onclick="setTimeout(() => {this.parentNode.innerHTML =
+            '<img src=&quot;https://pbs.twimg.com/media/revealed.jpg?name=orig&quot;>'}, 50)">Show</button>
+          </div></article>''')
+        rows = await self.collector._collect_visible(self.page)
+        self.assertEqual(rows[0]['media_ids'], ['revealed'])
+        self.assertFalse(rows[0]['has_video'])
+
+    async def test_text_keywords_and_unrelated_show_buttons_are_not_media(self):
+        await self.load('''<article><a href="/test/status/123"><time>now</time></a>
+          <p>Play Watch Cosplay 播放</p>
+          <button onclick="this.dataset.clicked='yes'">Show</button></article>''')
+        row = (await self.collector._collect_visible(self.page))[0]
+        self.assertEqual(row['media_ids'], [])
+        self.assertFalse(row['has_video'])
+        self.assertFalse(await self.page.evaluate("document.querySelector('button').dataset.clicked === 'yes'"))
+
+    async def test_video_elements_and_responsive_video_thumbnails(self):
+        await self.load('''<article><a href="/test/status/123"><time>now</time></a><video></video></article>
+          <article><a href="/test/status/124"><time>now</time></a><div data-testid="videoPlayer"></div></article>
+          <article><a href="/test/status/125"><time>now</time></a>
+            <img srcset="https://pbs.twimg.com/ext_tw_video_thumb/123/pu/img/thumb.jpg 1x"></article>''')
+        rows = await self.collector._collect_visible(self.page)
+        self.assertEqual([row['tweet_id'] for row in rows], ['123', '124', '125'])
+        self.assertTrue(all(row['has_video'] for row in rows))
+        self.assertTrue(all(not row['media_ids'] for row in rows))
+
+
 class PixivNetworkTests(unittest.TestCase):
+    def test_concat_paths_escape_apostrophes_and_resolve_relative_directories(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            folder = Path(tmp).relative_to(ROOT) / "artist's frames"
+            folder.mkdir()
+            (folder / "frame's.png").write_bytes(b'image fixture')
+            target = folder / 'out.gif'
+            downloader = PixivDownloader.__new__(PixivDownloader)
+            downloader.config = {}
+            def ffmpeg(_command, **_kwargs):
+                target.write_bytes(b'gif fixture')
+                return MagicMock(returncode=0)
+            with patch('pixiv_auto_worker.shutil.which', return_value='ffmpeg'), \
+                 patch('pixiv_auto_worker.subprocess.run', side_effect=ffmpeg):
+                downloader.convert_ugoira_to_gif(folder, [{'file': "frame's.png", 'delay': 80}], target)
+            expected = (folder / "frame's.png").resolve().as_posix().replace("'", "'\\''")
+            self.assertEqual((folder / 'frames.txt').read_text(encoding='utf-8'),
+                             f"file '{expected}'\nduration 0.080\nfile '{expected}'\n")
+
+    def test_ugoira_metadata_cannot_reference_frames_outside_extracted_zip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / 'frames'
+            folder.mkdir()
+            (root / 'outside.png').write_bytes(b'image fixture')
+            downloader = PixivDownloader.__new__(PixivDownloader)
+            downloader.config = {}
+            with patch('pixiv_auto_worker.shutil.which', return_value='ffmpeg'), \
+                 patch('pixiv_auto_worker.subprocess.run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'invalid frame path'):
+                    downloader.convert_ugoira_to_gif(folder, [{'file': '../outside.png'}], folder / 'out.gif')
+            run.assert_not_called()
+
     def test_classifies_transient_network_errors(self) -> None:
         self.assertEqual(classify_error(requests.exceptions.SSLError("UNEXPECTED_EOF_WHILE_READING")), "network")
         self.assertEqual(classify_error(PixivError("requests POST https://oauth.secure.pixiv.net/auth/token error")), "network")

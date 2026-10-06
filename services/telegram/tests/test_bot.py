@@ -1,4 +1,5 @@
 import asyncio
+import weakref
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,65 @@ def make_manager(tmp_path, retries=3):
     manager.settings = settings
     manager.retry_delay = lambda _: 0
     return manager, settings, history
+
+
+@pytest.mark.asyncio
+async def test_reconnect_releases_retained_exception_buffers_and_backs_off(tmp_path, monkeypatch):
+    manager, _, _ = make_manager(tmp_path)
+    retained = OSError("disconnected")
+    buffers = []
+    waits = []
+
+    class Buffer:
+        pass
+
+    class Client:
+        def is_connected(self):
+            return True
+
+        async def run_until_disconnected(self):
+            buffer = Buffer()
+            buffer.data = bytearray(1024 * 1024)
+            buffers.append(weakref.ref(buffer))
+            raise retained
+
+    async def sleep(delay):
+        waits.append(delay)
+        assert retained.__traceback__ is None
+        assert all(ref() is None for ref in buffers)
+        if len(waits) == 6:
+            manager._stopping = True
+
+    monkeypatch.setattr("app.bot.asyncio.sleep", sleep)
+    await manager._run_until_disconnected(Client())
+    assert waits == [3, 6, 12, 24, 30, 30]
+    assert manager.last_error == "OSError: disconnected"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resets_backoff_after_stable_connection(tmp_path, monkeypatch):
+    manager, _, _ = make_manager(tmp_path)
+    clock = [100.0]
+    waits = []
+
+    class Client:
+        def is_connected(self):
+            return True
+
+        async def run_until_disconnected(self):
+            if len(waits) == 2:
+                clock[0] += 61
+            raise OSError("disconnected")
+
+    async def sleep(delay):
+        waits.append(delay)
+        if len(waits) == 3:
+            manager._stopping = True
+
+    monkeypatch.setattr("app.bot.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("app.bot.asyncio.sleep", sleep)
+    await manager._run_until_disconnected(Client())
+    assert waits == [3, 6, 3]
 
 
 def test_pause_duration_parser_and_runtime_controls():

@@ -26,7 +26,7 @@ from nas_auto.proxy import stream_proxy
 
 PORT = int(os.environ.get("PORT", "14001"))
 ROOT = Path("/opt/nas-auto")
-APP_VERSION = os.environ.get("APP_VERSION", "v3.0.1")
+APP_VERSION = os.environ.get("APP_VERSION", "v3.0.2")
 _frontend_candidates = (
     Path(__file__).resolve().parent / "frontend" / "dist",
     Path(__file__).resolve().parents[1] / "frontend" / "dist",
@@ -244,8 +244,8 @@ def ensure_configs() -> None:
             "queue_files": ["/queue/xhs/links.txt"],
             "settings_path": "/xhs-volume/settings.json",
             "xhs_api_log_file": "/xhs-volume/xhs-api.log",
-            "image_format": os.environ.get("XHS_IMAGE_FORMAT", "AUTO"),
-            "request_delay_seconds": int(os.environ.get("XHS_REQUEST_DELAY_SECONDS", "0")),
+            "image_format": os.environ.get("XHS_IMAGE_FORMAT", "JPEG"),
+            "request_delay_seconds": int(os.environ.get("XHS_REQUEST_DELAY_SECONDS", "1")),
             "jitter_seconds": int(os.environ.get("XHS_JITTER_SECONDS", "0")),
             "max_items_per_run": int(os.environ.get("XHS_MAX_ITEMS_PER_RUN", "0") or "0"),
             "web": {"host": "127.0.0.1", "port": 18081, "log_lines": 5000},
@@ -388,12 +388,11 @@ def is_ascii_cookie_pair(name: str, value: str) -> bool:
 def select_douyin_cookie_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
     values: dict[str, str] = {}
     for name, value in dedupe_cookie_pairs(pairs):
-        if name not in DOUYIN_REFERENCE_COOKIE_NAMES:
-            continue
         if not value or not is_ascii_cookie_pair(name, value):
             continue
         values[name] = value
-    return [(name, values[name]) for name in DOUYIN_REFERENCE_COOKIE_ORDER if name in values]
+    ordered = [(name, values[name]) for name in DOUYIN_REFERENCE_COOKIE_ORDER if name in values]
+    return ordered + [(name, value) for name, value in values.items() if name not in DOUYIN_REFERENCE_COOKIE_NAMES]
 
 
 def extract_douyin_cookie_text(text: str) -> str:
@@ -429,6 +428,9 @@ def render_douyin_cookie_block_lines(cookie_text: str, base_indent: str = "") ->
         line_parts = [f"{name}={values[name]}" for name in group if name in values]
         if line_parts:
             grouped_parts.append(line_parts)
+    for name, value in values.items():
+        if name not in DOUYIN_REFERENCE_COOKIE_NAMES:
+            grouped_parts.append([f"{name}={value}"])
     if not grouped_parts:
         return [f"{base_indent}cookie:"]
     lines: list[str] = []

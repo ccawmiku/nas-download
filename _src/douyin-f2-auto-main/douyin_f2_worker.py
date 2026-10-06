@@ -359,12 +359,11 @@ def is_ascii_cookie_pair(name: str, value: str) -> bool:
 def select_douyin_cookie_pairs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
     values: dict[str, str] = {}
     for name, value in dedupe_cookie_pairs(pairs):
-        if name not in DOUYIN_REFERENCE_COOKIE_NAMES:
-            continue
         if not value or not is_ascii_cookie_pair(name, value):
             continue
         values[name] = value
-    return [(name, values[name]) for name in DOUYIN_REFERENCE_COOKIE_ORDER if name in values]
+    ordered = [(name, values[name]) for name in DOUYIN_REFERENCE_COOKIE_ORDER if name in values]
+    return ordered + [(name, value) for name, value in values.items() if name not in DOUYIN_REFERENCE_COOKIE_NAMES]
 
 
 def extract_cookie_block(text: str) -> str:
@@ -418,6 +417,10 @@ def render_cookie_block_lines(cookie_text: str, base_indent: str = "") -> list[s
         line_parts = [f"{name}={values[name]}" for name in group if name in values]
         if line_parts:
             grouped_parts.append(line_parts)
+    # Preserve new security tokens throughout the saved-cookie and f2 YAML path.
+    for name, value in values.items():
+        if name not in DOUYIN_REFERENCE_COOKIE_NAMES:
+            grouped_parts.append([f"{name}={value}"])
     if not grouped_parts:
         return [f"{base_indent}cookie:"]
     lines: list[str] = []
@@ -450,6 +453,15 @@ def render_douyin_job_yaml(douyin: dict[str, Any]) -> str:
     if not replaced:
         raise RuntimeError("未找到抖音 Cookie 占位符，无法生成参考格式 YAML")
     return "\n".join(output_lines) + "\n"
+
+
+def f2_network_hint(line: str) -> str:
+    lowered = line.lower()
+    redirect = re.search(r"redirect response\s+['\"]?(?:301|302|303|307|308)\b", lowered)
+    portal = re.search(r"\b(?:gportal|captive[ -]portal)\b", lowered)
+    if redirect or portal:
+        return "网络请求被重定向，可能需要网络认证、宽带续费或检查代理连接"
+    return ""
 
 
 def build_douyin_job_payload(config: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
@@ -845,13 +857,18 @@ class App:
         assert proc.stdout is not None
         stopped_by_guard = False
         stopped_by_timeout = False
+        network_hint = ""
 
         def reader() -> None:
-            nonlocal stopped_by_guard
+            nonlocal stopped_by_guard, network_hint
             for raw in proc.stdout:
                 line = raw.rstrip()
                 if line:
                     self.log.write(f"{key}: {line}")
+                    hint = f2_network_hint(line)
+                    if hint and not network_hint:
+                        network_hint = hint
+                        self.log.write(f"{key}: {hint}")
                     if guard.observe(line) and proc.poll() is None:
                         stopped_by_guard = True
                         self.log.write(
@@ -897,7 +914,7 @@ class App:
             message = "ok"
         else:
             status = "failed"
-            message = f"f2 exited with {returncode}"
+            message = f"f2 exited with {returncode}" + (f"：{network_hint}" if network_hint else "")
         self.log.write(f"{key}: {message}")
         return RunResult(key, status, returncode, started_at, now_iso(), message)
 

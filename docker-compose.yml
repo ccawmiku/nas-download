@@ -1,7 +1,10 @@
 name: nas-download
 services:
   xhs-api:
-    image: ghcr.io/joeanamier/xhs-downloader:2.7
+    image: ghcr.io/joeanamier/xhs-downloader:2.8
+    dns:
+    - 223.5.5.5
+    - 119.29.29.29
     container_name: nas-download-xhs-api
     ports:
     - 13001:5556
@@ -10,11 +13,11 @@ services:
     - /volume1/se-p/小红书:/xhs
     tty: true
     stdin_open: true
-    command: bash -lc "python main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
+    command: bash -lc "python -u main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
     restart: unless-stopped
     stop_grace_period: 45s
   console:
-    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.1}
+    image: ghcr.io/ccawmiku/nas-download:${NAS_DOWNLOAD_VERSION:-v3.0.2}
     container_name: nas-download
     environment:
       TELEGRAM_HOST: telegram-worker
@@ -44,7 +47,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
   telegram-worker:
-    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.1}
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v3.0.2}
     container_name: nas-download-telegram
     environment:
       ADMIN_PASSWORD: ${TELEGRAM_ADMIN_PASSWORD:-}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import html
 import json
 import os
@@ -15,7 +16,7 @@ import sys
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -45,6 +46,8 @@ TWEET_RE = re.compile(r"/([^/?#]+)/status/(\d+)")
 MEDIA_ID_RE = re.compile(r"/media/([^?./]+)(?:\.[a-zA-Z0-9]+)?")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
+# A valid transparent GIF lets image onload handlers run without fetching media.
+TINY_IMAGE_PAYLOAD = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "run_interval_hours": 12,
@@ -92,10 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "video_format": "bv*+ba/b",
         "convert_gif": True,
         "image_candidates": [
+            "{media_id}?format=jpg&name=orig",
+            "{media_id}?format=png&name=orig",
             "{media_id}.png?name=4096x4096",
             "{media_id}.jpg?name=4096x4096",
             "{media_id}?format=png&name=4096x4096",
-            "{media_id}?format=jpg&name=orig",
             "{media_id}?format=jpg&name=4096x4096",
             "{media_id}.jpg?name=orig",
         ],
@@ -258,8 +262,17 @@ class Store:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def connection(self):
+        conn = self.connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init(self) -> None:
-        with self.connect() as conn:
+        with self.connection() as conn:
             conn.executescript(
                 """
                 create table if not exists tweets (
@@ -292,7 +305,7 @@ class Store:
             )
 
     def begin_run(self) -> int:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connection() as conn:
             cur = conn.execute(
                 "insert into runs(started_at, status) values(?, 'running')",
                 (now_iso(),),
@@ -300,7 +313,7 @@ class Store:
             return int(cur.lastrowid)
 
     def finish_run(self, run_id: int, status: str, stats: dict[str, int], message: str = "") -> None:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connection() as conn:
             conn.execute(
                 """
                 update runs
@@ -321,7 +334,7 @@ class Store:
 
     def upsert_seen(self, item: dict[str, Any]) -> None:
         media_hint = media_hint_from_item(item)
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connection() as conn:
             conn.execute(
                 """
                 insert into tweets(tweet_id, url, author, text, media_hint, first_seen_at, updated_at)
@@ -348,7 +361,7 @@ class Store:
             )
 
     def get_tweet(self, tweet_id: str) -> sqlite3.Row | None:
-        with self.connect() as conn:
+        with self.connection() as conn:
             return conn.execute("select * from tweets where tweet_id=?", (tweet_id,)).fetchone()
 
     def _row_has_existing_media(self, row: sqlite3.Row) -> bool:
@@ -392,7 +405,7 @@ class Store:
         error: str = "",
         media_hint: str = "",
     ) -> None:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connection() as conn:
             conn.execute(
                 """
                 update tweets
@@ -416,7 +429,7 @@ class Store:
             )
 
     def recent_tweets(self, limit: int = 80) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with self.connection() as conn:
             rows = conn.execute(
                 "select * from tweets order by updated_at desc limit ?", (limit,)
             ).fetchall()
@@ -437,7 +450,7 @@ class Store:
             return result
 
     def manual_failed_tweets(self, limit: int = 200) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with self.connection() as conn:
             rows = conn.execute(
                 """
                 select tweet_id, url, author, media_hint, status, attempts, error, updated_at
@@ -455,12 +468,12 @@ class Store:
             return [dict(row) for row in rows]
 
     def delete_tweet(self, tweet_id: str) -> bool:
-        with self._lock, self.connect() as conn:
+        with self._lock, self.connection() as conn:
             cur = conn.execute("delete from tweets where tweet_id=?", (tweet_id,))
             return int(cur.rowcount or 0) > 0
 
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with self.connection() as conn:
             rows = conn.execute(
                 "select * from runs order by id desc limit ?", (limit,)
             ).fetchall()
@@ -805,13 +818,19 @@ class BrowserCollector:
             )
             try:
                 await context.add_cookies(cookies)
-                # Tweet media URLs remain in DOM attributes even when the
-                # browser does not download the files. Actual downloads are
-                # handled separately by the worker.
+                # Keep image load callbacks successful so React retains media
+                # nodes. Actual image bytes are downloaded by the worker.
                 async def reduce_browser_resources(route: Any) -> None:
                     resource_type = route.request.resource_type
                     block_images = not bool(browser_cfg.get("screenshot_enabled", False))
-                    if resource_type in {"media", "font"} or (block_images and resource_type == "image"):
+                    if block_images and resource_type == "image":
+                        await route.fulfill(
+                            status=200,
+                            content_type="image/gif",
+                            headers={"Cache-Control": "public, max-age=86400"},
+                            body=TINY_IMAGE_PAYLOAD,
+                        )
+                    elif resource_type in {"media", "font"}:
                         await route.abort()
                     else:
                         await route.continue_()
@@ -876,27 +895,57 @@ class BrowserCollector:
 
     async def _collect_visible(self, page: Any) -> list[dict[str, Any]]:
         return await page.evaluate(
-            """() => {
+            r"""async () => {
+              let revealed = false;
+              for (const article of document.querySelectorAll('article')) {
+                for (const button of article.querySelectorAll('button, div[role="button"]')) {
+                  const label = (button.innerText || '').trim();
+                  const media = button.closest('[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="videoComponent"]');
+                  const warning = /敏感|警告|sensitive|content warning|センシティブ/i.test(article.innerText);
+                  if ((media || warning) && /^(显示|查看|查看内容|显示内容|View|Show|表示)$/i.test(label)) {
+                    button.click();
+                    revealed = true;
+                  }
+                }
+              }
+              // React may mount the revealed images on a subsequent turn.
+              if (revealed) await new Promise(resolve => setTimeout(resolve, 300));
               const rows = [];
               for (const article of document.querySelectorAll('article')) {
-                const link = Array.from(article.querySelectorAll('a[href*="/status/"]'))
+                const timestamp = article.querySelector('time')?.closest('a[href*="/status/"]');
+                const links = Array.from(article.querySelectorAll('a[href*="/status/"]'));
+                if (timestamp) links.unshift(timestamp);
+                const link = links
                   .map(a => new URL(a.getAttribute('href'), location.href).href)
-                  .find(h => /https:\\/\\/x\\.com\\/[^/]+\\/status\\/\\d+/.test(h));
+                  .find(h => /https:\/\/x\.com\/[^/]+\/status\/\d+/.test(h));
                 if (!link) continue;
-                const match = link.match(/https:\\/\\/x\\.com\\/([^/]+)\\/status\\/(\\d+)/);
+                const match = link.match(/https:\/\/x\.com\/([^/]+)\/status\/(\d+)/);
                 if (!match) continue;
                 const mediaIds = [];
-                for (const img of article.querySelectorAll('img[src*="twimg.com/media"]')) {
-                  const m = img.src.match(/\\/media\\/([^?./]+)(?:\\.[a-zA-Z0-9]+)?/);
-                  if (m && !mediaIds.includes(m[1])) mediaIds.push(m[1]);
+                const urlsFor = node => [node.currentSrc, node.getAttribute('src'), node.getAttribute('data-src'),
+                  ...(node.getAttribute('srcset') || '').split(',').map(part => part.trim().split(/\s+/)[0])].filter(Boolean);
+                const addMedia = value => {
+                  try {
+                    const url = new URL(value, location.href);
+                    if (url.hostname !== 'pbs.twimg.com') return;
+                    const m = url.pathname.match(/^\/media\/([A-Za-z0-9_-]+)(?:\.[A-Za-z0-9]+)?$/);
+                    if (m && !mediaIds.includes(m[1])) mediaIds.push(m[1]);
+                  } catch (_) {}
+                };
+                for (const node of article.querySelectorAll('img, picture source')) {
+                  for (const url of urlsFor(node)) addMedia(url);
                 }
-                const videoThumbs = Array.from(article.querySelectorAll(
-                  'img[src*="twimg.com/amplify_video_thumb"], img[src*="twimg.com/ext_tw_video_thumb"], img[src*="twimg.com/tweet_video_thumb"]'
-                ));
+                for (const photo of article.querySelectorAll('[data-testid="tweetPhoto"], a[href*="/photo/"]')) {
+                  addMedia(photo.getAttribute('href'));
+                  for (const node of photo.querySelectorAll('img, source')) {
+                    for (const url of urlsFor(node)) addMedia(url);
+                  }
+                }
+                const videoThumbs = Array.from(article.querySelectorAll('img, picture source')).filter(node =>
+                  urlsFor(node).some(url => /\/((amplify_video|ext_tw_video|tweet_video)_thumb)\//.test(url)));
                 const videoLike = !!article.querySelector('video')
                   || !!article.querySelector('[data-testid="videoPlayer"], [data-testid="videoComponent"], [data-testid="playButton"]')
-                  || videoThumbs.length > 0
-                  || /播放|Play|Watch/i.test(article.innerText);
+                  || videoThumbs.length > 0;
                 rows.push({
                   tweet_id: match[2],
                   author: match[1],
@@ -920,12 +969,18 @@ class BrowserCollector:
             self.log.write(f"打开单条推文页面：{fallback['url']}")
             await page.goto(fallback["url"], wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(random.randint(2500, 4200))
-            rows = await self._collect_visible(page)
-            for row in rows:
-                if row["tweet_id"] == tweet_id:
-                    return row
-            self.log.write("单条页面没有解析到媒体卡片，将回退到 yt-dlp 直接测试")
-            return {**fallback, "has_video": True}
+            matched = fallback
+            for attempt in range(3):
+                rows = await self._collect_visible(page)
+                for row in rows:
+                    if row["tweet_id"] == tweet_id:
+                        matched = row
+                        if row.get("media_ids") or row.get("has_video"):
+                            return {**row, "_detail_checked": True}
+                if attempt < 2:
+                    await page.wait_for_timeout(700)
+            self.log.write("单条页面没有解析到媒体卡片")
+            return {**matched, "_detail_checked": True}
 
     async def collect(self) -> BrowserResult:
         cookies, user_id = self._load_cookies()
@@ -982,7 +1037,7 @@ class BrowserCollector:
                         seen[tweet_id] = row
                     else:
                         current = seen[tweet_id]
-                        current["media_ids"] = sorted(set(current.get("media_ids", []) + row.get("media_ids", [])))
+                        current["media_ids"] = list(dict.fromkeys(current.get("media_ids", []) + row.get("media_ids", [])))
                         current["has_video"] = current.get("has_video") or row.get("has_video")
                         if len(row.get("text", "")) > len(current.get("text", "")):
                             current["text"] = row.get("text", "")
@@ -1062,6 +1117,10 @@ class Downloader:
         self.config = config
         self.store = store
         self.log = log
+        self.session = requests.Session()
+
+    def close(self) -> None:
+        self.session.close()
 
     def _media_dirs(self) -> dict[str, Path]:
         root = Path(self.config["download_dir"])
@@ -1104,19 +1163,24 @@ class Downloader:
 
     def _download_image(self, url: str, path: Path) -> bool:
         headers = {"User-Agent": self.config.get("default_user_agent", "")}
-        with requests.get(url, headers=headers, timeout=45, stream=True) as response:
+        with self.session.get(url, headers=headers, timeout=45, stream=True) as response:
             if response.status_code != 200:
                 return False
             ctype = response.headers.get("content-type", "")
             if not ctype.startswith("image/"):
                 return False
             tmp = path.with_suffix(path.suffix + ".part")
-            with tmp.open("wb") as file:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    if chunk:
-                        file.write(chunk)
-            tmp.replace(path)
-            return path.stat().st_size > 0
+            try:
+                with tmp.open("wb") as file:
+                    for chunk in response.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            file.write(chunk)
+                if tmp.stat().st_size <= 0:
+                    return False
+                tmp.replace(path)
+                return True
+            finally:
+                tmp.unlink(missing_ok=True)
 
     def _valid_media_files(self, files: list[str]) -> list[str]:
         valid = []
@@ -1293,30 +1357,41 @@ class Downloader:
         ):
             return "skipped", [], ""
         media_hint = media_hint_from_item(item)
+        files: list[str] = []
         try:
-            files = []
-            files.extend(self.download_images(item))
-            fallback_error = ""
+            files = self._valid_media_files(self.download_images(item))
+            if not files and not item.get("has_video") and not item.get("_detail_checked"):
+                if self.config.get("browser", {}).get("enabled", True):
+                    collector = BrowserCollector(self.config, self.log, self.store)
+                    detail = asyncio.run(collector.collect_single(item["url"]))
+                    item = {
+                        **item, **detail,
+                        "media_ids": list(dict.fromkeys((item.get("media_ids") or []) + (detail.get("media_ids") or []))),
+                        "has_video": bool(item.get("has_video") or detail.get("has_video")),
+                    }
+                    self.store.upsert_seen(item)
+                    media_hint = media_hint_from_item(item)
+                    files = self._valid_media_files(self.download_images(item))
+            image_count = len(files)
             if item.get("has_video"):
-                files.extend(self.download_video(item))
-            if not files:
-                try:
-                    files.extend(self.download_video({**item, "has_video": True}))
-                except Exception as error:
-                    fallback_error = str(error)
-                    if media_hint == "unknown" and "No video could be found" in fallback_error:
-                        media_hint = "manual_check"
+                videos = self._valid_media_files(self.download_video(item))
+                files.extend(videos)
+                if not videos:
+                    raise RuntimeError("no downloadable video found in tweet")
+            if image_count < len(item.get("media_ids") or []):
+                raise RuntimeError(f"incomplete image download: {image_count}/{len(item['media_ids'])}")
             files = self._valid_media_files(files)
             file_hint = media_hint_from_files(files)
             if file_hint:
                 media_hint = file_hint
             status = "done" if files else "failed"
-            error = "" if files else (fallback_error or "no downloadable media found")
+            error = "" if files else "no downloadable media found in tweet"
             self.store.mark_result(tweet_id, status, files, error, media_hint)
             return status, files, error
         except Exception as error:
-            self.store.mark_result(tweet_id, "failed", [], str(error), media_hint)
-            return "failed", [], str(error)
+            files = self._valid_media_files(files)
+            self.store.mark_result(tweet_id, "failed", files, str(error), media_hint)
+            return "failed", files, str(error)
 
 
 class App:
@@ -1483,6 +1558,7 @@ class App:
         run_id = self.store.begin_run()
         stats = {"discovered": 1, "downloaded": 0, "skipped": 0, "failed": 0}
         message = ""
+        downloader: Downloader | None = None
         try:
             self.reload_config()
             item = item_from_url(url)
@@ -1500,8 +1576,7 @@ class App:
                 collector = BrowserCollector(self.config, self.log, self.store, self.set_progress)
                 item = asyncio.run(collector.collect_single(item["url"]))
             except Exception as error:
-                self.log.write(f"手动下载浏览器探测失败，回退到 yt-dlp：{error}")
-                item = {**item, "has_video": True}
+                raise RuntimeError(f"单条推文媒体探测失败：{error}") from error
             downloader = Downloader(self.config, self.store, self.log)
             status, files, error = downloader.download_item(item, force=True)
             if status == "done":
@@ -1534,6 +1609,8 @@ class App:
             self.log.write(traceback.format_exc())
             self.store.finish_run(run_id, "failed", stats, message)
         finally:
+            if downloader is not None:
+                downloader.close()
             self.set_progress({"phase": "idle", "current_url": ""})
             self._release_run(message)
 
@@ -1547,6 +1624,7 @@ class App:
         run_id = self.store.begin_run()
         stats = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
         message = ""
+        downloader: Downloader | None = None
         try:
             self.reload_config()
             self.log.write("Run started")
@@ -1607,6 +1685,8 @@ class App:
             self.store.finish_run(run_id, "failed", stats, message)
             raise
         finally:
+            if downloader is not None:
+                downloader.close()
             self._release_run(message)
 
     def _count_media_files(self, files: list[str]) -> dict[str, int]:

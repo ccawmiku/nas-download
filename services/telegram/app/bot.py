@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -609,6 +610,7 @@ class BotManager:
     async def _run_until_disconnected(self, client: TelegramClient) -> None:
         reconnect_delay = 3
         while not self._stopping:
+            connected_at = None
             try:
                 if not client.is_connected():
                     logger.warning("Bot 未连接，正在尝试连接 Telegram...")
@@ -617,13 +619,28 @@ class BotManager:
                         assert self.settings is not None
                         await client.start(bot_token=self.settings.bot_token)
                     logger.info("Bot 已成功重新连接至 Telegram")
-                reconnect_delay = 3
+                connected_at = time.monotonic()
                 await client.run_until_disconnected()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                if connected_at is not None and time.monotonic() - connected_at >= 60:
+                    reconnect_delay = 3
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Bot 断开连接或发生异常，将在 %s 秒后尝试重连", reconnect_delay)
+                # Telethon may retain/re-raise this exception via a Future.
+                # After logging, release completed frames and their buffers.
+                seen: set[int] = set()
+                error: BaseException | None = exc
+                while error is not None and id(error) not in seen:
+                    seen.add(id(error))
+                    traceback.clear_frames(error.__traceback__)
+                    error.__traceback__ = None
+                    error = error.__cause__ or error.__context__
+                error = None
+            else:
+                if connected_at is not None and time.monotonic() - connected_at >= 60:
+                    reconnect_delay = 3
             if self._stopping:
                 break
             try:

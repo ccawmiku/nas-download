@@ -4,11 +4,9 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
-
-from PIL import Image, ImageOps, UnidentifiedImageError
-
 
 PREVIEW_SIZE = (320, 180)
 PREVIEWABLE_CATEGORIES = {"images", "videos"}
@@ -64,22 +62,20 @@ class PreviewGenerator:
 
     @staticmethod
     def _generate_image(source: Path, destination: Path) -> None:
+        # Decoder buffers belong to a short-lived process, never to the bot.
         try:
-            with Image.open(source) as opened:
-                image = ImageOps.exif_transpose(opened)
-                image.seek(0)
-                image.thumbnail(PREVIEW_SIZE, Image.Resampling.LANCZOS)
-                if image.mode not in {"RGB", "RGBA"}:
-                    image = image.convert("RGBA" if "transparency" in image.info else "RGB")
-                canvas = Image.new("RGB", PREVIEW_SIZE, "#eef2f6")
-                offset = ((PREVIEW_SIZE[0] - image.width) // 2, (PREVIEW_SIZE[1] - image.height) // 2)
-                if image.mode == "RGBA":
-                    canvas.paste(image, offset, image)
-                else:
-                    canvas.paste(image, offset)
-                canvas.save(destination, "JPEG", quality=82, optimize=True)
-        except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
-            raise PreviewError(f"无法读取图片：{exc}") from exc
+            result = subprocess.run(
+                [sys.executable, "-m", "app.preview_worker", str(source.resolve()), str(destination.resolve())],
+                cwd=Path(__file__).resolve().parent.parent,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PreviewError("图片预览生成失败或超时") from exc
+        if result.returncode != 0:
+            raise PreviewError("无法读取图片或生成缩略图")
 
     @staticmethod
     def _generate_video(source: Path, destination: Path) -> None:

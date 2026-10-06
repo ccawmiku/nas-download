@@ -70,6 +70,12 @@ XHS_TRANSIENT_FAILURE_MARKERS = (
     "ConnectTimeout",
     "Timeout",
     "temporarily unavailable",
+    "Temporary failure in name resolution",
+    "Could not resolve host",
+    "curl: (6)",
+    "curl: (18)",
+    "curl: (28)",
+    "curl: (56)",
 )
 
 DEFAULT_DOWNLOADER_SETTINGS: dict[str, Any] = {
@@ -84,9 +90,9 @@ DEFAULT_DOWNLOADER_SETTINGS: dict[str, Any] = {
     "image_download": True,
     "video_download": True,
     "live_download": True,
-    "image_format": "AUTO",
+    "image_format": "JPEG",
     "proxy": None,
-    "timeout": 10,
+    "timeout": 30,
     "chunk": 2097152,
     "max_retry": 5,
     "language": "zh_CN",
@@ -102,8 +108,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "queue_files": ["/queue/links.txt"],
     "settings_path": "/xhs-volume/settings.json",
     "xhs_api_log_file": "/xhs-volume/xhs-api.log",
-    "image_format": "AUTO",
-    "request_delay_seconds": 0,
+    "image_format": "JPEG",
+    "request_delay_seconds": 1,
     "jitter_seconds": 0,
     "retry_failed": True,
     "max_download_attempts": 0,
@@ -807,7 +813,7 @@ def html_page(app: App) -> str:
     delay_value = html.escape(str(app.config.get("request_delay_seconds", 0)))
     jitter_value = html.escape(str(app.config.get("jitter_seconds", 0)))
     max_items_value = html.escape(str(app.config.get("max_items_per_run", 0)))
-    image_format_value = str(app.config.get("image_format") or "AUTO").upper()
+    image_format_value = str(app.config.get("image_format") or "JPEG").upper()
     image_options = "".join(
         f'<option value="{value}"{" selected" if value == image_format_value else ""}>{value}</option>'
         for value in ("AUTO", "JPEG", "WEBP", "PNG", "HEIC")
@@ -1086,7 +1092,7 @@ def make_handler(app: App):
                     "request_delay_seconds": int(number("request_delay_seconds", 0)),
                     "jitter_seconds": int(number("jitter_seconds", 0)),
                     "max_items_per_run": int(number("max_items_per_run", 0)),
-                    "image_format": ((form.get("image_format") or ["AUTO"])[0] or "AUTO").upper(),
+                    "image_format": ((form.get("image_format") or ["JPEG"])[0] or "JPEG").upper(),
                 }
                 app.config = save_web_settings(app.config_path, app.config, patch)
                 sync_downloader_settings(app.config)

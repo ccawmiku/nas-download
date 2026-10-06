@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import hmac
 import logging
 import os
 import secrets
+import stat as stat_module
+import threading
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -54,6 +57,11 @@ LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_ATTEMPTS = 5
 BOOTSTRAP_TOKEN = os.getenv("BOOTSTRAP_TOKEN", "").strip() or secrets.token_urlsafe(18)
 login_attempts: dict[str, deque[float]] = defaultdict(deque)
+FILE_LIST_CACHE_SECONDS = 30
+file_list_lock = threading.Lock()
+file_list_cache_key: tuple[tuple[str, str], ...] | None = None
+file_list_cache_at = 0.0
+file_list_cache_rows: list[dict[str, Any]] = []
 
 
 class LoginPayload(BaseModel):
@@ -145,35 +153,52 @@ def _media_urls(category: str, name: str, modified_ns: int) -> dict[str, str | N
     }
 
 
-def list_downloaded_files(download_dirs: dict[str, Path]) -> list[dict[str, Any]]:
-    files: list[dict[str, Any]] = []
-    for category, download_dir in download_dirs.items():
-        download_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            paths = list(download_dir.iterdir())
-        except OSError:
-            logger.exception("无法读取下载目录：%s", download_dir)
-            continue
-        for path in paths:
+def _scan_downloaded_files(download_dirs: dict[str, Path]) -> list[dict[str, Any]]:
+    def entries():
+        for category, download_dir in download_dirs.items():
+            download_dir.mkdir(parents=True, exist_ok=True)
             try:
-                if not path.is_file() or path.name.startswith("."):
-                    continue
-                stat = path.stat()
-                if stat.st_size == 0:
-                    continue
+                with os.scandir(download_dir) as paths:
+                    for path in paths:
+                        if path.name.startswith("."):
+                            continue
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        if stat.st_size and stat_module.S_ISREG(stat.st_mode):
+                            yield category, path.name, stat
             except OSError:
+                logger.exception("无法读取下载目录：%s", download_dir)
                 continue
-            files.append(
-                {
-                    "category": category,
-                    "name": path.name,
-                    "size_bytes": stat.st_size,
-                    "modified_at": stat.st_mtime,
-                    **_media_urls(category, path.name, stat.st_mtime_ns),
-                }
-            )
-    files.sort(key=lambda item: item["modified_at"], reverse=True)
-    return files[:200]
+
+    # Keep only the displayed rows; directory size must not determine RAM use.
+    newest = heapq.nlargest(200, entries(), key=lambda entry: entry[2].st_mtime)
+    return [
+        {
+            "category": category,
+            "name": name,
+            "size_bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+            **_media_urls(category, name, stat.st_mtime_ns),
+        }
+        for category, name, stat in newest
+    ]
+
+
+def list_downloaded_files(download_dirs: dict[str, Path]) -> list[dict[str, Any]]:
+    global file_list_cache_key, file_list_cache_at, file_list_cache_rows
+    # A single bounded cache avoids duplicate full scans during concurrent polls.
+    # External file changes become visible within 30 seconds; file serving still
+    # checks the actual path on each request.
+    key = tuple((category, str(path.resolve())) for category, path in download_dirs.items())
+    with file_list_lock:
+        if key != file_list_cache_key or time.monotonic() - file_list_cache_at >= FILE_LIST_CACHE_SECONDS:
+            rows = _scan_downloaded_files(download_dirs)
+            file_list_cache_rows = rows
+            file_list_cache_key = key
+            file_list_cache_at = time.monotonic()
+        return [dict(row) for row in file_list_cache_rows]
 
 
 def list_download_records(current: Settings) -> list[dict[str, Any]]:

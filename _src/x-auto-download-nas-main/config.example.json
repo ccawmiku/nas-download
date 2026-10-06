@@ -41,10 +41,11 @@
     "video_format": "bv*+ba/b",
     "convert_gif": true,
     "image_candidates": [
+      "{media_id}?format=jpg&name=orig",
+      "{media_id}?format=png&name=orig",
       "{media_id}.png?name=4096x4096",
       "{media_id}.jpg?name=4096x4096",
       "{media_id}?format=png&name=4096x4096",
-      "{media_id}?format=jpg&name=orig",
       "{media_id}?format=jpg&name=4096x4096",
       "{media_id}.jpg?name=orig"
     ]

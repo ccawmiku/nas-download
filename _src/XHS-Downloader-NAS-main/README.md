@@ -14,7 +14,7 @@
 
 ## Cookie
 
-如果 JoeanAmier/XHS-Downloader 2.7 需要 Cookie，可在本服务网页里粘贴 Cookie Header。保存后会写入：
+如果 JoeanAmier/XHS-Downloader 2.8 需要 Cookie，可在本服务网页里粘贴 Cookie Header。保存后会写入：
 
 ```text
 /xhs-volume/settings.json
@@ -39,3 +39,7 @@ compose 会把 `xhs-api` 输出追加到：
 ```
 
 worker 页面会同时显示队列日志和 `xhs-api` 日志。
+
+## 图片格式
+
+直接使用未修改的上游 2.8 镜像，新配置默认 JPEG。请求超时默认 30 秒，队列基础间隔默认 1 秒，已有显式配置继续保留。Docker 继续挂载 `/app/Volume`；独立程序版升级时，将旧 `_internal/Volume` 复制至新程序旁的 `Volume`。

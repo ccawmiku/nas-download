@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   xhs-api:
-    image: ghcr.io/joeanamier/xhs-downloader:2.7
+    image: ghcr.io/joeanamier/xhs-downloader:2.8
     container_name: xhs-api
     ports:
       - "13001:5556"
@@ -11,7 +11,7 @@ services:
       - /volume1/se/小红书:/xhs
     tty: true
     stdin_open: true
-    command: bash -lc "python main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
+    command: bash -lc "python -u main.py api 2>&1 | tee -a /app/Volume/xhs-api.log"
     restart: unless-stopped
 
   xhs-auto-worker:
