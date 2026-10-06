@@ -8,6 +8,8 @@ Docker 2.8 的数据目录仍为 `/app/Volume`，原 NAS 挂载保持不变，Co
 
 API 容器配置两个公共 DNS 上游。worker 识别原来的 httpx DNS 错误和 2.8 curl 的 DNS、超时、传输中断错误，按原有队列重试机制处理。不会清理删除、私密或失效笔记。
 
+2.8 API 将 `skip` 改名为 `check_record`，worker 同时传递两个同值参数，兼容旧 API 并保留关闭记录检查时的行为。
+
 2.8 虽修复部分解析错误，其 `Converter.YAML_ILLEGAL` 没有覆盖 U+0083。不能据发布说明断言日志中的特定 ReaderError 已修复。本次遵照要求保留原版上游，遇到该字符仍可能失败；未通过清除队列掩盖问题。
 
 ## f2

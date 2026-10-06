@@ -36,6 +36,7 @@ from xhs_auto_worker import (
     Store as XhsStore,
     cookie_summary_from_settings,
     is_transient_xhs_failure,
+    post_download,
     save_settings_cookie,
     sync_downloader_settings,
     xhs_api_response_has_failure,
@@ -273,6 +274,15 @@ class XhsSettingsTests(unittest.TestCase):
             self.assertEqual(saved["work_path"], "/xhs")
             self.assertTrue(saved["folder_mode"])
             self.assertEqual(saved["image_format"], "AUTO")
+
+    def test_xhs_record_flag_supports_both_api_versions(self) -> None:
+        response = MagicMock(status_code=200, text="ok")
+        response.json.return_value = {"message": "获取小红书作品数据成功", "data": {"作品ID": "abc"}}
+        for skip in (True, False):
+            with patch("xhs_auto_worker.requests.post", return_value=response) as post:
+                self.assertTrue(post_download("http://xhs-api:5556/xhs/detail", "https://www.xiaohongshu.com/explore/abc", skip=skip, timeout=120)[0])
+                self.assertEqual(post.call_args.kwargs["json"]["skip"], skip)
+                self.assertEqual(post.call_args.kwargs["json"]["check_record"], skip)
 
     def test_saves_xhs_downloader_cookie_to_settings_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

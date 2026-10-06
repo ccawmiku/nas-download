@@ -623,7 +623,8 @@ def append_queue_links(queue_file: Path, urls: list[str]) -> QueueResult:
 
 
 def post_download(api_url: str, url: str, *, skip: bool, timeout: int) -> tuple[bool, str]:
-    body = {"url": url, "download": True, "skip": skip}
+    # 2.8 renamed skip to check_record; older APIs ignore the new field.
+    body = {"url": url, "download": True, "skip": skip, "check_record": skip}
     response = requests.post(api_url, json=body, timeout=timeout)
     text = response.text[:2000]
     if 200 <= response.status_code < 300:
