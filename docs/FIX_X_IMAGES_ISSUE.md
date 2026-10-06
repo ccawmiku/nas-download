@@ -37,4 +37,8 @@
 
 ## 验证边界
 
-本地检查：Python 单元与集成测试 48 项通过，Telegram pytest 56 项通过，前端构建与 npm audit 通过（0 项漏洞），另完成依赖及编译检查。Windows 的 Docker 服务没有运行，新增镜像构建检查需要在 CI 执行，不能把本地测试当作镜像构建已通过。修复尚未发布镜像或部署到 NAS。
+本地检查：Python 单元与集成测试 49 项通过，Telegram pytest 56 项通过，前端构建与 npm audit 通过（0 项漏洞），另完成依赖及编译检查。GitHub Actions [v3.0.2 发布流水线](https://github.com/ccawmiku/nas-download/actions/runs/37421983137)的独立 Python、浏览器、前端及两个镜像构建/导入检查全部通过，两个自有镜像发布成功。
+
+2026-10-06 已更新 NAS：控制台、Telegram 使用 v3.0.2，小红书使用未修改的官方 2.8。五个平台就绪，两个自有容器健康，Telegram 已连接。所有挂载及 X/Pixiv/抖音配置保持一致，小红书 Cookie 保留，1,904 条队列记录和 Telegram session 授权保留。更新后实际 X 点赞任务已下载 3 张图片（检查时下载进度 7/32，失败 0），整轮任务仍在运行。备份位于 NAS 的 `/volume2/docker/nas-download/backups/pre-v3.0.2-20261006-141453`。升级细节与上游已知限制见 [升级说明](UPGRADE_3.0.2.md)。
+
+另外使用原版小红书 2.8 的公开库入口，在 NAS 隔离验证目录以现有 Cookie 下载一张 JPEG；输出 1,213,315 字节，3024×4032，通过 Pillow 完整解码。测试未修改正式队列和下载记录。API 容器公共 DNS 配置与 CDN 域名解析均验证成功。原版 2.8 的 U+0083 ReaderError 在镜像内仍可复现，按要求未覆盖上游代码。
