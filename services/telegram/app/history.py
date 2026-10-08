@@ -39,6 +39,7 @@ class DownloadRecord:
     error: str = ""
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+    notification_chat_id: int | None = None
 
 
 class DownloadHistory:
@@ -66,6 +67,8 @@ class DownloadHistory:
                 if not isinstance(item, dict):
                     continue
                 filtered = {key: value for key, value in item.items() if key in allowed_fields}
+                # Before link downloads, the source was also the requesting chat.
+                filtered.setdefault("notification_chat_id", filtered.get("chat_id"))
                 records.append(DownloadRecord(**filtered))
             self._records = records
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:

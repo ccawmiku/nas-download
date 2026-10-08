@@ -13,12 +13,23 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from telethon import TelegramClient, events, functions, types
-from telethon.errors import FloodWaitError, MessageNotModifiedError, RPCError
+from telethon.errors import (
+    ChannelInvalidError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    FloodWaitError,
+    MessageNotModifiedError,
+    RPCError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
+from telethon.tl.types import MessageMediaWebPage
 
 from app import __version__
 from app.config import Settings
 from app.file_naming import media_kind, unique_media_path
 from app.history import DownloadHistory, DownloadRecord, RETRYABLE_STATUSES
+from app.link_parser import ParsedTelegramLink, parse_telegram_links
 
 logger = logging.getLogger("media-downloader-bot")
 LIMIT_RE = re.compile(r"^/limit(?:@\w+)?\s+([0-9]+(?:\.[0-9]+)?)(?:m|mb)?$", re.IGNORECASE)
@@ -362,7 +373,7 @@ class BotManager:
         return False
 
     async def _handle_command(self, event, settings: Settings) -> bool:
-        text = (event.message.raw_text or "").strip()
+        text = (getattr(event.message, "raw_text", None) or getattr(event.message, "message", None) or getattr(event.message, "text", "") or "").strip()
         if not text.startswith("/"):
             return False
         sender_id = getattr(event, "sender_id", None)
@@ -377,6 +388,10 @@ class BotManager:
 
         if command == "/help":
             await event.reply(
+                "直接发送图片、视频、文件或 Telegram 消息链接即可加入下载：\n"
+                "• 消息链接：`https://t.me/CosSSDZH/17530`\n"
+                "• 消息范围：`https://t.me/CosSSDZH/17530-17535`\n"
+                "• 私有频道：`https://t.me/c/1234567890/17530`（需先将 Bot 邀请进频道）\n\n"
                 "可用命令：\n"
                 "/status - 当前下载、速度、ETA、队列和控制状态\n"
                 "/queue [n] - 查看下载队列\n"
@@ -586,9 +601,9 @@ class BotManager:
                 if batch.finalize_task:
                     batch.finalize_task.cancel()
             self.albums.clear()
-            if self.client:
+            if self.client and hasattr(self.client, "disconnect"):
                 await self.client.disconnect()
-            if self.task:
+            if self.task and isinstance(self.task, (asyncio.Future, asyncio.Task)):
                 try:
                     await asyncio.wait_for(self.task, timeout=5)
                 except asyncio.TimeoutError:
@@ -656,24 +671,196 @@ class BotManager:
             await self._reply_unauthorized(event, settings)
             return
         message = event.message
-        if not message.media:
-            await event.reply("请发送图片、视频或文件，我会自动加入下载队列。")
+        if not message.media or isinstance(message.media, MessageMediaWebPage):
+            text_content = getattr(message, "raw_text", None) or getattr(message, "message", None) or getattr(message, "text", None) or ""
+            links = parse_telegram_links(text_content)
+            if links:
+                await self._handle_links(event, links, settings)
+                return
+            await event.reply("请发送图片、视频、文件，或发送消息链接（如 https://t.me/CosSSDZH/17530），我会自动加入下载队列。")
             return
         grouped_id = getattr(message, "grouped_id", None)
         if grouped_id:
             await self._enqueue_album_item(event, settings, str(grouped_id))
         else:
-            await self.enqueue(message, settings, await event.reply("正在加入下载队列..."))
+            await self.enqueue(
+                message, settings, await event.reply("正在加入下载队列..."),
+                notification_chat_id=getattr(event, "chat_id", None),
+            )
+
+    async def _handle_links(self, event, links: list[ParsedTelegramLink], settings: Settings) -> None:
+        if not self.client or not self.client.is_connected():
+            await event.reply("Bot 尚未连接至 Telegram，请稍后重试。")
+            return
+
+        total_requested = sum(len(link.message_ids) for link in links)
+        initial_text = f"正在解析 {total_requested} 个链接..." if total_requested > 1 else "正在解析 Telegram 链接..."
+        status_message = await event.reply(initial_text)
+
+        resolved_items: list[Any] = []
+        errors: list[str] = []
+        processed_albums: set[str] = set()
+
+        for link in links:
+            channel_label = link.display_name()
+            for msg_id in link.message_ids:
+                try:
+                    target = await self.client.get_messages(link.channel, ids=msg_id)
+                except (ChannelPrivateError, ChatAdminRequiredError):
+                    errors.append(f"无法访问私有频道（Bot 未加入）：{channel_label}/{msg_id}")
+                    continue
+                except (ChannelInvalidError, UsernameInvalidError, UsernameNotOccupiedError):
+                    errors.append(f"频道或用户不存在：{channel_label}")
+                    continue
+                except FloodWaitError as fwe:
+                    errors.append(f"触发 Telegram 限流，需等待 {fwe.seconds} 秒")
+                    break
+                except Exception as exc:
+                    logger.exception("获取链接消息失败：%s/%s", link.channel, msg_id)
+                    errors.append(f"获取失败 {channel_label}/{msg_id}：{type(exc).__name__}")
+                    continue
+
+                if not target:
+                    errors.append(f"未找到消息（可能已删除）：{channel_label}/{msg_id}")
+                    continue
+
+                if not target.media or isinstance(target.media, MessageMediaWebPage):
+                    errors.append(f"消息未包含媒体文件：{channel_label}/{msg_id}")
+                    continue
+
+                grouped_id = getattr(target, "grouped_id", None)
+                if grouped_id and not link.is_single:
+                    album_key = f"{link.channel}:{grouped_id}"
+                    if album_key in processed_albums:
+                        continue
+                    processed_albums.add(album_key)
+                    ids = list(range(max(1, target.id - 9), target.id + 10))
+                    try:
+                        surrounding = await self.client.get_messages(link.channel, ids=ids)
+                        album_items = [
+                            m for m in surrounding
+                            if m and getattr(m, "grouped_id", None) == grouped_id
+                            and m.media and not isinstance(m.media, MessageMediaWebPage)
+                        ]
+                        album_items.sort(key=lambda m: m.id)
+                    except Exception:
+                        album_items = [target]
+                    resolved_items.extend(album_items or [target])
+                else:
+                    resolved_items.append(target)
+
+        if not resolved_items:
+            error_msg = "\n".join(errors[:5]) if errors else "未找到可下载的媒体文件"
+            if len(errors) > 5:
+                error_msg += f"\n...及其他 {len(errors) - 5} 处错误"
+            await self.safe_edit(status_message, f"解析失败：\n{error_msg}")
+            return
+
+        if len(resolved_items) == 1:
+            await self.enqueue(
+                resolved_items[0], settings, status_message,
+                notification_chat_id=getattr(event, "chat_id", None),
+            )
+            return
+
+        batch_key = f"{getattr(event, 'chat_id', None)}:link_batch_{uuid.uuid4().hex[:8]}"
+        async with self._album_lock:
+            batch = AlbumBatch(getattr(event, "chat_id", None), status_message)
+            self.albums[batch_key] = batch
+            for item in resolved_items:
+                batch.total += 1
+                rec = await self.enqueue(
+                    item, settings, batch.status_message, batch_key,
+                    notification_chat_id=batch.chat_id,
+                )
+                if rec is None:
+                    batch.failed += 1
+            await self._update_album_status(batch_key, force=True)
+
+    async def enqueue_from_links_text(self, text: str) -> tuple[int, list[str]]:
+        if not self.running or not self.client or not self.client.is_connected():
+            return 0, ["Bot 尚未运行或未连接"]
+
+        assert self.settings is not None
+        links = parse_telegram_links(text)
+        if not links:
+            return 0, ["未识别到有效的 Telegram 链接"]
+
+        resolved_items: list[Any] = []
+        errors: list[str] = []
+        processed_albums: set[str] = set()
+
+        for link in links:
+            channel_label = link.display_name()
+            for msg_id in link.message_ids:
+                try:
+                    target = await self.client.get_messages(link.channel, ids=msg_id)
+                except (ChannelPrivateError, ChatAdminRequiredError):
+                    errors.append(f"无法访问私有频道（Bot 未加入）：{channel_label}/{msg_id}")
+                    continue
+                except (ChannelInvalidError, UsernameInvalidError, UsernameNotOccupiedError):
+                    errors.append(f"频道或用户不存在：{channel_label}")
+                    continue
+                except FloodWaitError as fwe:
+                    errors.append(f"触发 Telegram 限流，需等待 {fwe.seconds} 秒")
+                    break
+                except Exception as exc:
+                    logger.exception("获取链接消息失败：%s/%s", link.channel, msg_id)
+                    errors.append(f"获取失败 {channel_label}/{msg_id}：{type(exc).__name__}")
+                    continue
+
+                if not target:
+                    errors.append(f"未找到消息：{channel_label}/{msg_id}")
+                    continue
+
+                if not target.media or isinstance(target.media, MessageMediaWebPage):
+                    errors.append(f"消息未包含媒体文件：{channel_label}/{msg_id}")
+                    continue
+
+                grouped_id = getattr(target, "grouped_id", None)
+                if grouped_id and not link.is_single:
+                    album_key = f"{link.channel}:{grouped_id}"
+                    if album_key in processed_albums:
+                        continue
+                    processed_albums.add(album_key)
+                    ids = list(range(max(1, target.id - 9), target.id + 10))
+                    try:
+                        surrounding = await self.client.get_messages(link.channel, ids=ids)
+                        album_items = [
+                            m for m in surrounding
+                            if m and getattr(m, "grouped_id", None) == grouped_id
+                            and m.media and not isinstance(m.media, MessageMediaWebPage)
+                        ]
+                        album_items.sort(key=lambda m: m.id)
+                    except Exception:
+                        album_items = [target]
+                    resolved_items.extend(album_items or [target])
+                else:
+                    resolved_items.append(target)
+
+        enqueued_count = 0
+        for item in resolved_items:
+            rec = await self.enqueue(item, self.settings, status_message=None)
+            if rec:
+                enqueued_count += 1
+            else:
+                errors.append("下载队列已满")
+                break
+
+        return enqueued_count, errors
 
     async def enqueue(
         self,
         message,
         settings: Settings,
-        status_message,
+        status_message=None,
         album_key: str | None = None,
+        *,
+        notification_chat_id: int | None = None,
     ) -> str | None:
         if not self.queue or self.queue.full():
-            await self.safe_edit(status_message, "下载队列已满，请稍后重试。")
+            if status_message:
+                await self.safe_edit(status_message, "下载队列已满，请稍后重试。")
             return None
         kind = media_kind(message)
         target_path = unique_media_path(message, settings.media_dir(kind), settings.max_filename_stem_length)
@@ -686,13 +873,14 @@ class BotManager:
                 file_name=target_path.name,
                 path=str(target_path),
                 max_retries=settings.max_auto_retries,
+                notification_chat_id=notification_chat_id,
             )
         )
         job = DownloadJob(record_id, message, target_path, status_message, album_key)
         self.jobs[record_id] = job
         self.queue.put_nowait(job)
         position = self.queue.qsize()
-        if not album_key:
+        if not album_key and status_message:
             await self.safe_edit(
                 status_message,
                 f"已加入下载队列。\n任务：`{record_id[:8]}`\n文件：`{target_path.name}`\n队列位置：{position}",
@@ -710,7 +898,10 @@ class BotManager:
             if batch.finalize_task and not batch.finalize_task.done():
                 batch.finalize_task.cancel()
             batch.total += 1
-            record_id = await self.enqueue(event.message, settings, batch.status_message, album_key)
+            record_id = await self.enqueue(
+                event.message, settings, batch.status_message, album_key,
+                notification_chat_id=batch.chat_id,
+            )
             if record_id is None:
                 batch.failed += 1
             await self._update_album_status(album_key, force=True)
@@ -877,6 +1068,8 @@ class BotManager:
             pass
 
     async def safe_edit(self, status_message, text: str) -> None:
+        if not status_message:
+            return
         try:
             await status_message.edit(text)
         except MessageNotModifiedError:
@@ -996,10 +1189,16 @@ class BotManager:
             if not message or not getattr(message, "media", None):
                 self.history.update(record["id"], error="原 Telegram 消息已不可用，无法重试")
                 continue
-            status_message = await self.client.send_message(
-                record["chat_id"],
-                f"正在重新加入下载队列...\n任务：`{record['id'][:8]}`",
-            )
+            status_message = None
+            notification_chat_id = record["notification_chat_id"]
+            if notification_chat_id is not None:
+                try:
+                    status_message = await self.client.send_message(
+                        notification_chat_id,
+                        f"正在重新加入下载队列...\n任务：`{record['id'][:8]}`",
+                    )
+                except RPCError:
+                    logger.exception("无法发送重试状态消息：%s", record["id"][:8])
             target_path = Path(record["path"])
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if not target_path.exists():
