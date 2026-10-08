@@ -220,6 +220,26 @@
         overflow-x: auto;
       }
 
+      .link-download-bar {
+        display: flex;
+        gap: 8px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        background: #fbfcfe;
+      }
+
+      .link-download-bar input {
+        flex: 1;
+        min-width: 0;
+        height: 32px;
+        padding: 0 10px;
+        font-size: 13px;
+      }
+
+      .link-download-bar button {
+        white-space: nowrap;
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -553,6 +573,10 @@
           </div>
 
           <div id="downloadsTab" class="table-wrap">
+            <form id="linkDownloadForm" class="link-download-bar">
+              <input id="linkInput" type="text" placeholder="输入 Telegram 消息链接（如 https://t.me/CosSSDZH/17530），支持批量或范围..." required />
+              <button class="primary small" type="submit">添加链接下载</button>
+            </form>
             <table class="downloads-table">
               <colgroup>
                 <col class="col-preview" />

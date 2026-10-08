@@ -284,3 +284,85 @@ async def test_worker_survives_unexpected_job_exception(tmp_path):
     await asyncio.gather(worker, return_exceptions=True)
 
     assert second_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_handle_media_with_telegram_link(tmp_path):
+    manager, settings, history = make_manager(tmp_path)
+    settings.allowed_user_ids = [123]
+    manager.queue = asyncio.Queue(maxsize=10)
+
+    class MockClient:
+        def is_connected(self):
+            return True
+
+        async def get_messages(self, channel, ids=None):
+            if ids == 17530:
+                msg = FakeMessage(message_id=17530)
+                msg.grouped_id = None
+                return msg
+            return None
+
+    manager.client = MockClient()
+    manager.task = asyncio.create_task(asyncio.sleep(10))
+
+    class LinkEvent:
+        def __init__(self):
+            self.sender_id = 123
+            self.chat_id = 123
+            self.message = type("Msg", (), {
+                "media": None,
+                "text": "https://t.me/CosSSDZH/17530",
+                "message": "https://t.me/CosSSDZH/17530",
+                "raw_text": "https://t.me/CosSSDZH/17530",
+            })()
+            self.replies = []
+
+        async def reply(self, text):
+            status = FakeStatus()
+            status.text = text
+            self.replies.append(status)
+            return status
+
+    event = LinkEvent()
+    await manager._handle_media(event, settings)
+
+    assert manager.queue.qsize() == 1
+    job = manager.queue.get_nowait()
+    assert job.message.id == 17530
+    assert len(history.list()) == 1
+
+    manager.task.cancel()
+    await asyncio.gather(manager.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_from_links_text(tmp_path):
+    manager, settings, history = make_manager(tmp_path)
+    manager.queue = asyncio.Queue(maxsize=10)
+
+    class MockClient:
+        def is_connected(self):
+            return True
+
+        async def get_messages(self, channel, ids=None):
+            if ids in (101, 102):
+                msg = FakeMessage(message_id=ids)
+                msg.grouped_id = None
+                return msg
+            return None
+
+    manager.client = MockClient()
+    manager.task = asyncio.create_task(asyncio.sleep(10))
+
+    text = "https://t.me/CosSSDZH/101 https://t.me/CosSSDZH/102"
+    count, errors = await manager.enqueue_from_links_text(text)
+
+    assert count == 2
+    assert not errors
+    assert manager.queue.qsize() == 2
+    assert len(history.list()) == 2
+
+    manager.task.cancel()
+    await asyncio.gather(manager.task, return_exceptions=True)
+

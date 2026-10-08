@@ -37,7 +37,9 @@ const els = {
   progressStep: document.querySelector("#progressStep"),
   maxAutoRetries: document.querySelector("#maxAutoRetries"),
   queueMaxsize: document.querySelector("#queueMaxsize"),
-  historyFlushInterval: document.querySelector("#historyFlushInterval")
+  historyFlushInterval: document.querySelector("#historyFlushInterval"),
+  linkDownloadForm: document.querySelector("#linkDownloadForm"),
+  linkInput: document.querySelector("#linkInput")
 };
 
 let firstLoad = true;
@@ -381,6 +383,27 @@ els.cleanupBtn.addEventListener("click", async () => {
     await refresh();
   } catch (error) {
     els.formMessage.textContent = error.message;
+  }
+});
+
+els.linkDownloadForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = els.linkInput;
+  if (!input) return;
+  const links = input.value.trim();
+  if (!links) return;
+  const button = els.linkDownloadForm.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    const result = await postJson("/api/downloads/links", { links });
+    const errText = result.errors?.length ? `（${result.errors.join("；")}）` : "";
+    els.formMessage.textContent = `已添加 ${result.queued} 个下载任务${errText}`;
+    input.value = "";
+    await refresh();
+  } catch (error) {
+    els.formMessage.textContent = error.message;
+  } finally {
+    if (button) button.disabled = false;
   }
 });
 

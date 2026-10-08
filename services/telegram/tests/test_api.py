@@ -270,3 +270,29 @@ def test_retry_all_failed_endpoint_queues_every_available_record(monkeypatch, tm
     assert response.status_code == 200
     assert response.json() == {"total": 3, "queued": 3, "remaining": 0}
     main.bot_manager.retry.assert_awaited_once_with("failed", all_matches=True)
+
+
+def test_add_downloads_from_links_endpoint(monkeypatch, tmp_path):
+    main = load_main(monkeypatch, tmp_path)
+    main.bot_manager.task = None
+    class ConnectedClient:
+        def is_connected(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    main.bot_manager.client = ConnectedClient()
+
+    async def mock_enqueue(text):
+        assert "https://t.me/CosSSDZH/17530" in text
+        return 1, []
+
+    main.bot_manager.enqueue_from_links_text = AsyncMock(side_effect=mock_enqueue)
+    with TestClient(main.app) as client:
+        login(client, main)
+        response = client.post("/api/downloads/links", json={"links": "https://t.me/CosSSDZH/17530"})
+
+    assert response.status_code == 200
+    assert response.json() == {"queued": 1, "errors": []}
+

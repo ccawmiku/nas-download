@@ -109,6 +109,11 @@ class LimitPayload(BaseModel):
     megabytes_per_second: float | None = Field(default=None, ge=1, le=10_000)
 
 
+class LinksPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    links: str = Field(min_length=1, max_length=10_000)
+
+
 def _client_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -500,6 +505,17 @@ async def retry_all_failed_downloads(request: Request):
     queued = await bot_manager.retry("failed", all_matches=True)
     remaining = len(history.list_statuses(RETRYABLE_STATUSES, limit=None))
     return {"total": total, "queued": queued, "remaining": remaining}
+
+
+@app.post("/api/downloads/links")
+async def add_downloads_from_links(request: Request, payload: LinksPayload):
+    require_panel_auth(request)
+    if not bot_manager.running:
+        raise HTTPException(status_code=409, detail="Bot 尚未运行，请先启动 Bot")
+    count, errors = await bot_manager.enqueue_from_links_text(payload.links)
+    if not count and errors:
+        raise HTTPException(status_code=400, detail="；".join(errors))
+    return {"queued": count, "errors": errors}
 
 
 @app.post("/api/downloads/cleanup")
