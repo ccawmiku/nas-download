@@ -671,20 +671,22 @@ class BotManager:
             await self._reply_unauthorized(event, settings)
             return
         message = event.message
-        text_content = getattr(message, "raw_text", None) or getattr(message, "message", None) or getattr(message, "text", None) or ""
-        links = parse_telegram_links(text_content)
-        if links:
-            await self._handle_links(event, links, settings)
-            return
-
         if not message.media or isinstance(message.media, MessageMediaWebPage):
+            text_content = getattr(message, "raw_text", None) or getattr(message, "message", None) or getattr(message, "text", None) or ""
+            links = parse_telegram_links(text_content)
+            if links:
+                await self._handle_links(event, links, settings)
+                return
             await event.reply("请发送图片、视频、文件，或发送消息链接（如 https://t.me/CosSSDZH/17530），我会自动加入下载队列。")
             return
         grouped_id = getattr(message, "grouped_id", None)
         if grouped_id:
             await self._enqueue_album_item(event, settings, str(grouped_id))
         else:
-            await self.enqueue(message, settings, await event.reply("正在加入下载队列..."))
+            await self.enqueue(
+                message, settings, await event.reply("正在加入下载队列..."),
+                notification_chat_id=getattr(event, "chat_id", None),
+            )
 
     async def _handle_links(self, event, links: list[ParsedTelegramLink], settings: Settings) -> None:
         if not self.client or not self.client.is_connected():
@@ -755,7 +757,10 @@ class BotManager:
             return
 
         if len(resolved_items) == 1:
-            await self.enqueue(resolved_items[0], settings, status_message)
+            await self.enqueue(
+                resolved_items[0], settings, status_message,
+                notification_chat_id=getattr(event, "chat_id", None),
+            )
             return
 
         batch_key = f"{getattr(event, 'chat_id', None)}:link_batch_{uuid.uuid4().hex[:8]}"
@@ -764,7 +769,10 @@ class BotManager:
             self.albums[batch_key] = batch
             for item in resolved_items:
                 batch.total += 1
-                rec = await self.enqueue(item, settings, batch.status_message, batch_key)
+                rec = await self.enqueue(
+                    item, settings, batch.status_message, batch_key,
+                    notification_chat_id=batch.chat_id,
+                )
                 if rec is None:
                     batch.failed += 1
             await self._update_album_status(batch_key, force=True)
@@ -847,6 +855,8 @@ class BotManager:
         settings: Settings,
         status_message=None,
         album_key: str | None = None,
+        *,
+        notification_chat_id: int | None = None,
     ) -> str | None:
         if not self.queue or self.queue.full():
             if status_message:
@@ -863,6 +873,7 @@ class BotManager:
                 file_name=target_path.name,
                 path=str(target_path),
                 max_retries=settings.max_auto_retries,
+                notification_chat_id=notification_chat_id,
             )
         )
         job = DownloadJob(record_id, message, target_path, status_message, album_key)
@@ -887,7 +898,10 @@ class BotManager:
             if batch.finalize_task and not batch.finalize_task.done():
                 batch.finalize_task.cancel()
             batch.total += 1
-            record_id = await self.enqueue(event.message, settings, batch.status_message, album_key)
+            record_id = await self.enqueue(
+                event.message, settings, batch.status_message, album_key,
+                notification_chat_id=batch.chat_id,
+            )
             if record_id is None:
                 batch.failed += 1
             await self._update_album_status(album_key, force=True)
@@ -1175,10 +1189,16 @@ class BotManager:
             if not message or not getattr(message, "media", None):
                 self.history.update(record["id"], error="原 Telegram 消息已不可用，无法重试")
                 continue
-            status_message = await self.client.send_message(
-                record["chat_id"],
-                f"正在重新加入下载队列...\n任务：`{record['id'][:8]}`",
-            )
+            status_message = None
+            notification_chat_id = record["notification_chat_id"]
+            if notification_chat_id is not None:
+                try:
+                    status_message = await self.client.send_message(
+                        notification_chat_id,
+                        f"正在重新加入下载队列...\n任务：`{record['id'][:8]}`",
+                    )
+                except RPCError:
+                    logger.exception("无法发送重试状态消息：%s", record["id"][:8])
             target_path = Path(record["path"])
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if not target_path.exists():

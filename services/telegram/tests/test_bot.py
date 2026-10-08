@@ -1,8 +1,12 @@
 import asyncio
 import weakref
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from telethon.errors import ChatWriteForbiddenError
+from telethon.tl.types import MessageMediaWebPage
 
 from app.bot import BotManager, DownloadJob, RuntimeControls, parse_pause_seconds
 from app.config import Settings
@@ -287,7 +291,8 @@ async def test_worker_survives_unexpected_job_exception(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_handle_media_with_telegram_link(tmp_path):
+@pytest.mark.parametrize("preview", [None, MessageMediaWebPage(webpage=None)])
+async def test_handle_media_with_telegram_link(tmp_path, preview):
     manager, settings, history = make_manager(tmp_path)
     settings.allowed_user_ids = [123]
     manager.queue = asyncio.Queue(maxsize=10)
@@ -311,7 +316,7 @@ async def test_handle_media_with_telegram_link(tmp_path):
             self.sender_id = 123
             self.chat_id = 123
             self.message = type("Msg", (), {
-                "media": None,
+                "media": preview,
                 "text": "https://t.me/CosSSDZH/17530",
                 "message": "https://t.me/CosSSDZH/17530",
                 "raw_text": "https://t.me/CosSSDZH/17530",
@@ -334,6 +339,123 @@ async def test_handle_media_with_telegram_link(tmp_path):
 
     manager.task.cancel()
     await asyncio.gather(manager.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped_id", [None, 999])
+async def test_media_caption_link_preserves_received_attachment(tmp_path, grouped_id):
+    manager, settings, history = make_manager(tmp_path)
+    settings.allowed_user_ids = [123]
+    manager.queue = asyncio.Queue(maxsize=10)
+    manager.client = SimpleNamespace(get_messages=AsyncMock())
+    message = FakeMessage(message_id=900)
+    message.raw_text = "Source: https://t.me/example_channel/101"
+    message.grouped_id = grouped_id
+    event = SimpleNamespace(
+        sender_id=123, chat_id=123, message=message,
+        reply=AsyncMock(return_value=FakeStatus()),
+    )
+
+    await manager._handle_media(event, settings)
+
+    manager.client.get_messages.assert_not_awaited()
+    job = manager.queue.get_nowait()
+    assert job.message is message
+    assert bool(job.album_key) == bool(grouped_id)
+    assert history.find(job.record_id)["notification_chat_id"] == 123
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted"])
+async def test_web_link_retry_after_reload_has_no_channel_notifications(tmp_path, status):
+    manager, settings, history = make_manager(tmp_path)
+    manager.queue = asyncio.Queue(maxsize=10)
+    source = FakeMessage(message_id=101)
+    source.chat_id = -1001234567890
+    source.grouped_id = None
+    manager.client = SimpleNamespace(
+        is_connected=lambda: True,
+        get_messages=AsyncMock(return_value=source),
+        send_message=AsyncMock(side_effect=ChatWriteForbiddenError(request=None)),
+    )
+    assert await manager.enqueue_from_links_text("https://t.me/example_channel/101") == (1, [])
+    original = manager.queue.get_nowait()
+    manager.queue.task_done()
+    manager.jobs.clear()
+    history.update(original.record_id, status=status)
+    manager.history = DownloadHistory(history.path)
+
+    assert await manager.retry(original.record_id) == 1
+
+    manager.client.get_messages.assert_awaited_with(source.chat_id, ids=101)
+    manager.client.send_message.assert_not_awaited()
+    retried = manager.queue.get_nowait()
+    assert retried.status_message is None
+    await manager._process_job(retried)
+    assert manager.history.find(original.record_id)["status"] == "complete"
+    assert retried.target_path.read_bytes() == source.payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("album_size", [1, 2])
+async def test_bot_link_retry_notifies_requester_after_reload(tmp_path, album_size):
+    manager, settings, history = make_manager(tmp_path)
+    settings.allowed_user_ids = [123]
+    manager.queue = asyncio.Queue(maxsize=10)
+    sources = [FakeMessage(message_id=101 + index) for index in range(album_size)]
+    for source in sources:
+        source.chat_id = -1001234567890
+        source.grouped_id = 999 if album_size > 1 else None
+
+    async def get_messages(channel, ids=None):
+        if isinstance(ids, list):
+            return sources
+        return next(source for source in sources if source.id == ids)
+
+    manager.client = SimpleNamespace(
+        is_connected=lambda: True,
+        get_messages=AsyncMock(side_effect=get_messages),
+        send_message=AsyncMock(return_value=FakeStatus()),
+    )
+    event = SimpleNamespace(
+        sender_id=123, chat_id=123,
+        message=SimpleNamespace(media=None, raw_text="https://t.me/example_channel/101"),
+        reply=AsyncMock(return_value=FakeStatus()),
+    )
+    await manager._handle_media(event, settings)
+    manager.jobs.clear()
+    while not manager.queue.empty():
+        job = manager.queue.get_nowait()
+        manager.queue.task_done()
+        history.update(job.record_id, status="failed")
+    manager.history = DownloadHistory(history.path)
+
+    assert await manager.retry("failed", all_matches=True) == album_size
+
+    assert manager.client.send_message.await_count == album_size
+    assert all(call.args[0] == 123 for call in manager.client.send_message.await_args_list)
+    assert all(record["chat_id"] == sources[0].chat_id for record in manager.history.list())
+
+
+@pytest.mark.asyncio
+async def test_retry_still_queues_when_requester_cannot_receive_notification(tmp_path):
+    manager, settings, history = make_manager(tmp_path)
+    manager.queue = asyncio.Queue(maxsize=10)
+    source = FakeMessage()
+    source.chat_id = -1001234567890
+    record_id = await manager.enqueue(source, settings, notification_chat_id=123)
+    manager.queue.get_nowait()
+    manager.queue.task_done()
+    manager.jobs.clear()
+    history.update(record_id, status="failed")
+    manager.client = SimpleNamespace(
+        get_messages=AsyncMock(return_value=source),
+        send_message=AsyncMock(side_effect=ChatWriteForbiddenError(request=None)),
+    )
+
+    assert await manager.retry(record_id) == 1
+    assert manager.client.send_message.await_args.args[0] == 123
+    assert manager.queue.get_nowait().status_message is None
 
 
 @pytest.mark.asyncio
@@ -365,4 +487,3 @@ async def test_enqueue_from_links_text(tmp_path):
 
     manager.task.cancel()
     await asyncio.gather(manager.task, return_exceptions=True)
-

@@ -1,6 +1,21 @@
 import json
 
+import pytest
+
 from app.history import DownloadHistory, DownloadRecord
+
+
+@pytest.mark.parametrize("chat_id", [123, -1001234567890])
+def test_legacy_history_keeps_requesting_chat_for_retry_notifications(tmp_path, chat_id):
+    path = tmp_path / "downloads.json"
+    path.write_text(json.dumps([{
+        "id": "legacy", "message_id": 1, "chat_id": chat_id,
+        "file_name": "one.bin", "path": str(tmp_path / "one.bin"), "status": "failed",
+    }]), encoding="utf-8")
+
+    history = DownloadHistory(path)
+
+    assert history.find("legacy")["notification_chat_id"] == chat_id
 
 
 def test_recover_incomplete_downloads(tmp_path):
