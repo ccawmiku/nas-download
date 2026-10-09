@@ -26,7 +26,7 @@ DEFAULTS = {
     "workspace": {key: key in {"telegram", "xhs"} for key in PLATFORMS},
     "max_minutes": {"x": 15, "pixiv": 15, "douyin": 15},
     "schedule": {
-        key: {"enabled": False, "hours": 12} for key in ("x", "pixiv", "douyin")
+        key: {"enabled": False, "hours": 12} for key in ("x", "pixiv", "douyin", "xhs")
     },
     "workspace_root": os.getenv("NAS_WORKSPACE_ROOT", "/media/.nas-workspace"),
     "auth_enabled": False,

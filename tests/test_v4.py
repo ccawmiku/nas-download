@@ -18,6 +18,33 @@ from core import media
 from workers.media_worker import finish_receipt
 
 
+def test_xhs_legacy_schedule_migrates_can_be_saved_and_enqueues(client, tmp_path, monkeypatch):
+    import asyncio
+    from core import config, migrate
+
+    for key in ("x", "pixiv", "douyin", "xhs"):
+        monkeypatch.setitem(config.CONFIG_PATHS, key, tmp_path / key / "config.json")
+    write_json(config.CONFIG_PATHS['xhs'], {'database': str(tmp_path / 'missing.sqlite3'), 'run_interval_seconds': 1800})
+    migrate.import_legacy(server.store)
+    prefs = server.settings()
+    assert prefs['schedule']['xhs'] == {'enabled': True, 'hours': 0.5}
+    assert client.patch('/api/settings', json={'schedule': prefs['schedule']}).status_code == 200
+    server.store.set('due:xhs', time.time() - 1)
+    monkeypatch.setattr(server, 'check_updates', lambda store: None)
+    monkeypatch.setattr(server, 'schedule_xhs_retries', lambda now: None)
+
+    async def stop_after_cycle(delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(server.asyncio, 'sleep', stop_after_cycle)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(server.scheduler())
+    with server.store.connect() as db:
+        row = db.execute('SELECT platform,kind,state FROM tasks').fetchone()
+    assert tuple(row) == ('xhs', 'sync', 'queued')
+    assert server.store.get('due:xhs') > time.time() + 1700
+
+
 def test_console_standalone_starts_and_saves_threshold_without_worker_package(tmp_path):
     isolated = tmp_path / "console-only"
     shutil.copytree(

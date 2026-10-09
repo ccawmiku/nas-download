@@ -62,7 +62,7 @@ def import_legacy(store):
         finally:
             source.close()
     preferences = store.get("preferences", json.loads(json.dumps(DEFAULTS)))
-    for key in ("x", "pixiv", "douyin"):
+    for key in ("x", "pixiv", "douyin", "xhs"):
         config = read_json(CONFIG_PATHS[key])
         seconds = (
             config.get("run_interval_seconds")
