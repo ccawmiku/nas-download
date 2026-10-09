@@ -23,7 +23,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app import __version__
-from app.bot import BotManager
+from app.bot import BotManager, RuntimeControls
 from app.config import Settings, SettingsStore, verify_password
 from app.history import DownloadHistory, RETRYABLE_STATUSES
 from app.logs import MemoryLogHandler
@@ -34,7 +34,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("media-downloader-web")
-memory_log_handler = MemoryLogHandler()
+memory_log_handler = MemoryLogHandler(path=Path(os.getenv('CONFIG_DIR','/config'))/'logs.sqlite3' if os.getenv('NAS_CORE_URL') else None)
 memory_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
 logging.getLogger().addHandler(memory_log_handler)
 
@@ -45,6 +45,11 @@ history = DownloadHistory(
     flush_interval=settings.history_flush_interval_seconds,
 )
 bot_manager = BotManager(history)
+bot_manager.controls = RuntimeControls(
+    lambda enabled, value: settings_store.save({"limit_enabled": enabled, "limit_mb": value})
+)
+bot_manager.controls.limit_mb = settings.limit_mb
+bot_manager.controls.speed_limit_bytes_per_second = int(settings.limit_mb * 1024 * 1024) if settings.limit_enabled else None
 preview_generator = PreviewGenerator(settings.config_dir / "previews")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 PUBLIC_BASE_PATH = os.getenv("PUBLIC_BASE_PATH", "").rstrip("/")
@@ -89,6 +94,8 @@ class SettingsPayload(BaseModel):
     max_auto_retries: int = Field(default=3, ge=0, le=10)
     queue_maxsize: int = Field(default=100, ge=1, le=1000)
     history_flush_interval_seconds: float = Field(default=2, ge=0.5, le=60)
+    limit_enabled: bool = False
+    limit_mb: float = Field(default=2, ge=1, le=10_000)
 
     @field_validator(
         "download_dir",
@@ -107,6 +114,7 @@ class SettingsPayload(BaseModel):
 class LimitPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     megabytes_per_second: float | None = Field(default=None, ge=1, le=10_000)
+    limit_mb: float | None = Field(default=None, ge=1, le=10_000)
 
 
 class LinksPayload(BaseModel):
@@ -206,8 +214,8 @@ def list_downloaded_files(download_dirs: dict[str, Path]) -> list[dict[str, Any]
         return [dict(row) for row in file_list_cache_rows]
 
 
-def list_download_records(current: Settings) -> list[dict[str, Any]]:
-    records = history.list()
+def list_download_records(current: Settings, records=None) -> list[dict[str, Any]]:
+    records = records if records is not None else history.list(100 if os.getenv('NAS_CORE_URL') else None)
     download_dirs = configured_download_dirs(current)
     for record in records:
         record["category"] = None
@@ -260,8 +268,21 @@ def _valid_session(token: str | None) -> bool:
 
 
 def require_panel_auth(request: Request) -> None:
+    if os.getenv('NAS_CORE_URL'):
+        if not INTERNAL_API_TOKEN or not hmac.compare_digest(request.headers.get('X-NAS-Download-Token',''), INTERNAL_API_TOKEN):
+            raise HTTPException(status_code=401, detail='请通过统一控制台访问')
+        return
     if PANEL_AUTH_REQUIRED and not _valid_session(request.cookies.get(SESSION_COOKIE)):
         raise HTTPException(status_code=401, detail="请先登录控制面板")
+
+
+def preview_mode():
+    return os.getenv('NAS_PREVIEW','').lower() in {'1','true','yes'}
+
+
+def require_live_bot():
+    if preview_mode():
+        raise HTTPException(409, '隔离预览暂不连接生产机器人')
 
 
 @asynccontextmanager
@@ -271,18 +292,50 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     recovery = history.recover_incomplete()
     if recovery["recovered"] or recovery["interrupted"]:
         logger.warning("启动时恢复完成 %s 条，标记中断 %s 条", recovery["recovered"], recovery["interrupted"])
-    if PANEL_AUTH_REQUIRED and not current.admin_password_hash:
+    if PANEL_AUTH_REQUIRED and not current.admin_password_hash and not os.getenv('NAS_CORE_URL'):
         logger.warning("控制台尚未设置密码。一次性初始化口令：%s", BOOTSTRAP_TOKEN)
-    auto_start = os.getenv("AUTO_START_BOT", "true").lower() not in {"0", "false", "no"}
-    if current.ready and auto_start:
-        try:
-            await bot_manager.start(current)
-        except Exception as exc:
-            bot_manager.last_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("Bot 自动启动失败")
+    auto_start = os.getenv("AUTO_START_BOT", "true").lower() not in {"0", "false", "no"} and not preview_mode()
+    supervisor = asyncio.create_task(bot_manager.supervise(lambda: settings_store.settings), name="bot-keepalive") if auto_start else None
+    async def reconcile_workspace():
+        from workers.client import Client, replay_receipts
+        while True:
+            await asyncio.sleep(10)
+            await asyncio.to_thread(replay_receipts)
+            try:
+                from workers.telegram_delivery import recover_handoffs
+                await asyncio.to_thread(Client().request, '/internal/heartbeat', {'owner':'telegram-service','platforms':['telegram'],'details':{'running':bot_manager.running and bot_manager.connection_status == 'online','connection_status':bot_manager.connection_status}})
+                await asyncio.to_thread(recover_handoffs, history)
+            except Exception:
+                pass
+            try:
+                cursor_path=history.path.parent/'core-log-cursor.json'
+                from core.config import read_json,write_json
+                cursor=read_json(cursor_path).get('cursor',0)
+                for entry in memory_log_handler.pending(cursor):
+                    await asyncio.to_thread(Client().request,'/internal/logs',{'platform':'telegram','message':entry['message'],'level':entry['level'],'event_id':'telegram-log-'+str(entry['id'])})
+                    cursor=entry['id']
+                    write_json(cursor_path,{'cursor':cursor})
+            except Exception:
+                pass
+            for value in history.list_statuses({'processing'}, limit=None):
+                try:
+                    result = await asyncio.to_thread(Client().request, '/internal/record/telegram/' + value['id'])
+                    if result['state'] == 'complete' and result['files']:
+                        target = Path(result['files'][0])
+                        history.update(value['id'], status='complete',path=str(target),file_name=target.name,size_bytes=target.stat().st_size,error='')
+                    elif result['state'] in {'failed','deleted'}:
+                        history.update(value['id'],status=result['state'],error=result['metadata'].get('error','工作区文件已删除'))
+                except Exception:
+                    continue
+    reconcile = asyncio.create_task(reconcile_workspace()) if os.getenv('NAS_CORE_URL') else None
     try:
         yield
     finally:
+        if supervisor:
+            supervisor.cancel()
+            await asyncio.gather(supervisor, return_exceptions=True)
+        if reconcile:
+            reconcile.cancel()
         await bot_manager.stop()
         history.flush()
 
@@ -386,8 +439,18 @@ async def api_state(request: Request):
         "settings": current.public_dict(),
         "bot": bot_manager.state(),
         "downloads": list_download_records(current),
-        "files": await asyncio.to_thread(list_downloaded_files, configured_download_dirs(current)),
+        "files": [] if os.getenv('NAS_CORE_URL') else await asyncio.to_thread(list_downloaded_files, configured_download_dirs(current)),
     }
+
+
+@app.get('/api/downloads/history')
+def paged_history(request: Request, page: int = 1):
+    require_panel_auth(request)
+    if page < 1:
+        raise HTTPException(422)
+    data=history.page(page,30)
+    data['items']=list_download_records(settings_store.settings,data['items'])
+    return data
 
 
 @app.get("/api/logs")
@@ -404,9 +467,21 @@ async def save_settings(request: Request, payload: SettingsPayload):
     old = settings_store.snapshot()
     was_running = bot_manager.running
     candidate = settings_store.build(payload.model_dump(exclude_unset=True))
+    if os.getenv("NAS_CORE_URL"):
+        # Persist valid settings immediately; connection failures remain visible
+        # and are recovered by the supervisor instead of making settings unusable.
+        candidate.ensure_dirs()
+        current = settings_store.commit(candidate)
+        if bot_manager.client:
+            await bot_manager.stop()
+        bot_manager.controls.limit_mb = current.limit_mb
+        bot_manager.controls.speed_limit_bytes_per_second = int(current.limit_mb * 1024 * 1024) if current.limit_enabled else None
+        bot_manager.retry_at = 0
+        bot_manager._supervision_wakeup.set()
+        return {"settings": current.public_dict(), "bot": bot_manager.state()}
     try:
         candidate.ensure_dirs()
-        if candidate.ready:
+        if candidate.ready and not preview_mode():
             if was_running:
                 await bot_manager.restart(candidate)
             else:
@@ -430,6 +505,7 @@ async def save_settings(request: Request, payload: SettingsPayload):
 @app.post("/api/bot/start")
 async def start_bot(request: Request):
     require_panel_auth(request)
+    require_live_bot()
     try:
         await bot_manager.start(settings_store.settings)
     except Exception as exc:
@@ -440,6 +516,8 @@ async def start_bot(request: Request):
 @app.post("/api/bot/stop")
 async def stop_bot(request: Request):
     require_panel_auth(request)
+    if os.getenv("NAS_CORE_URL"):
+        raise HTTPException(409, "机器人保持在线；如需暂停传输，请暂停下载")
     await bot_manager.stop()
     return {"bot": bot_manager.state()}
 
@@ -447,6 +525,10 @@ async def stop_bot(request: Request):
 @app.post("/api/bot/restart")
 async def restart_bot(request: Request):
     require_panel_auth(request)
+    require_live_bot()
+    if os.getenv("NAS_CORE_URL"):
+        await bot_manager.reconnect()
+        return {"bot": bot_manager.state()}
     try:
         await bot_manager.restart(settings_store.settings)
     except Exception as exc:
@@ -472,6 +554,8 @@ async def pause_downloads(request: Request):
 async def set_download_limit(request: Request, payload: LimitPayload):
     require_panel_auth(request)
     if payload.megabytes_per_second is None:
+        if payload.limit_mb is not None:
+            bot_manager.controls.limit_mb = payload.limit_mb
         bot_manager.controls.clear_limit()
     else:
         bot_manager.controls.set_limit_mb(payload.megabytes_per_second)
@@ -553,10 +637,10 @@ async def get_preview(request: Request, category: str, file_name: str):
 def platform_summary() -> dict[str, Any]:
     state = bot_manager.state()
     active = state.get("active") or {}
-    records = history.list()
+    grouped = history.counts()
     counts = {"pending": state["queue_size"],
-              "failed": sum(r["status"] in RETRYABLE_STATUSES for r in records),
-              "retry": sum(r["status"] == "retrying" for r in records)}
+              "failed": sum(grouped.get(key,0) for key in RETRYABLE_STATUSES),
+              "retry": grouped.get('retrying',0)}
     return {"connected": state["running"], "running": bool(active),
             "next_run_at": "", "current_job": active.get("file_name", ""),
             "counts": counts, "progress": active, "bot": state}

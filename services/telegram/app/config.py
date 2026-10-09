@@ -126,6 +126,8 @@ class Settings:
     history_flush_interval_seconds: float = 2.0
     log_level: str = "INFO"
     cookie_secure: bool = False
+    limit_enabled: bool = False
+    limit_mb: float = 2.0
 
     @property
     def ready(self) -> bool:
@@ -156,6 +158,8 @@ class Settings:
             "queue_maxsize": self.queue_maxsize,
             "history_flush_interval_seconds": self.history_flush_interval_seconds,
             "ready": self.ready,
+            "limit_enabled": self.limit_enabled,
+            "limit_mb": self.limit_mb,
         }
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -192,6 +196,8 @@ class Settings:
             path.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> None:
+        if type(self.limit_enabled) is not bool or not 1 <= self.limit_mb <= 10_000:
+            raise RuntimeError("限速值须为 1–10000 MB/s")
         if self.api_id is not None and self.api_id <= 0:
             raise RuntimeError("API_ID 必须大于 0")
         if not SESSION_NAME_RE.fullmatch(self.session_name):
@@ -244,6 +250,8 @@ class Settings:
             queue_maxsize=int(data.get("queue_maxsize") or 100),
             history_flush_interval_seconds=float(data.get("history_flush_interval_seconds") or 2),
             log_level=str(data.get("log_level") or "INFO"),
+            limit_enabled=data.get("limit_enabled", False),
+            limit_mb=float(data.get("limit_mb", 2)),
         )
         settings.validate()
         return settings
@@ -353,6 +361,8 @@ class SettingsStore:
             "max_auto_retries",
             "queue_maxsize",
             "history_flush_interval_seconds",
+            "limit_enabled",
+            "limit_mb",
         ):
             if key not in updates:
                 continue

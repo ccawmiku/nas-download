@@ -1,88 +1,33 @@
-# NAS Download
+# NAS Download v4
 
-统一管理小红书、X、Pixiv、抖音和 Telegram 的 NAS 下载控制台。
+五个平台的新下载与媒体归档中心：Telegram、小红书、X、Pixiv、抖音。
 
-当前版本：`v3.0.3`。项目由原 NAS 下载集成服务 v2.0.2 和 Telegram v1.9 迁移而来，保留已有平台实现、配置与状态格式。
+v4 重写了网页、调度、持久任务与媒体处理。平台下载能力通过独立适配器复用现有实现和固定上游版本，包括修复版 F2 和小红书下载器。
 
-## 功能
+## 日常使用
 
-- 五个平台的服务状态、运行任务与日志。
-- Telegram 直接访问，下载队列、进度、速率、ETA、历史和媒体预览。
-- Telegram 启动、停止、重启、暂停、恢复、限速、取消与失败重试。
-- 原有小红书链接队列、X 点赞、Pixiv 收藏和抖音 f2 下载。
-- 平台 worker 退出后的退避重启，流式媒体代理及视频 Range 请求。
-- Telegram 独立容器，单实例复用现有 session，集成 cryptg 加速。
-- 小红书保留自动重试，页面只展示失败记录与重试状态。
+- 总览：平台/执行服务、任务数量、最近任务、上游版本。
+- 下载：链接、增量同步、任务进度、取消/重试；Telegram 下载控制与分页历史。
+- 工作区：新文件的转换、校验、入库结果、重试和删除；没有暂停操作。
+- 媒体记录：每份来源内容的下载结果、归档文件和预览，独立于采集边界。
+- 平台与设置：五个平台配置、工作区开关、分钟上限、同步周期、可选密码登录。
+- 日志：默认最近 30 行，全部日志可分页/导出。
 
-## 访问
+Telegram/小红书默认经过工作区，其他平台可开启。视频使用 N95 核显 HEVC，PNG 转 JPEG 质量 95；不改变分辨率。候选不更小、透明/动画 PNG 保留原件。转换自动重试一次，仍失败则归档有效原件；封装损坏的原视频保留并标记失败。
 
-- 统一控制台：`http://NAS_IP:14001`
-- Telegram 统一入口：在控制台选择 Telegram；完整设置页为 `/telegram/`
-- 原 Telegram 独立端口继续保留：`http://NAS_IP:12010`
-- 小红书 API 保留端口 13001
+工作区不可用时 bypass。仅在归档文件和持久记录确认后删除工作区原件。重启、接口确认丢失均有交付/入库恢复记录。
 
-## 已有部署迁移
+X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、触达来源边界或真实末页时结束；默认停止数为 10/20/50，网页可调整。另有分钟上限兜底，超限不标记成功。历史媒体不扫描、不转换。Telegram 自动保持在线，限速使用一个开关；工作区显示累计节省空间。
 
-请先阅读 [迁移说明](docs/MIGRATION.md)。运行数据集中在 `/volume2/docker/nas-download`，素材目录及容器内路径保持原样。
+## 部署
 
-新项目不会用空配置替代已有 Cookie、数据库、历史或 Telegram session。公开仓库只包含源码、示例和文档，NAS 的私有运行配置单独保存。
+新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-## 部署和更新
+发布标签 `v4.0.0` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
 
-准备私有 `.env`，可参考 `.env.example`。发布镜像分别为：
+- [需求约定](docs/REBUILD_CONTRACT.md)
+- [架构与数据流程](docs/V4_ARCHITECTURE.md)
+- [v3 → v4 切换](docs/V4_MIGRATION.md)
+- [NAS 验证记录](docs/V4_VALIDATION.md)
 
-```text
-ghcr.io/ccawmiku/nas-download:v3.0.3
-ghcr.io/ccawmiku/nas-download-telegram:v3.0.3
-ghcr.io/ccawmiku/xhs-downloader:2.8-nas.2
-```
-
-```bash
-docker compose -f docker-compose.yml pull
-docker compose -f docker-compose.yml up -d
-```
-
-已有部署先执行迁移流程；上述命令不能替代迁移。NAS 运行文件命名为 `compose.yaml`。
-
-小红书使用 [ccawmiku/XHS-Downloader](https://github.com/ccawmiku/XHS-Downloader) 的 2.8-nas.2 镜像，只补齐 PyYAML 非法控制字符范围，修复 U+0083；默认 JPEG。Docker 数据目录仍为 `/app/Volume`，升级保留现有挂载；独立程序版需把旧 `_internal/Volume` 复制至新程序旁。新增配置默认超时 30 秒、队列间隔 1 秒；已有显式配置继续保留。
-
-## 开发与验证
-
-集成服务：在仓库根目录的独立 Python 3.12 虚拟环境中运行。
-
-```bash
-python -m pip install -r _integrated/requirements.txt PyYAML
-python -m playwright install chromium
-python -m unittest test_integrated.py test_integration.py
-```
-
-Telegram：另建独立 Python 3.12 虚拟环境，在 `services/telegram` 中运行；f2 固定的 pytest/pytest-asyncio 版本与 Telegram 开发依赖不同，不要混装两个服务的依赖。
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-前端：在 `frontend` 中运行。
-
-```bash
-npm ci
-npm run build
-npm audit --audit-level=high
-```
-
-`.github/workflows/ci.yml` 在 PR 上用独立作业验证两个 Python 环境、真实浏览器采集与前端，并构建两个自有镜像检查 worker 和工具能否导入。正式版本标签全部验证通过后发布。测试直接使用对应镜像的锁定依赖，f2 使用明确 commit。
-
-X 的手动失败列表支持单条重试、全部重试和删除，同一时间只运行一个任务。详情见 [v3.0.3 升级说明](docs/UPGRADE_3.0.3.md)。
-
-X 图片下载和其他兼容性修复的验证记录见 [修复说明](docs/FIX_X_IMAGES_ISSUE.md)。
-
-## 代码结构
-
-- `frontend/`：统一 React 控制台。
-- `_integrated/`：Web 服务、平台适配、进程监督和流式代理。
-- `_src/`：沿用的四个平台下载器。
-- `services/telegram/`：沿用的 Telegram 实现与测试。
-- `scripts/`、`docs/`：迁移及运维说明。
-
-来源与基线 commit 见 [PROVENANCE.md](PROVENANCE.md)。原平台中的参考文档和示例保留供开发使用，部署以根目录 Compose 与迁移说明为准。
+v3 原部署文件与旧平台源码仍保留，用于固定依赖和回退；v4 网页不再提供旧完整设置页。

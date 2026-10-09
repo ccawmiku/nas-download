@@ -1,0 +1,91 @@
+name: nas-download-v4
+x-common: &common
+  restart: unless-stopped
+  environment: &env
+    INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set a private internal token}
+    NAS_CORE_URL: http://console:14001
+    TZ: Asia/Shanghai
+  volumes: &volumes
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/core:/state/core
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/execution:/state/execution
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/config:/config/x
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/pixiv/config:/config/pixiv
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/douyin/config:/config/douyin
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/config:/config/xhs
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/config:/config/telegram
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/sessions:/sessions
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/telegram/download-root:/downloads
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/state:/state/x
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/pixiv/state:/state/pixiv
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/douyin/f2/database:/state/douyin/f2
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/state:/state/xhs
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/queue:/queue/xhs
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/volumes:/xhs-volume
+    - /volume1/se-p/x-p:/downloads/x/images
+    - /volume1/se-v/x-v:/downloads/x/videos
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/downloads-metadata:/downloads/x/downloads-metadata
+    - /volume1/se-p/pixiv:/downloads/pixiv
+    - /volume1/se-p/小红书:/xhs
+    - /volume1/douyin:/douyin
+    - /volume1/se-p/tele-p:/downloads/images
+    - /volume1/se-v/tele-v:/downloads/videos
+    - /volume1/se-v/tele-files:/downloads/files
+    - /volume1/.nas-workspace:/media/.nas-workspace
+services:
+  console:
+    <<: *common
+    image: ghcr.io/ccawmiku/nas-download-console:${NAS_DOWNLOAD_VERSION:-v4.0.0}
+    build: {context: ., dockerfile: containers/console.Dockerfile}
+    environment:
+      <<: *env
+      NAS_IMPORT_LEGACY: "true"
+      NAS_SCHEDULER: ${NAS_SCHEDULER:-true}
+      NAS_CORE_DATA: /state/core
+      TELEGRAM_CONFIG_PATH: /config/telegram/settings.json
+      TELEGRAM_URL: http://telegram-worker:8000
+    ports: ["${NAS_DOWNLOAD_PORT:-14001}:14001"]
+  engines:
+    <<: *common
+    image: ghcr.io/ccawmiku/nas-download-engines:${NAS_DOWNLOAD_VERSION:-v4.0.0}
+    build: {context: ., dockerfile: containers/engines.Dockerfile}
+    shm_size: 256m
+    init: true
+    stop_grace_period: 20s
+    depends_on: [console]
+  xhs:
+    <<: *common
+    image: ghcr.io/ccawmiku/nas-download-xhs:${NAS_DOWNLOAD_VERSION:-v4.0.0}
+    build: {context: ., dockerfile: containers/xhs.Dockerfile}
+    environment:
+      <<: *env
+      WORKER_PLATFORMS: xhs
+      XHS_SETTINGS_PATH: /app/Volume/settings.json
+    volumes:
+      - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/volumes:/app/Volume
+      - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/config:/config/xhs
+      - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/execution:/state/execution
+      - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/queue:/queue/xhs
+      - /volume1/se-p/小红书:/xhs
+      - /volume1/.nas-workspace:/media/.nas-workspace
+    init: true
+    depends_on: [console]
+  telegram-worker:
+    <<: *common
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v4.0.0}
+    build: {context: ., dockerfile: containers/telegram.Dockerfile}
+    environment:
+      <<: *env
+      CONFIG_DIR: /config/telegram
+      DOWNLOAD_DIR: /downloads
+      PUBLIC_BASE_PATH: /api/telegram
+      AUTO_START_BOT: "true"
+    depends_on: [console]
+  media:
+    <<: *common
+    image: ghcr.io/ccawmiku/nas-download-media:${NAS_DOWNLOAD_VERSION:-v4.0.0}
+    build: {context: ., dockerfile: containers/media.Dockerfile}
+    devices: ["/dev/dri/renderD128:/dev/dri/renderD128"]
+    # DSM kernel has no CPU CFS quota. The worker binds one CPU and uses nice/ionice.
+    mem_limit: 1g
+    init: true
+    depends_on: [console]

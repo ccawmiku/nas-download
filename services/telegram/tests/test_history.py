@@ -51,7 +51,7 @@ def test_history_corruption_is_backed_up_and_service_can_continue(tmp_path):
 
     assert (tmp_path / "downloads.json.corrupt").exists()
     assert history.list()[0]["status"] == "failed"
-    assert isinstance(json.loads(path.read_text(encoding="utf-8")), list)
+    assert DownloadHistory(path).list()[0]['status']=='failed'
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -61,12 +61,24 @@ def test_progress_updates_are_throttled_but_flush_persists_latest_state(tmp_path
     history.add(DownloadRecord("one", 1, 1, "one.bin", str(tmp_path / "one.bin")))
 
     history.update("one", persist=False, status="downloading", progress=55)
-    before_flush = json.loads(path.read_text(encoding="utf-8"))[0]
+    before_flush = DownloadHistory(path).find('one')
     history.flush()
-    after_flush = json.loads(path.read_text(encoding="utf-8"))[0]
+    after_flush = DownloadHistory(path).find('one')
 
     assert before_flush["progress"] == 0
     assert after_flush["progress"] == 55
+
+
+def test_history_is_not_pruned_by_display_limit_and_imports_only_once(tmp_path):
+    path=tmp_path/'downloads.json'
+    path.write_text(json.dumps([{'id':'legacy','message_id':1,'chat_id':1,'file_name':'old','path':'old','status':'complete'}]),encoding='utf-8')
+    history=DownloadHistory(path,limit=2)
+    for index in range(205):
+        history.add(DownloadRecord(str(index),index,1,f'{index}.bin',str(tmp_path/f'{index}.bin')))
+    assert history.page()['total']==206
+    assert history.find('legacy')['status']=='complete'
+    path.write_text('[]',encoding='utf-8')
+    assert DownloadHistory(path).page()['total']==206
 
 
 def test_list_statuses_can_return_all_matches(tmp_path):

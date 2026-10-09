@@ -23,6 +23,37 @@ def load_main(monkeypatch, tmp_path):
     return importlib.import_module("app.main")
 
 
+def test_limit_switch_persists_disabled_value_and_restores_after_restart(monkeypatch, tmp_path):
+    main = load_main(monkeypatch,tmp_path)
+    with TestClient(main.app) as client:
+        login(client, main)
+        assert client.post('/api/controls/limit',json={'megabytes_per_second':3}).json()['controls']['limit_enabled']
+        controls = client.post('/api/controls/limit',json={'megabytes_per_second':None,'limit_mb':4}).json()['controls']
+        assert not controls['limit_enabled'] and controls['limit_mb'] == 4
+    restarted = load_main(monkeypatch,tmp_path)
+    assert not restarted.bot_manager.controls.state()['limit_enabled']
+    assert restarted.bot_manager.controls.limit_mb == 4
+    restarted.bot_manager.controls.set_limit_mb(5)  # same path used by /limit commands
+    assert restarted.settings_store.settings.limit_mb == 5
+    again = load_main(monkeypatch,tmp_path)
+    assert again.bot_manager.controls.speed_limit_bytes_per_second == 5*1024*1024
+
+
+def test_background_start_does_not_block_web_and_v4_bot_cannot_be_stopped(monkeypatch,tmp_path):
+    import asyncio
+    main = load_main(monkeypatch,tmp_path)
+    main.settings_store.save({'api_id':123,'api_hash':'test-hash','bot_token':'test-token'})
+    monkeypatch.setenv('AUTO_START_BOT','true')
+    monkeypatch.setenv('NAS_CORE_URL','http://preview-only.invalid')
+    monkeypatch.setattr(main,'INTERNAL_API_TOKEN','private-test')
+    async def blocked(*a): await asyncio.Event().wait()
+    main.bot_manager.start = AsyncMock(side_effect=blocked)
+    with TestClient(main.app) as client:
+        assert client.get('/healthz').status_code == 200
+        assert client.post('/api/bot/stop',json={},headers={'X-NAS-Download-Token':'private-test'}).status_code == 409
+        assert main.bot_manager.start.await_count == 1
+
+
 def test_file_listing_keeps_newest_200_across_categories(monkeypatch, tmp_path):
     main = load_main(monkeypatch, tmp_path)
     dirs = main.configured_download_dirs(main.settings_store.settings)
@@ -295,4 +326,3 @@ def test_add_downloads_from_links_endpoint(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.json() == {"queued": 1, "errors": []}
-
