@@ -3,7 +3,7 @@
 set -eu
 umask 077
 root=${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}
-workspace=${NAS_WORKSPACE_HOST:-/volume1/.nas-workspace}
+workspace=${NAS_WORKSPACE_HOST:-/volume1/NDtempwork}
 test "$(id -u)" = 0 || { echo 'Run as root'; exit 1; }
 test -d "$root/platforms" && test -d "$root/telegram" || { echo 'Existing v3 data root required'; exit 1; }
 test ! -L "$root/v4" && test ! -L "$workspace" || { echo 'State/workspace cannot be symlinks'; exit 1; }

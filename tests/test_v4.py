@@ -27,7 +27,7 @@ def test_telegram_gateway_forwards_json_content_type(client, monkeypatch):
         assert request.headers['content-type'] == 'application/json'
         assert json.loads(request.content) == {'megabytes_per_second': 2}
         assert request.headers['X-NAS-Download-Token'] == 'private-test-key'
-        return httpx.Response(200, json={'ok': True})
+        return httpx.Response(200, stream=httpx.ByteStream(b'{"ok":true}'), headers={'Content-Type': 'application/json'})
 
     monkeypatch.setattr(server.httpx, 'AsyncClient', lambda **kwargs: async_client(transport=httpx.MockTransport(accept), **kwargs))
     response = client.post('/api/telegram/api/controls/limit', json={'megabytes_per_second': 2})
