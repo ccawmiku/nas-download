@@ -1,8 +1,8 @@
-# NAS Download v4 重建预览
+# NAS Download v4
 
 五个平台的新下载与媒体归档中心：Telegram、小红书、X、Pixiv、抖音。
 
-v4 重写了网页、调度、持久任务与媒体处理。平台下载能力通过独立适配器复用现有实现和固定上游版本。当前分支为预览，正式 NAS 仍运行 v3.0.3。
+v4 重写了网页、调度、持久任务与媒体处理。平台下载能力通过独立适配器复用现有实现和固定上游版本，包括修复版 F2 和小红书下载器。
 
 ## 日常使用
 
@@ -23,7 +23,7 @@ X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、
 
 新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)。当前没有 v4 发布标签，请从源码构建；先完成隔离验证再切换正式数据。
+发布标签 `v4.0.0` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
 
 - [需求约定](docs/REBUILD_CONTRACT.md)
 - [架构与数据流程](docs/V4_ARCHITECTURE.md)

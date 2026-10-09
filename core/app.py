@@ -34,6 +34,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
+VERSION = os.getenv("APP_VERSION", "4.0.0")
 
 
 def settings():
@@ -185,7 +186,7 @@ async def guard(request: Request, call_next):
 
 @app.get("/healthz")
 def health():
-    return {"ok": True, "version": "4.0.0-preview"}
+    return {"ok": True, "version": VERSION}
 
 
 @app.get("/api/auth/status")
@@ -329,7 +330,7 @@ def overview():
             for key in PLATFORMS
         }
     return {
-        "version": "4.0.0-preview",
+        "version": VERSION,
         "counts": counts,
         "workers": workers,
         "platforms": [
