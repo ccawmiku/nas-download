@@ -18,6 +18,22 @@ from core import media
 from workers.media_worker import finish_receipt
 
 
+def test_telegram_gateway_forwards_json_content_type(client, monkeypatch):
+    import httpx
+
+    async_client = httpx.AsyncClient
+
+    def accept(request):
+        assert request.headers['content-type'] == 'application/json'
+        assert json.loads(request.content) == {'megabytes_per_second': 2}
+        assert request.headers['X-NAS-Download-Token'] == 'private-test-key'
+        return httpx.Response(200, json={'ok': True})
+
+    monkeypatch.setattr(server.httpx, 'AsyncClient', lambda **kwargs: async_client(transport=httpx.MockTransport(accept), **kwargs))
+    response = client.post('/api/telegram/api/controls/limit', json={'megabytes_per_second': 2})
+    assert response.status_code == 200 and response.json() == {'ok': True}
+
+
 def test_xhs_legacy_schedule_migrates_can_be_saved_and_enqueues(client, tmp_path, monkeypatch):
     import asyncio
     from core import config, migrate

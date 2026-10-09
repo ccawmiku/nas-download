@@ -34,7 +34,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.1")
+VERSION = os.getenv("APP_VERSION", "4.0.2")
 
 
 def settings():
@@ -956,6 +956,8 @@ async def telegram_proxy(path: str, request: Request):
         raise HTTPException(404)
     url = os.getenv("TELEGRAM_URL", "http://telegram-worker:8000") + "/" + path
     headers = {"X-NAS-Download-Token": TOKEN}
+    if request.headers.get("content-type"):
+        headers["Content-Type"] = request.headers["content-type"]
     if request.headers.get("range"):
         headers["Range"] = request.headers["range"]
     client = httpx.AsyncClient(timeout=30)
