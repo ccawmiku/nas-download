@@ -34,11 +34,15 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.0")
+VERSION = os.getenv("APP_VERSION", "4.0.1")
 
 
 def settings():
-    return {**DEFAULTS, **store.get("preferences", {})}
+    saved = store.get("preferences", {})
+    value = {**DEFAULTS, **saved}
+    for key in ("workspace", "max_minutes", "schedule"):
+        value[key] = {**DEFAULTS[key], **saved.get(key, {})}
+    return value
 
 
 def session_secret():
@@ -267,7 +271,7 @@ def save_settings(payload: dict):
         raise HTTPException(422, "工作区开关无效")
     if set(current["max_minutes"]) != {"x", "pixiv", "douyin"} or set(
         current["schedule"]
-    ) != {"x", "pixiv", "douyin"}:
+    ) != {"x", "pixiv", "douyin", "xhs"}:
         raise HTTPException(422, "平台设置无效")
     if any(
         not isinstance(v, (int, float)) or not 1 <= v <= 1440

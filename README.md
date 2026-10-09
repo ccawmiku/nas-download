@@ -23,7 +23,7 @@ X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、
 
 新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-发布标签 `v4.0.0` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+发布标签 `v4.0.1` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.1`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
 
 - [需求约定](docs/REBUILD_CONTRACT.md)
 - [架构与数据流程](docs/V4_ARCHITECTURE.md)
