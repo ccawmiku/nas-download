@@ -71,7 +71,8 @@ def parse_limit_mb(text: str) -> float | None:
     match = LIMIT_RE.match(text.strip())
     if not match:
         return None
-    return max(1.0, float(match.group(1)))
+    value = max(1.0, float(match.group(1)))
+    return value if value <= 10_000 else None
 
 
 def parse_delay_hours(text: str) -> float | None:
@@ -97,19 +98,28 @@ def parse_pause_seconds(value: str) -> float | None:
 
 
 class RuntimeControls:
-    def __init__(self) -> None:
+    def __init__(self, on_limit_change=None) -> None:
         self.speed_limit_bytes_per_second: int | None = None
+        self.limit_mb = 2.0
+        self.on_limit_change = on_limit_change
         self.pause_until: float = 0.0
         self.pause_indefinitely = False
         self._changed = asyncio.Event()
 
     def set_limit_mb(self, megabytes: float) -> float:
         value = max(1.0, megabytes)
+        if not value <= 10_000:
+            raise ValueError("限速值须为 1–10000 MB/s")
+        if self.on_limit_change:
+            self.on_limit_change(True, value)
+        self.limit_mb = value
         self.speed_limit_bytes_per_second = int(value * 1024 * 1024)
         self._changed.set()
         return value
 
     def clear_limit(self) -> None:
+        if self.on_limit_change:
+            self.on_limit_change(False, self.limit_mb)
         self.speed_limit_bytes_per_second = None
         self._changed.set()
 
@@ -142,7 +152,7 @@ class RuntimeControls:
 
     def limit_text(self) -> str:
         if not self.speed_limit_bytes_per_second:
-            return "未设置"
+            return "不限速"
         return f"{self.speed_limit_bytes_per_second / 1024 / 1024:.1f} MB/s"
 
     def state(self) -> dict[str, Any]:
@@ -151,6 +161,8 @@ class RuntimeControls:
             "pause_indefinitely": self.pause_indefinitely,
             "pause_remaining_seconds": self.delay_remaining_seconds(),
             "speed_limit_bytes_per_second": self.speed_limit_bytes_per_second,
+            "limit_enabled": bool(self.speed_limit_bytes_per_second),
+            "limit_mb": self.limit_mb,
             "speed_limit_text": self.limit_text(),
         }
 
@@ -327,6 +339,9 @@ class BotManager:
         self.albums: dict[str, AlbumBatch] = {}
         self.controls = RuntimeControls()
         self._stopping = False
+        self.connection_status = "waiting_config"
+        self.retry_at = 0.0
+        self._supervision_wakeup = asyncio.Event()
 
     @property
     def running(self) -> bool:
@@ -340,6 +355,8 @@ class BotManager:
             "last_error": self.last_error,
             "started_at": self.started_at,
             "task_done": bool(self.task and self.task.done()),
+            "connection_status": self.connection_status,
+            "retry_at": self.retry_at,
             "queue_size": self.queue.qsize() if self.queue else 0,
             "queue_maxsize": self.queue.maxsize if self.queue else 0,
             "active": active,
@@ -540,7 +557,7 @@ class BotManager:
                 await client.start(bot_token=settings.bot_token)
                 me = await client.get_me()
                 await self._register_commands(client)
-            except Exception:
+            except BaseException:
                 await client.disconnect()
                 raise
 
@@ -553,6 +570,72 @@ class BotManager:
             self.worker_task = asyncio.create_task(self._worker(), name="download-worker")
             self.task = asyncio.create_task(self._run_until_disconnected(client), name="telegram-client")
             logger.info("Bot 已启动：@%s，队列上限 %s", self.username, settings.queue_maxsize)
+
+    async def supervise(self, get_settings) -> None:
+        """Own initial start/recovery without blocking the web server or clearing live jobs."""
+        delay, rejected = 3, None
+        def connection_config(settings):
+            return {key: value for key, value in settings.to_json_dict().items() if key not in {"limit_enabled", "limit_mb"}}
+        while True:
+            current = get_settings()
+            if not current.ready:
+                self.connection_status = "waiting_config"
+                self.retry_at = 0
+                rejected = None
+            elif rejected == current.to_json_dict():
+                self.connection_status = "credential_error"
+            elif self.client and self.settings and connection_config(current) != connection_config(self.settings):
+                # Settings may have changed while the initial connection was awaiting the network.
+                await self.stop()
+                self.connection_status, self.retry_at = "connecting", 0
+                self._supervision_wakeup.set()
+            elif self.client:
+                async with self._lock:
+                    self._stopping = False
+                    if not self.task or self.task.done():
+                        if self.task and not self.task.cancelled():
+                            self.task.exception()
+                        self.task = asyncio.create_task(self._run_until_disconnected(self.client), name="telegram-client")
+                    if self.queue is not None and (not self.worker_task or self.worker_task.done()):
+                        if self.worker_task and not self.worker_task.cancelled():
+                            self.worker_task.exception()
+                        self.worker_task = asyncio.create_task(self._worker(), name="download-worker")
+                        logger.warning("已恢复退出的下载处理任务，现有队列保留")
+                if self.running and self.connection_status == "online":
+                    self.connection_status, self.retry_at, delay = "online", 0, 3
+            elif time.time() >= self.retry_at:
+                self.connection_status = "connecting"
+                try:
+                    await asyncio.wait_for(self.start(current), timeout=90)
+                    self.connection_status, self.retry_at, delay = "online", 0, 3
+                    rejected = None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    fatal = type(exc).__name__ in {"AccessTokenInvalidError", "AccessTokenExpiredError", "ApiIdInvalidError", "ApiIdPublishedFloodError", "AuthKeyUnregisteredError", "UserDeactivatedError"}
+                    if fatal:
+                        rejected = current.to_json_dict()
+                        self.connection_status = "credential_error"
+                        self.retry_at = 0
+                    else:
+                        wait = max(delay, int(getattr(exc, "seconds", 0) or 0))
+                        self.retry_at = time.time() + wait
+                        self.connection_status = "retry_wait"
+                        delay = min(30, delay * 2)
+                    logger.warning("Bot 启动未完成，将按连接状态恢复：%s", type(exc).__name__)
+            try:
+                await asyncio.wait_for(self._supervision_wakeup.wait(), timeout=3)
+                self._supervision_wakeup.clear()
+                rejected, delay = None, 3
+            except asyncio.TimeoutError:
+                pass
+
+    async def reconnect(self) -> None:
+        self.retry_at = 0
+        self._supervision_wakeup.set()
+        if self.client:
+            await self.client.disconnect()
 
     async def _register_commands(self, client: TelegramClient) -> None:
         commands = [
@@ -635,6 +718,9 @@ class BotManager:
                         await client.start(bot_token=self.settings.bot_token)
                     logger.info("Bot 已成功重新连接至 Telegram")
                 connected_at = time.monotonic()
+                self.connection_status = "online"
+                self.last_error = ""
+                self.retry_at = 0
                 await client.run_until_disconnected()
             except asyncio.CancelledError:
                 break
@@ -643,6 +729,7 @@ class BotManager:
                     reconnect_delay = 3
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("Bot 断开连接或发生异常，将在 %s 秒后尝试重连", reconnect_delay)
+                wait = max(reconnect_delay, int(getattr(exc, "seconds", 0) or 0))
                 # Telethon may retain/re-raise this exception via a Future.
                 # After logging, release completed frames and their buffers.
                 seen: set[int] = set()
@@ -656,10 +743,13 @@ class BotManager:
             else:
                 if connected_at is not None and time.monotonic() - connected_at >= 60:
                     reconnect_delay = 3
+                wait = reconnect_delay
             if self._stopping:
                 break
+            self.connection_status = "retry_wait"
+            self.retry_at = time.time() + wait
             try:
-                await asyncio.sleep(reconnect_delay)
+                await asyncio.sleep(wait)
             except asyncio.CancelledError:
                 break
             reconnect_delay = min(30, reconnect_delay * 2)
@@ -940,6 +1030,16 @@ class BotManager:
 
     async def _process_job(self, job: DownloadJob) -> None:
         assert self.settings is not None
+        archive_target = job.target_path
+        workspace_enabled = False
+        handed_off = False
+        if os.getenv('NAS_CORE_URL'):
+            from workers.client import prepare
+            job.target_path, workspace_enabled = await asyncio.to_thread(prepare, 'telegram', archive_target, job.record_id)
+            if workspace_enabled:
+                if archive_target.exists() and archive_target.stat().st_size == 0:
+                    archive_target.unlink()
+                self.history.update(job.record_id, path=str(job.target_path), archive_path=str(archive_target))
         partial = job.target_path.with_name(f".{job.target_path.name}.{job.record_id[:8]}.part")
         for retry_count in range(self.settings.max_auto_retries + 1):
             reporter = ProgressReporter(self, job, self.settings)
@@ -971,10 +1071,34 @@ class BotManager:
                     raise RuntimeError("下载结果文件不存在")
                 self.history.update(job.record_id, status="verifying", progress=100, eta_seconds=0)
                 file_size = result.stat().st_size
+                expected = getattr(getattr(job.message, 'file', None), 'size', None)
+                if file_size <= 0 or expected and file_size != expected:
+                    raise RuntimeError('下载文件大小不完整')
                 os.replace(result, job.target_path)
+                asset_id = ''
+                final_path = str(job.target_path)
+                if os.getenv('NAS_CORE_URL'):
+                    from workers.client import submit, record
+                    # Persist ownership before awaiting a thread: cancellation cannot
+                    # delete a file that the intake thread may already have committed.
+                    self.history.update(job.record_id, status='processing' if workspace_enabled else 'complete',
+                                        archive_path=str(archive_target), path=final_path,
+                                        total_bytes=file_size, size_bytes=file_size, progress=100)
+                    handed_off = True
+                    if workspace_enabled:
+                        outcome = await asyncio.to_thread(submit, 'telegram', job.target_path, archive_target, {'source_id':job.record_id, 'metadata':{'title':archive_target.name}})
+                        if isinstance(outcome, dict):
+                            final_path = outcome['path']
+                            workspace_enabled = False
+                        else:
+                            asset_id = outcome
+                    await asyncio.to_thread(record, 'telegram', job.record_id, 'processing' if workspace_enabled else 'complete', [final_path], {'title':archive_target.name})
                 self.history.update(
                     job.record_id,
-                    status="complete",
+                    status="processing" if workspace_enabled else "complete",
+                    path=final_path,
+                    archive_path=str(archive_target),
+                    workspace_asset_id=asset_id,
                     progress=100,
                     downloaded_bytes=file_size,
                     total_bytes=file_size,
@@ -992,7 +1116,8 @@ class BotManager:
                         limit_line = f"\n限速：{self.controls.limit_text()}"
                     await self.safe_edit(
                         job.status_message,
-                        "下载完成。\n"
+                        ("下载完成，已进入工作区。\n" if workspace_enabled else "下载完成。\n")
+                        +
                         f"任务：`{job.record_id[:8]}`\n"
                         f"文件：`{job.target_path.name}`\n"
                         f"大小：{human_size(file_size)}\n"
@@ -1000,6 +1125,8 @@ class BotManager:
                     )
                 return
             except asyncio.CancelledError:
+                if handed_off:
+                    raise
                 status = "cancelled" if job.record_id in self.cancelled_ids else "interrupted"
                 error = "用户取消任务" if status == "cancelled" else "Bot 停止或任务被中断"
                 self.history.update(job.record_id, status=status, error=error, speed_bytes_per_second=0, eta_seconds=None)
@@ -1012,6 +1139,9 @@ class BotManager:
                 self.cancelled_ids.discard(job.record_id)
                 raise
             except Exception as exc:
+                if handed_off:
+                    logger.exception('文件已交付，通知发送失败')
+                    return
                 error = f"{type(exc).__name__}: {exc}"
                 logger.exception("下载任务 %s 失败", job.record_id[:8])
                 if retry_count < self.settings.max_auto_retries:
@@ -1199,7 +1329,7 @@ class BotManager:
                     )
                 except RPCError:
                     logger.exception("无法发送重试状态消息：%s", record["id"][:8])
-            target_path = Path(record["path"])
+            target_path = Path(record.get('archive_path') or record["path"])
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if not target_path.exists():
                 target_path.touch(mode=0o600)

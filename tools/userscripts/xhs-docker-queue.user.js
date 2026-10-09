@@ -1144,7 +1144,7 @@ Discord Community: https://discord.com/invite/ZYtmgKud9Y
                                            page: window.location.href,
                                            submitted_at: new Date().toISOString(),
                                        }),
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-NAS-Submit-Token': GM_getValue('nasSubmitToken', '') },
                     timeout: 30000,
                     onload: function (response) {
                         let body = {};
@@ -1768,6 +1768,13 @@ Discord Community: https://discord.com/invite/ZYtmgKud9Y
         body.appendChild(dockerHost);
         body.appendChild(dockerPort);
         body.appendChild(dockerPath);
+        const submitToken = createTextInput({
+            label: 'NAS 推送授权',
+            description: '开启控制台密码后，在通用设置中复制浏览器推送授权；未开启密码可留空。',
+            placeholder: '',
+            value: GM_getValue('nasSubmitToken', ''),
+        });
+        body.appendChild(submitToken);
         body.appendChild(scriptServerURL);
         body.appendChild(scriptServerSwitch);
 
@@ -1798,6 +1805,7 @@ Discord Community: https://discord.com/invite/ZYtmgKud9Y
             updateLinkCheckboxSwitch(linkCheckboxSwitch.querySelector('input').checked);
             updateImageCheckboxSwitch(imageCheckboxSwitch.querySelector('input').checked);
             updateMaxScrollCount(parseInt(scrollCount.querySelector('input').value) || 50)
+            GM_setValue('nasSubmitToken', submitToken.querySelector('.text-input').value.trim());
             updateDockerHost(dockerHost.querySelector('.text-input').value.trim() || defaultDockerHost);
             updateDockerPort(dockerPort.querySelector('.text-input').value.trim() || defaultDockerPort);
             updateDockerPath(dockerPath.querySelector('.text-input').value.trim() || defaultDockerPath);

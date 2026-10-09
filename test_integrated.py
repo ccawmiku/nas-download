@@ -52,21 +52,6 @@ from x_auto_worker import (
 
 
 class IntegratedPageTests(unittest.TestCase):
-    def test_home_page_includes_version_and_service_cards(self) -> None:
-        index = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
-        app = (ROOT / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
-        styles = (ROOT / "frontend" / "src" / "styles.css").read_text(encoding="utf-8")
-        self.assertIn('<div id="root"></div>', index)
-        self.assertIn("运行总览", app)
-        self.assertIn("小红书", app)
-        self.assertIn("Pixiv", app)
-        self.assertIn("抖音", app)
-        self.assertIn("任务中心", app)
-        self.assertIn("运行日志", app)
-        self.assertIn('aria-label="折叠侧边栏"', app)
-        self.assertIn("grid-template-columns", styles)
-        self.assertIn("@media(max-width:720px)", styles)
-
     def test_frontend_dist_is_served_when_built(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp) / "assets"

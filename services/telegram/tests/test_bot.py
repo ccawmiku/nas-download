@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telethon.errors import ChatWriteForbiddenError
+from telethon.errors import ChatWriteForbiddenError, FloodWaitError
 from telethon.tl.types import MessageMediaWebPage
 
 from app.bot import BotManager, DownloadJob, RuntimeControls, parse_pause_seconds
@@ -76,6 +76,95 @@ def make_manager(tmp_path, retries=3):
     manager.settings = settings
     manager.retry_delay = lambda _: 0
     return manager, settings, history
+
+
+@pytest.mark.asyncio
+async def test_supervisor_recovers_initial_start_failure_and_cleans_partial_client(tmp_path, monkeypatch):
+    manager, settings, _ = make_manager(tmp_path)
+    settings.api_id, settings.api_hash, settings.bot_token = 123, 'test-hash', 'test-token'
+    clients = []
+    class Client:
+        def __init__(self, *a, **k):
+            clients.append(self)
+            self.connected = False
+            self.disconnected = asyncio.Event()
+        def on(self, *a): return lambda fn: fn
+        async def start(self, **k):
+            if len(clients) == 1: raise OSError('network unavailable')
+            self.connected = True
+        async def get_me(self): return SimpleNamespace(username='test-bot')
+        def is_connected(self): return self.connected
+        async def disconnect(self):
+            self.connected = False
+            self.disconnected.set()
+        async def run_until_disconnected(self): await self.disconnected.wait()
+    monkeypatch.setattr('app.bot.TelegramClient', Client)
+    manager._register_commands = AsyncMock()
+    task = asyncio.create_task(manager.supervise(lambda:settings))
+    try:
+        async def wait_status(status):
+            while manager.connection_status != status: await asyncio.sleep(0.001)
+        await asyncio.wait_for(wait_status('retry_wait'), 1)
+        assert clients[0].disconnected.is_set()
+        manager.retry_at = 0
+        manager._supervision_wakeup.set()
+        await asyncio.wait_for(wait_status('online'), 1)
+        assert manager.running and len(clients) == 2
+        assert manager.last_error == ''
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restores_worker_without_clearing_queue_or_connection(tmp_path):
+    manager, settings, _ = make_manager(tmp_path)
+    settings.api_id, settings.api_hash, settings.bot_token = 123, 'hash', 'token'
+    manager.client = SimpleNamespace(is_connected=lambda:True)
+    blocker = asyncio.Event()
+    manager.task = asyncio.create_task(blocker.wait())
+    async def crashed(): raise OSError('worker stopped')
+    manager.worker_task = asyncio.create_task(crashed())
+    await asyncio.sleep(0)
+    queue = asyncio.Queue()
+    queue.put_nowait('pending')
+    manager.queue = queue
+    manager._worker = AsyncMock(side_effect=blocker.wait)
+    task = asyncio.create_task(manager.supervise(lambda:settings))
+    try:
+        async def restored():
+            while not manager._worker.await_count: await asyncio.sleep(0.001)
+        await asyncio.wait_for(restored(), 1)
+        assert manager.queue is queue and queue.qsize() == 1 and manager.running
+        assert manager._worker.await_count == 1
+    finally:
+        for value in (task,manager.task,manager.worker_task): value.cancel()
+        await asyncio.gather(task,manager.task,manager.worker_task,return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_obeys_telegram_flood_wait(tmp_path, monkeypatch):
+    manager, _, _ = make_manager(tmp_path)
+    waits = []
+    class Client:
+        def is_connected(self): return True
+        async def run_until_disconnected(self): raise FloodWaitError(None,42)
+    async def sleep(delay):
+        waits.append(delay)
+        manager._stopping = True
+    monkeypatch.setattr('app.bot.asyncio.sleep',sleep)
+    await manager._run_until_disconnected(Client())
+    assert waits == [42]
+
+
+@pytest.mark.asyncio
+async def test_paused_downloads_keep_commands_responsive(tmp_path):
+    manager, settings, _ = make_manager(tmp_path)
+    manager.controls.pause()
+    event = SimpleNamespace(message=SimpleNamespace(raw_text='/ping'), sender_id=123, reply=AsyncMock(return_value=FakeStatus()))
+    assert await manager._handle_command(event,settings)
+    assert event.reply.await_count == 1 and manager.controls.is_paused()
 
 
 @pytest.mark.asyncio
@@ -183,6 +272,41 @@ async def test_download_retries_then_completes(tmp_path):
     assert saved["status"] == "complete"
     assert saved["retry_count"] == 2
     assert target.read_bytes() == b"payload"
+
+
+@pytest.mark.asyncio
+async def test_stop_during_workspace_intake_keeps_owned_original(tmp_path, monkeypatch):
+    import sys, types, threading
+    manager, settings, history = make_manager(tmp_path)
+    root = tmp_path / 'workspace'
+    root.mkdir()
+    staged = root / 'new.bin'
+    target = settings.file_download_dir / 'new.bin'
+    target.touch()
+    history.add(DownloadRecord('handoff',1,123,target.name,str(target)))
+    entered, release = threading.Event(), threading.Event()
+    def submit(*args):
+        entered.set()
+        release.wait(3)
+        return 'asset'
+    fake = types.ModuleType('workers.client')
+    fake.prepare = lambda *args:(staged, True)
+    fake.submit = submit
+    fake.record = lambda *args:None
+    monkeypatch.setitem(sys.modules,'workers',types.ModuleType('workers'))
+    monkeypatch.setitem(sys.modules,'workers.client',fake)
+    monkeypatch.setenv('NAS_CORE_URL','http://test')
+    task = asyncio.create_task(manager._process_job(DownloadJob('handoff',FakeMessage(),target,FakeStatus())))
+    try:
+        assert await asyncio.to_thread(entered.wait,2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert staged.read_bytes() == b'payload'
+        assert history.find('handoff')['status']=='processing'
+        assert history.pending_handoffs()[0]['archive_path']==str(target)
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
