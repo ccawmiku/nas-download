@@ -17,7 +17,7 @@ Compose 默认目录与其他平台同层级：
 | 配置 / Cookies | `${NAS_DOWNLOAD_ROOT}/platforms/instagram/config` | `/config/instagram` |
 | 下载恢复状态 | `${NAS_DOWNLOAD_ROOT}/platforms/instagram/state` | `/state/instagram` |
 
-Docker Compose 会创建缺少的绑定目录。确认运行账户有读写权限。工作区默认关闭，可按其他平台的方式开启。
+群晖可能拒绝不存在的绑定目录；升级前以 root 运行 `scripts/prepare-v4.sh`，显式创建 Instagram 配置、状态及媒体目录。新媒体目录沿用已有 X 目录的用户、组和权限，现有目录不改动。工作区默认关闭，可按其他平台的方式开启。
 
 ## 获取与去重
 
