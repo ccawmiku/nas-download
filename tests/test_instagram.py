@@ -24,6 +24,10 @@ class Catalog:
     def __init__(self):
         self.records = {}
         self.checkpoints = {}
+        self.logs = []
+
+    def log(self, platform, message, task_id, level):
+        self.logs.append(message)
 
     def request(self, path, payload=None):
         if path == "/internal/records/lookup":
@@ -349,3 +353,64 @@ def test_cookie_session_initializes_pinned_extractor_offline(tmp_path):
     assert source.account == "42"
     assert source.extractor._retries == 0
     assert not list(source.session.cookies)
+
+
+@pytest.mark.parametrize("extension", ["heic", "heif"])
+def test_heif_only_post_keeps_original_media_format(extension):
+    raw = post("5")
+    raw["image_versions2"]["candidates"][0]["url"] = "https://scontent.cdninstagram.com/original." + extension
+    media = Source([]).media(raw)
+    assert len(media) == 1
+    assert media[0]["name"] == "5_5." + extension
+    assert media[0]["kind"] == "images"
+
+
+def test_heic_download_decodes_and_preserves_original_bytes(tmp_path):
+    import io
+    from PIL import Image
+    from pillow_heif import register_heif_opener
+    register_heif_opener(decode_threads=1, thumbnails=False)
+    output = io.BytesIO()
+    Image.new("RGB", (64, 48), "red").save(output, format="HEIF")
+    data = output.getvalue()
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "image/heic", "Content-Length": str(len(data))}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def raise_for_status(self): pass
+        def iter_content(self, size): return iter([data])
+    response = Response()
+    source = object.__new__(worker.GallerySource)
+    source.session = SimpleNamespace(get=lambda *args, **kwargs: response)
+    target = tmp_path / "photo.heic"
+    journal = []
+    item = {"url": "https://scontent.cdninstagram.com/photo.heic", "kind": "images"}
+    source.download(item, target, journal.append)
+    assert target.read_bytes() == data and worker.owned(journal[0])
+    with Image.open(target) as image:
+        assert image.size == (64, 48)
+    target.unlink()
+    journal.clear()
+    data = data[:32]
+    response.headers["Content-Length"] = str(len(data))
+    with pytest.raises((OSError, ValueError)):
+        source.download(item, target, journal.append)
+    assert not target.exists() and not journal
+
+
+def test_failure_reason_is_visible_redacted_and_cleared_on_success(setup):
+    import requests
+    source = Source([])
+    original = source.download
+    def fail(*args):
+        raise requests.ConnectionError("https://cdn.example/path?token=private-session-secret")
+    source.download = fail
+    runner(setup, source).process(post("3"))
+    value = setup[1].records["3"]
+    assert "网络" in value["metadata"]["error"]
+    assert setup[1].logs and "private-session-secret" not in str(setup[1].logs)
+    source.download = original
+    runner(setup, source).process(post("3"), value)
+    assert setup[1].records["3"]["state"] == "complete"
+    assert "error" not in setup[1].records["3"]["metadata"]
