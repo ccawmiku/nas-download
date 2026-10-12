@@ -36,7 +36,7 @@ def failure_reason(error):
         return "媒体下载网络异常或超时，文件保留供重试"
     if isinstance(error, FileExistsError):
         return "归档文件已存在但未通过归属校验，未覆盖原文件"
-    safe = {"媒体响应类型不匹配", "媒体文件为空或下载不完整", "收藏媒体不完整，保留失败记录供重试", "收藏图片格式不受支持，请更新下载器"}
+    safe = {"媒体响应类型不匹配", "媒体文件为空或下载不完整", "收藏媒体不完整，保留失败记录供重试", "收藏图片格式不受支持，请更新下载器", "媒体实际格式不受支持"}
     if isinstance(error, ValueError) and str(error) in safe:
         return str(error)
     return "媒体下载或文件校验失败，已下载部分保留供重试"
@@ -179,7 +179,14 @@ class GallerySource:
                         from pillow_heif import register_heif_opener
                         register_heif_opener(decode_threads=1, thumbnails=False)
                     with Image.open(temporary) as image:
-                        if target.suffix.lower() in {".heic", ".heif"}:
+                        extensions = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "HEIF": ".heic"}
+                        extension = extensions.get(image.format)
+                        if not extension:
+                            raise ValueError("媒体实际格式不受支持")
+                        # Instagram CDN can return JPEG bytes for a .heic URL.
+                        # Publish with the decoded format, without re-encoding.
+                        target = target.with_suffix(extension)
+                        if image.format == "HEIF":
                             # HEIF's verify() does not decode image data. Load the
                             # primary image to reject truncated/corrupt payloads.
                             image.load()
@@ -252,6 +259,7 @@ class SavedJob:
                 old_checks = (previous or {}).get("metadata", {}).get("file_checks", {})
                 existing = next((f for f in (previous or {}).get("files", []) if Path(f).stem == Path(item["name"]).stem and Path(f).is_file() and Path(f).stat().st_size > 0 and (f not in old_checks or owned(old_checks[f]))), None)
                 if existing:
+                    target = target.with_suffix(Path(existing).suffix)
                     files.append(existing)
                     if Path(existing).parent != target.parent:
                         submit("instagram", existing, target, {"source_id": identifier, "metadata": metadata})
@@ -266,6 +274,7 @@ class SavedJob:
                         write_json(manifest_path, manifest)
                     entry = self.source.download(item, self.roots[item["kind"]] / item["name"], journal)
                 path = Path(entry["source"])
+                target = target.with_suffix(path.suffix)
                 if path != target:
                     submit("instagram", path, target, {"source_id": identifier, "metadata": metadata})
                     pending = True

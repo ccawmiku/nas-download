@@ -414,3 +414,36 @@ def test_failure_reason_is_visible_redacted_and_cleared_on_success(setup):
     runner(setup, source).process(post("3"), value)
     assert setup[1].records["3"]["state"] == "complete"
     assert "error" not in setup[1].records["3"]["metadata"]
+
+
+def test_heic_url_with_jpeg_response_publishes_correct_extension(setup, tmp_path, monkeypatch):
+    import io
+    from PIL import Image
+    output = io.BytesIO()
+    Image.new("RGB", (32, 24), "blue").save(output, format="JPEG")
+    data = output.getvalue()
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "image/jpeg", "Content-Length": str(len(data))}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def raise_for_status(self): pass
+        def iter_content(self, size): return iter([data])
+    source = Source([])
+    source.session = SimpleNamespace(get=lambda *args, **kwargs: Response())
+    source.download = worker.GallerySource.download.__get__(source)
+    raw = post("5")
+    raw["image_versions2"]["candidates"][0]["url"] = "https://scontent.cdninstagram.com/photo.heic"
+    monkeypatch.setattr(worker, "submit", lambda *args: pytest.fail("direct archive must not be submitted to workspace"))
+    runner(setup, source).process(raw)
+    value = setup[1].records["5"]
+    assert value["state"] == "complete"
+    target = Path(value["files"][0])
+    assert target.suffix == ".jpg" and target.read_bytes() == data
+    assert worker.complete(value, ["5"])
+    assert not target.with_suffix(".heic").exists()
+    with Image.open(target) as image:
+        assert image.size == (32, 24)
+    source.session.get = lambda *args, **kwargs: pytest.fail("completed file must be reused")
+    runner(setup, source).process(raw, value)
+    assert setup[1].records["5"]["state"] == "complete"
