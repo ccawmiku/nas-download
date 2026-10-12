@@ -269,9 +269,9 @@ def save_settings(payload: dict):
         type(v) is not bool for v in current["workspace"].values()
     ):
         raise HTTPException(422, "工作区开关无效")
-    if set(current["max_minutes"]) != {"x", "pixiv", "douyin"} or set(
+    if set(current["max_minutes"]) != set(DEFAULTS["max_minutes"]) or set(
         current["schedule"]
-    ) != {"x", "pixiv", "douyin", "xhs"}:
+    ) != set(DEFAULTS["schedule"]):
         raise HTTPException(422, "平台设置无效")
     if any(
         not isinstance(v, (int, float)) or not 1 <= v <= 1440
@@ -378,6 +378,15 @@ async def save_platform_config(platform: str, payload: dict):
             type(fields[key]) is not int or not 1 <= fields[key] <= 1000
         ):
             raise HTTPException(422, "连续已下载停止数须为 1–1000 的整数")
+    if platform == "instagram":
+        from .instagram import validate_settings, validate_cookies
+
+        try:
+            validate_settings({**config, **fields})
+            if payload.get("credential"):
+                validate_cookies(str(payload["credential"]))
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
     if platform == "telegram":
         async with httpx.AsyncClient(timeout=90) as client:
             try:
@@ -416,7 +425,7 @@ async def save_platform_config(platform: str, payload: dict):
             value = read_json(upstream)
             value["cookie"] = str(credential)
             write_json(upstream, value)
-        elif platform in {"x", "douyin", "pixiv"}:
+        elif platform in {"x", "douyin", "pixiv", "instagram"}:
             key = "refresh_token_file" if platform == "pixiv" else "cookie_file"
             target = Path(config.get(key) or f"/config/{platform}/{key}.txt")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -496,12 +505,14 @@ def add_task(payload: dict):
     platform = payload.get("platform")
     kind = payload.get("kind", "sync")
     if (
-        platform not in {"x", "pixiv", "douyin", "xhs"}
+        platform not in {"x", "pixiv", "douyin", "xhs", "instagram"}
         or kind not in {"sync", "links", "retry", "test", "oauth-start", "oauth-finish"}
         or kind.startswith("oauth-")
         and platform != "pixiv"
         or kind == "test"
         and platform == "xhs"
+        or platform == "instagram"
+        and kind not in {"sync", "retry", "test"}
     ):
         raise HTTPException(422, "任务无效")
     task_payload = payload.get("payload", {})

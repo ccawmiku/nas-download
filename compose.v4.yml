@@ -10,6 +10,8 @@ x-common: &common
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/core:/state/core
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/execution:/state/execution
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/config:/config/x
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/instagram/config:/config/instagram
+    - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/instagram/state:/state/instagram
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/pixiv/config:/config/pixiv
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/douyin/config:/config/douyin
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/config:/config/xhs
@@ -24,6 +26,8 @@ x-common: &common
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/volumes:/xhs-volume
     - /volume1/se-p/x-p:/downloads/x/images
     - /volume1/se-v/x-v:/downloads/x/videos
+    - /volume1/se-p/ins-p:/downloads/instagram/images
+    - /volume1/se-v/ins-v:/downloads/instagram/videos
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/downloads-metadata:/downloads/x/downloads-metadata
     - /volume1/se-p/pixiv:/downloads/pixiv
     - /volume1/se-p/小红书:/xhs

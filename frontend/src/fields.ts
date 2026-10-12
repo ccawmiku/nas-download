@@ -6,6 +6,20 @@ export type Spec = {
   value?: unknown;
 };
 export const definitions: Record<string, Record<string, Spec[]>> = {
+  instagram: {
+    收藏下载: [
+      { key: "browser", label: "Cookies 来源浏览器", value: "chrome", hint: "与导出 Cookies 的浏览器对应，例如 chrome、firefox、edge。" },
+      { key: "known_stop_consecutive", label: "连续已完成收藏停止数", type: "number", value: 20, hint: "按整条收藏计算；轮播缺图、失败和处理中均不计入。" },
+      { key: "retry_failed", label: "同步前重试失败收藏", type: "boolean", value: true },
+      { key: "max_download_attempts", label: "自动下载尝试上限", type: "number", value: 3 },
+    ],
+    请求间隔: [
+      { key: "sleep_request_min", label: "API 请求最小间隔（秒）", type: "number", value: 30 },
+      { key: "sleep_request_max", label: "API 请求最大间隔（秒）", type: "number", value: 60 },
+      { key: "sleep_download_min", label: "媒体下载最小间隔（秒）", type: "number", value: 5 },
+      { key: "sleep_download_max", label: "媒体下载最大间隔（秒）", type: "number", value: 10 },
+    ],
+  },
   telegram: {
     账号与访问: [
       { key: "api_id", label: "Telegram API ID", type: "number" },
