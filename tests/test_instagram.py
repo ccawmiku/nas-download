@@ -416,7 +416,8 @@ def test_failure_reason_is_visible_redacted_and_cleared_on_success(setup):
     assert "error" not in setup[1].records["3"]["metadata"]
 
 
-def test_heic_url_with_jpeg_response_publishes_correct_extension(setup, tmp_path, monkeypatch):
+@pytest.mark.parametrize("staged", [False, True])
+def test_heic_url_with_jpeg_response_publishes_correct_extension(setup, tmp_path, monkeypatch, staged):
     import io
     from PIL import Image
     output = io.BytesIO()
@@ -434,16 +435,23 @@ def test_heic_url_with_jpeg_response_publishes_correct_extension(setup, tmp_path
     source.download = worker.GallerySource.download.__get__(source)
     raw = post("5")
     raw["image_versions2"]["candidates"][0]["url"] = "https://scontent.cdninstagram.com/photo.heic"
-    monkeypatch.setattr(worker, "submit", lambda *args: pytest.fail("direct archive must not be submitted to workspace"))
+    deliveries = []
+    if staged:
+        monkeypatch.setattr(worker, "prepare", lambda *args: (tmp_path / "stage", True))
+        monkeypatch.setattr(worker, "submit", lambda *args: deliveries.append(args))
+    else:
+        monkeypatch.setattr(worker, "submit", lambda *args: pytest.fail("direct archive must not be submitted to workspace"))
     runner(setup, source).process(raw)
     value = setup[1].records["5"]
-    assert value["state"] == "complete"
+    assert value["state"] == ("processing" if staged else "complete")
     target = Path(value["files"][0])
     assert target.suffix == ".jpg" and target.read_bytes() == data
-    assert worker.complete(value, ["5"])
+    assert worker.complete(value, ["5"]) == (not staged)
+    if staged:
+        assert Path(deliveries[0][2]) == Path(setup[0]["image_dir"]) / "5_5.jpg"
     assert not target.with_suffix(".heic").exists()
     with Image.open(target) as image:
         assert image.size == (32, 24)
     source.session.get = lambda *args, **kwargs: pytest.fail("completed file must be reused")
     runner(setup, source).process(raw, value)
-    assert setup[1].records["5"]["state"] == "complete"
+    assert setup[1].records["5"]["state"] == ("processing" if staged else "complete")
