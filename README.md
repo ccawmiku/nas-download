@@ -21,11 +21,11 @@ X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、
 
 ## 部署
 
-Instagram 收藏下载的配置、目录和停止规则见 [Instagram 使用说明](docs/INSTAGRAM.md)。本分支的 Instagram 功能尚未包含在已发布的 `v4.0.3` 镜像中，需构建包含此改动的新镜像，并先使用隔离数据和端口验证。
+Instagram 收藏下载的配置、目录和停止规则见 [Instagram 使用说明](docs/INSTAGRAM.md)。Instagram 功能从 `v4.0.4` 开始提供。升级时先验证新镜像，再停止并删除旧容器、清理旧版本镜像，最后启动新实例；配置、状态与媒体目录保留。
 
 新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-发布标签 `v4.0.3` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.3`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+发布标签 `v4.0.4` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.4`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
 
 - [需求约定](docs/REBUILD_CONTRACT.md)
 - [架构与数据流程](docs/V4_ARCHITECTURE.md)
