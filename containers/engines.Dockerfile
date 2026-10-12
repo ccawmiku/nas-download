@@ -2,7 +2,7 @@
 ARG ENGINE_BASE=ghcr.io/ccawmiku/nas-download:v3.0.3
 FROM ${ENGINE_BASE}
 USER root
-RUN pip install --no-cache-dir Pillow==12.3.0 gallery-dl==1.32.16
+RUN pip install --no-cache-dir Pillow==12.3.0 gallery-dl==1.32.16 pillow-heif==1.8.1
 WORKDIR /opt/nas-auto
 COPY core/ ./core/
 COPY workers/ ./workers/

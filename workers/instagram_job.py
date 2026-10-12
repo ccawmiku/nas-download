@@ -25,6 +25,23 @@ class SourceError(RuntimeError):
     """An upstream/authentication error must stop the whole run."""
 
 
+def failure_reason(error):
+    """Only controlled messages enter records/logs; never signed URLs or cookies."""
+    if isinstance(error, SourceError):
+        return str(error)
+    if isinstance(error, requests.HTTPError):
+        code = error.response.status_code if error.response is not None else 0
+        return f"媒体请求失败（HTTP {code}），文件保留供重试"
+    if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        return "媒体下载网络异常或超时，文件保留供重试"
+    if isinstance(error, FileExistsError):
+        return "归档文件已存在但未通过归属校验，未覆盖原文件"
+    safe = {"媒体响应类型不匹配", "媒体文件为空或下载不完整", "收藏媒体不完整，保留失败记录供重试", "收藏图片格式不受支持，请更新下载器", "媒体实际格式不受支持"}
+    if isinstance(error, ValueError) and str(error) in safe:
+        return str(error)
+    return "媒体下载或文件校验失败，已下载部分保留供重试"
+
+
 def media_url(url):
     host = urlsplit(url).hostname or ""
     if urlsplit(url).scheme != "https" or not any(
@@ -117,7 +134,7 @@ class GallerySource:
                 video = bool(item.get("video_url"))
                 url = media_url(item["video_url"] if video else item["display_url"])
                 extension = "mp4" if video else Path(urlsplit(url).path).suffix.lstrip(".").lower()
-                if extension not in {"mp4", "jpg", "jpeg", "png", "webp"}:
+                if extension not in {"mp4", "jpg", "jpeg", "png", "webp", "heic", "heif"}:
                     raise ValueError("unsupported extension")
                 result.append({"id": identifier, "url": url, "kind": "videos" if video else "images", "name": f'{post["pk"]}_{identifier}.{extension}'})
             if len({item["id"] for item in result}) != expected:
@@ -126,6 +143,8 @@ class GallerySource:
         except SourceError:
             raise
         except Exception as exc:
+            if isinstance(exc, ValueError) and str(exc) == "unsupported extension":
+                raise ValueError("收藏图片格式不受支持，请更新下载器") from exc
             raise ValueError("收藏媒体不完整，保留失败记录供重试") from exc
 
     def download(self, item, target, journal):
@@ -156,7 +175,21 @@ class GallerySource:
                     validate_video(temporary, probe(temporary))
                 else:
                     from PIL import Image
+                    if target.suffix.lower() in {".heic", ".heif"}:
+                        from pillow_heif import register_heif_opener
+                        register_heif_opener(decode_threads=1, thumbnails=False)
                     with Image.open(temporary) as image:
+                        extensions = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "HEIF": ".heic"}
+                        extension = extensions.get(image.format)
+                        if not extension:
+                            raise ValueError("媒体实际格式不受支持")
+                        # Instagram CDN can return JPEG bytes for a .heic URL.
+                        # Publish with the decoded format, without re-encoding.
+                        target = target.with_suffix(extension)
+                        if image.format == "HEIF":
+                            # HEIF's verify() does not decode image data. Load the
+                            # primary image to reject truncated/corrupt payloads.
+                            image.load()
                         image.verify()
                 entry = {"source": str(target), "size": size, "sha256": digest.hexdigest()}
                 # Journal ownership before publication, closing the crash window
@@ -226,6 +259,7 @@ class SavedJob:
                 old_checks = (previous or {}).get("metadata", {}).get("file_checks", {})
                 existing = next((f for f in (previous or {}).get("files", []) if Path(f).stem == Path(item["name"]).stem and Path(f).is_file() and Path(f).stat().st_size > 0 and (f not in old_checks or owned(old_checks[f]))), None)
                 if existing:
+                    target = target.with_suffix(Path(existing).suffix)
                     files.append(existing)
                     if Path(existing).parent != target.parent:
                         submit("instagram", existing, target, {"source_id": identifier, "metadata": metadata})
@@ -240,6 +274,7 @@ class SavedJob:
                         write_json(manifest_path, manifest)
                     entry = self.source.download(item, self.roots[item["kind"]] / item["name"], journal)
                 path = Path(entry["source"])
+                target = target.with_suffix(path.suffix)
                 if path != target:
                     submit("instagram", path, target, {"source_id": identifier, "metadata": metadata})
                     pending = True
@@ -249,14 +284,17 @@ class SavedJob:
                 metadata["file_checks"] = checks
                 record("instagram", identifier, "failed", files, metadata)
             metadata["download_incomplete"] = False
+            metadata.pop("error", None)
             record("instagram", identifier, "processing" if pending else "complete", files, metadata)
             self.stats["processing" if pending else "downloaded"] += 1
         except Exception as exc:
+            metadata["error"] = failure_reason(exc)
             record("instagram", identifier, "failed", files, metadata)
             self.stats["failed"] += 1
+            self.client.log("instagram", f"收藏 {identifier}：{metadata['error']}", self.job["id"], "error")
             if isinstance(exc, SourceError):
                 raise
-            print(json.dumps({"phase": "download_failed", "source_id": identifier, "error": "收藏下载未完成，原文件保留供重试"}), flush=True)
+            print(json.dumps({"phase": "download_failed", "source_id": identifier, "error": metadata["error"]}), flush=True)
 
     def retry(self, manual=False, urls=None):
         page = 1
