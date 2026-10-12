@@ -77,7 +77,7 @@ def test_console_standalone_starts_and_saves_threshold_without_worker_package(tm
         INTERNAL_API_TOKEN="standalone-test",
         PYTHONPATH=str(isolated),
     )
-    for platform in ("x", "pixiv", "douyin", "xhs", "telegram"):
+    for platform in ("x", "pixiv", "douyin", "xhs", "telegram", "instagram"):
         environment[platform.upper() + "_CONFIG_PATH"] = str(
             isolated / "config" / platform / "config.json"
         )
@@ -216,6 +216,52 @@ def client(tmp_path, monkeypatch):
     server.store.set("preferences", {**DEFAULTS, "workspace_root": str(root)})
     with TestClient(server.app) as http:
         yield http
+
+
+def test_instagram_default_schedule_upgrade_and_task_scope(client):
+    server.store.set("preferences", {"schedule": {"x": {"enabled": True, "hours": 6}}})
+    prefs = client.get("/api/settings").json()
+    assert prefs["schedule"]["instagram"] == {"enabled": False, "hours": 72}
+    assert prefs["schedule"]["x"] == {"enabled": True, "hours": 6}
+    prefs["schedule"]["instagram"]["enabled"] = True
+    assert client.patch("/api/settings", json={"schedule": prefs["schedule"]}).status_code == 200
+    for kind in ("sync", "test", "retry"):
+        assert client.post("/api/tasks", json={"platform": "instagram", "kind": kind}).status_code == 200
+    for kind in ("links", "oauth-start"):
+        assert client.post("/api/tasks", json={"platform": "instagram", "kind": kind}).status_code == 422
+
+
+def test_instagram_cookie_validation_is_atomic_and_private(client, tmp_path, monkeypatch):
+    from core.config import CONFIG_PATHS, read_json, sanitize
+    path, cookies = tmp_path / "instagram.json", tmp_path / "cookies.txt"
+    monkeypatch.setitem(CONFIG_PATHS, "instagram", path)
+    write_json(path, {"cookie_file": str(cookies)})
+    url = "/api/platforms/instagram/settings"
+    bad = client.patch(url, json={"fields": {"known_stop_consecutive": 5}, "credential": "sessionid=must-stay-secret"})
+    assert bad.status_code == 422 and "must-stay-secret" not in bad.text
+    assert not cookies.exists() and "known_stop_consecutive" not in read_json(path)
+    credential = ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tprivate-session-secret\n.instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t42\n"
+    response = client.patch(url, json={"fields": {"known_stop_consecutive": 5}, "credential": credential})
+    assert response.status_code == 200 and response.json()["credential_set"]
+    assert "private-session-secret" not in response.text
+    assert "private-session-secret" not in sanitize("error private-session-secret")
+    assert cookies.read_text() == credential
+    assert client.patch(url, json={"fields": {"sleep_request_min": 0}}).status_code == 422
+
+
+def test_instagram_partial_download_cannot_be_completed_by_one_asset(client, tmp_path):
+    source = Path(server.settings()["workspace_root"]) / "5_51.jpg"
+    source.write_bytes(b"owned-test-source")
+    target = tmp_path / "archive" / source.name
+    headers = {"X-NAS-Download-Token": "private-test-key"}
+    payload = {"platform": "instagram", "source_id": "5", "state": "failed", "files": [str(source)], "metadata": {"download_incomplete": True, "media_ids": ["51", "52"]}}
+    client.post("/internal/records", headers=headers, json=payload)
+    identifier = client.post("/internal/intake", headers=headers, json={"platform": "instagram", "source": str(source), "target": str(target), "details": {"source_id": "5"}}).json()["id"]
+    with server.store.connect() as db:
+        db.execute("UPDATE assets SET state='complete' WHERE id=?", (identifier,))
+    server.reconcile_asset(identifier)
+    value = client.get("/internal/record/instagram/5", headers=headers).json()
+    assert value["state"] == "failed" and value["metadata"]["download_incomplete"]
 
 
 def test_password_is_opt_in_and_bad_settings_cannot_set_password(client):

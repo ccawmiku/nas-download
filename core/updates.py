@@ -30,8 +30,8 @@ SOURCES = {
     },
     "gallery-dl": {
         "repo": "mikf/gallery-dl",
-        "installed": "1.32.13",
-        "version": "1.32.13",
+        "installed": "1.32.16",
+        "version": "1.32.16",
     },
 }
 LOCK = Lock()

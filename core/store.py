@@ -13,6 +13,7 @@ PLATFORMS = {
     "x": "X",
     "pixiv": "Pixiv",
     "douyin": "抖音",
+    "instagram": "Instagram",
 }
 
 

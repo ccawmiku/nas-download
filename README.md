@@ -1,6 +1,6 @@
 # NAS Download v4
 
-五个平台的新下载与媒体归档中心：Telegram、小红书、X、Pixiv、抖音。
+六个平台的新下载与媒体归档中心：Telegram、小红书、X、Pixiv、抖音、Instagram。
 
 v4 重写了网页、调度、持久任务与媒体处理。平台下载能力通过独立适配器复用现有实现和固定上游版本，包括修复版 F2 和小红书下载器。
 
@@ -10,7 +10,7 @@ v4 重写了网页、调度、持久任务与媒体处理。平台下载能力�
 - 下载：链接、增量同步、任务进度、取消/重试；Telegram 下载控制与分页历史。
 - 工作区：新文件的转换、校验、入库结果、重试和删除；没有暂停操作。
 - 媒体记录：每份来源内容的下载结果、归档文件和预览，独立于采集边界。
-- 平台与设置：五个平台配置、工作区开关、分钟上限、同步周期、可选密码登录。
+- 平台与设置：六个平台配置、工作区开关、分钟上限、同步周期、可选密码登录。
 - 日志：默认最近 30 行，全部日志可分页/导出。
 
 Telegram/小红书默认经过工作区，其他平台可开启。视频使用 N95 核显 HEVC，PNG 转 JPEG 质量 95；不改变分辨率。候选不更小、透明/动画 PNG 保留原件。转换自动重试一次，仍失败则归档有效原件；封装损坏的原视频保留并标记失败。
@@ -21,9 +21,11 @@ X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、
 
 ## 部署
 
+Instagram 收藏下载的配置、目录和停止规则见 [Instagram 使用说明](docs/INSTAGRAM.md)。Instagram 功能从 `v4.0.4` 开始提供。升级时先验证新镜像，再停止并删除旧容器、清理旧版本镜像，最后启动新实例；配置、状态与媒体目录保留。
+
 新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-发布标签 `v4.0.3` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.3`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+发布标签 `v4.0.4` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.4`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
 
 - [需求约定](docs/REBUILD_CONTRACT.md)
 - [架构与数据流程](docs/V4_ARCHITECTURE.md)

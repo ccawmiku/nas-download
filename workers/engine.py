@@ -17,7 +17,7 @@ from .client import Client, replay_receipts
 def main():
     client = Client()
     owner = os.getenv("WORKER_ID", "engine-" + socket.gethostname())
-    platforms = os.getenv("WORKER_PLATFORMS", "x,pixiv,douyin").split(",")
+    platforms = os.getenv("WORKER_PLATFORMS", "x,pixiv,douyin,instagram").split(",")
     while True:
         try:
             replay_receipts()
@@ -31,7 +31,7 @@ def main():
                     outcome_path.unlink()
                     outcome_path.with_suffix(".task").unlink(missing_ok=True)
                     outcome_path.with_suffix(".result").unlink(missing_ok=True)
-            if any(platform in platforms for platform in ("x", "pixiv", "douyin")):
+            if any(platform in platforms for platform in ("x", "pixiv", "douyin", "instagram")):
                 from .bypass import drain_one
 
                 drain_one()

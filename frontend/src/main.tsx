@@ -35,6 +35,7 @@ const names: Record<string, string> = {
   x: "X",
   pixiv: "Pixiv",
   douyin: "抖音",
+  instagram: "Instagram",
 };
 const initials: Record<string, string> = {
   telegram: "TG",
@@ -42,6 +43,7 @@ const initials: Record<string, string> = {
   x: "X",
   pixiv: "Px",
   douyin: "抖",
+  instagram: "IG",
 };
 const stateNames: Record<string, string> = {
   queued: "排队中",
@@ -644,7 +646,7 @@ function Downloads({
                 onClick={async () => {
                   for (const key of platform
                     ? [platform]
-                    : ["x", "pixiv", "douyin", "xhs"])
+                    : ["x", "pixiv", "douyin", "xhs", "instagram"])
                     await act("/api/tasks", { platform: key, kind: "retry" });
                 }}
               >
@@ -1550,7 +1552,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                       : "尚未保存凭证"}
                   </div>
                   <label className="field">
-                    <span>{tab === "pixiv" ? "Refresh Token" : "Cookie"}</span>
+                    <span>{tab === "pixiv" ? "Refresh Token" : tab === "instagram" ? "Netscape Cookies" : "Cookie"}</span>
                     <textarea
                       rows={3}
                       spellCheck={false}
@@ -1561,7 +1563,9 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                     <small>
                       {tab === "pixiv"
                         ? "可粘贴已有 Refresh Token，也可使用下方登录流程。"
-                        : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
+                        : tab === "instagram"
+                          ? "粘贴浏览器导出的 Netscape Cookies 文件内容；保留 sessionid、ds_user_id，并选择对应浏览器。仅用于读取收藏。"
+                          : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
                     </small>
                   </label>
                   <div className="button-group">
@@ -1577,7 +1581,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                         生成 Pixiv 登录链接
                       </button>
                     )}
-                    {["pixiv", "douyin"].includes(tab) && (
+                    {["pixiv", "douyin", "instagram"].includes(tab) && (
                       <button
                         onClick={() =>
                           act("/api/tasks", { platform: tab, kind: "test" })
@@ -2054,7 +2058,7 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
             value={platform}
             onChange={(e) => setPlatform(e.target.value)}
           >
-            {Object.entries(names).map(([k, v]) => (
+            {Object.entries(names).filter(([k]) => k !== "instagram").map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
               </option>

@@ -894,6 +894,10 @@ def main():
         from .xhs_job import run
 
         result = asyncio.run(run(job))
+    elif job["platform"] == "instagram":
+        from .instagram_job import run
+
+        result = run(job)
     else:
         raise ValueError("unsupported executor")
     write_json(path.with_suffix(".result"), result)

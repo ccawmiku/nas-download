@@ -491,6 +491,11 @@ main {
   background: #f0f0f8;
   color: #655b8d;
 }
+
+.platform-mark.instagram {
+  color: #b92f79;
+  background: #fbe8f2;
+}
 .connection {
   display: inline-flex;
   align-items: center;
