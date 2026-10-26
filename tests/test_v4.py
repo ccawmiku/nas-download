@@ -633,14 +633,18 @@ def test_telegram_replays_only_completed_workspace_handoffs(tmp_path, monkeypatc
     assert len(calls) == 2
 
 
-def test_xhs_handoff_precedes_upstream_download_marker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind,destination,custom", [
+    ("links", "batch", ""), ("links", "single", ""),
+    ("links", "single", "/custom"), ("retry", "single", ""),
+])
+def test_xhs_handoff_precedes_upstream_download_marker(tmp_path, monkeypatch, kind, destination, custom):
     import asyncio, sys, types
     from workers import xhs_job
 
     root = tmp_path / "workspace"
     root.mkdir()
     config = tmp_path / "config.json"
-    write_json(config, {})
+    write_json(config, {"single_work_path": str(tmp_path / "custom") if custom else "", "request_delay_seconds": 0})
     monkeypatch.setitem(xhs_job.CONFIG_PATHS, "xhs", config)
     settings = tmp_path / "settings.json"
     write_json(settings, {"work_path": str(tmp_path / "archive")})
@@ -663,6 +667,7 @@ def test_xhs_handoff_precedes_upstream_download_marker(tmp_path, monkeypatch):
 
         async def extract(self, url, **kw):
             assert url == "https://www.xiaohongshu.com/explore/note"
+            assert kw["check_record"] == (kind != "retry" and destination != "single")
             (root / "new.png").write_bytes(b"image")
             await self.id_recorder.add("note")
             (root / "note.json").write_text("{}")
@@ -672,19 +677,25 @@ def test_xhs_handoff_precedes_upstream_download_marker(tmp_path, monkeypatch):
     for name in ["source", "source.application", "source.application.app"]:
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     sys.modules["source.application.app"].XHS = XHS
-    monkeypatch.setattr(
-        xhs_job,
-        "submit",
-        lambda *a, **kw: events.append("intake:" + a[1].name) or "asset",
-    )
+    def submit(*args, **kwargs):
+        final = tmp_path / "archive"
+        if destination == "single":
+            final = tmp_path / "custom" if custom else final / "single"
+        assert args[2] == final / args[1].name
+        assert args[3]["metadata"]["destination"] == destination
+        events.append("intake:" + args[1].name)
+        return "asset"
+
+    monkeypatch.setattr(xhs_job, "submit", submit)
     monkeypatch.setattr(xhs_job, "record", lambda *a, **kw: events.append("record"))
-    monkeypatch.setattr(xhs_job.Client, "request", lambda *a, **kw: {"metadata": {}})
+    monkeypatch.setattr(xhs_job.Client, "request", lambda *a, **kw: {"metadata": {"destination": destination}})
     stats = asyncio.run(
         xhs_job.run(
             {
                 "id": "task",
-                "kind": "links",
-                "payload": {"urls": ["https://www.xiaohongshu.com/explore/note"]},
+                "kind": kind,
+                "payload": {"urls": ["https://www.xiaohongshu.com/explore/note"],
+                            **({"destination": destination} if kind != "retry" else {})},
             }
         )
     )
@@ -758,3 +769,42 @@ def test_upstream_date_versions_ignore_zero_padding(monkeypatch):
         updates.check_one("yt-dlp", updates.SOURCES["yt-dlp"], {})["status"]
         == "current"
     )
+
+
+def test_xhs_browser_destination_is_durable_and_backward_compatible(client):
+    url = "https://www.xiaohongshu.com/explore/1234567890abcdef12345678?xsec_token=test"
+    batch = client.post('/api/xhs/links', json={'urls': [url]}).json()
+    single = client.post('/api/xhs/links', json={'urls': [url], 'destination': 'single'}).json()
+    assert batch['ok'] and single['ok'] and batch['task_id'] != single['task_id']
+    for reply, destination in [(batch, 'batch'), (single, 'single')]:
+        detail = client.get('/api/detail/tasks/' + reply['task_id']).json()
+        assert detail['payload']['destination'] == destination
+        assert detail['payload']['urls'] == [url]
+    duplicate = client.post('/api/xhs/links', json={'urls': [url], 'destination': 'single'}).json()
+    assert duplicate['skipped'] == 1 and duplicate['accepted'] == 0
+    for data in [
+        {'urls': [url], 'destination': '../escape'},
+        {'urls': [url, url + '&other=1'], 'destination': 'single'},
+        {'urls': ['https://example.com/file'], 'destination': 'single'},
+    ]:
+        assert client.post('/api/xhs/links', json=data).status_code == 422
+
+
+def test_xhs_archive_paths():
+    from workers.xhs_job import archive_root
+    assert archive_root({'work_path': '/xhs'}, {}) == Path('/xhs')
+    assert archive_root({'work_path': '/xhs'}, {}, 'single') == Path('/xhs/single')
+    assert archive_root({'work_path': '/xhs'}, {'single_work_path': '/mounted/singles'}, 'single') == Path('/mounted/singles')
+    with pytest.raises(ValueError):
+        archive_root({}, {'single_work_path': '../relative'}, 'single')
+
+
+def test_xhs_single_directory_can_be_configured(client, monkeypatch, tmp_path):
+    from core.config import CONFIG_PATHS
+    monkeypatch.setitem(CONFIG_PATHS, 'xhs', tmp_path / 'xhs.json')
+    monkeypatch.setenv('XHS_SETTINGS_PATH', str(tmp_path / 'settings.json'))
+    for value in ['../relative', 3]:
+        assert client.patch('/api/platforms/xhs/settings', json={'fields': {'single_work_path': value}}).status_code == 422
+    response = client.patch('/api/platforms/xhs/settings', json={'fields': {'single_work_path': '/xhs/manual'}})
+    assert response.status_code == 200
+    assert response.json()['fields']['single_work_path'] == '/xhs/manual'

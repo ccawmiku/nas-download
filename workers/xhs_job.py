@@ -3,6 +3,8 @@ import asyncio
 import os
 import json
 import hashlib
+import re
+from urllib.parse import urlparse
 from pathlib import Path
 from core.config import CONFIG_PATHS, read_json
 from core.media import publish
@@ -35,6 +37,16 @@ def queue_urls(config):
     return urls, checkpoints
 
 
+def archive_root(settings, config, destination="batch"):
+    root = Path(settings.get("work_path") or "/xhs")
+    if destination == "single":
+        custom = str(config.get("single_work_path") or "").strip()
+        root = Path(custom) if custom else root / "single"
+        if not root.is_absolute():
+            raise ValueError("单个作品保存目录必须是容器绝对路径")
+    return root
+
+
 async def run(job):
     from source.application.app import XHS
 
@@ -52,7 +64,8 @@ async def run(job):
                 "message": "没有新队列链接；不回查历史",
             }
     settings = read_json(os.getenv("XHS_SETTINGS_PATH", "/app/Volume/settings.json"))
-    final = Path(settings.get("work_path") or "/xhs")
+    settings_original = dict(settings)
+    final = archive_root(settings, config)
     destination, enabled = prepare("xhs", final / "incoming", job["id"])
     # Temporary downloads are scoped to this task even when processing is bypassed.
     staging = destination.parent if enabled else final / ".incoming" / job["id"]
@@ -86,13 +99,16 @@ async def run(job):
                 and not p.name.startswith(".")
             ]
             for source in files:
-                target = final / source.relative_to(staging)
+                target = current["final"] / source.relative_to(staging)
                 if enabled:
                     submit(
                         "xhs",
                         source,
                         target,
-                        {"source_id": identifier, "metadata": {"url": current["url"]}},
+                        {
+                            "source_id": identifier,
+                            "metadata": {"url": current["url"], "destination": current["destination"]},
+                        },
                     )
                     current["delivered"].append(str(source))
                     current["processing"] = True
@@ -106,7 +122,7 @@ async def run(job):
                 identifier,
                 "processing" if current["processing"] else "complete",
                 current["delivered"],
-                {"url": current["url"]},
+                {"url": current["url"], "destination": current["destination"]},
             )
             if not enabled:
                 for source in files:
@@ -132,18 +148,27 @@ async def run(job):
                 "delivered": [],
                 "processing": False,
             }
+            match = re.search(r"/(?:explore|discovery/item)/([^/?#]+)", urlparse(url).path)
             input_id = (
-                getattr(app, "extract_link_id", lambda value: None)(url)
-                or "url-" + hashlib.sha256(url.encode()).hexdigest()[:24]
+                match.group(1) if match
+                else "url-" + hashlib.sha256(url.encode()).hexdigest()[:24]
             )
             try:
                 previous = Client().request("/internal/record/xhs/" + input_id)
             except Exception:
+                if job["kind"] == "retry":
+                    # Never route a single retry into batch when its receipt is unavailable.
+                    raise
                 previous = {}
+            destination_kind = job["payload"].get("destination", "batch")
+            if job["kind"] == "retry":
+                destination_kind = previous.get("metadata", {}).get("destination", destination_kind)
+            current["destination"] = destination_kind
+            current["final"] = archive_root(settings_original, config, destination_kind)
             values = await app.extract(
                 url,
                 download=True,
-                check_record=job["kind"] != "retry",
+                check_record=job["kind"] != "retry" and destination_kind != "single",
                 task_id=job["id"],
                 result_callback=lambda value: count.update(value),
             )
@@ -163,6 +188,7 @@ async def run(job):
             failed = bool(count.get("fail") or not delivered)
             metadata = {
                 "url": url,
+                "destination": destination_kind,
                 "attempts": int(previous.get("metadata", {}).get("attempts", 0)) + 1,
                 "replaces_source_id": input_id if input_id != identifier else "",
                 "title": next(

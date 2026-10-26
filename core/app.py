@@ -402,6 +402,13 @@ async def save_platform_config(platform: str, payload: dict):
                 raise HTTPException(503, "Telegram 服务不可用，设置未保存")
         return public_config(platform)
     if platform == "xhs":
+        single_path = fields.get("single_work_path", "")
+        if not isinstance(single_path, str) or (
+            single_path.strip() and not Path(single_path.strip()).is_absolute()
+        ):
+            raise HTTPException(422, "单个作品保存目录必须是容器绝对路径")
+        if "single_work_path" in fields:
+            fields["single_work_path"] = single_path.strip()
         upstream_path = Path(
             os.getenv("XHS_SETTINGS_PATH", "/xhs-volume/settings.json")
         )
@@ -539,6 +546,13 @@ def add_task(payload: dict):
         ):
             raise HTTPException(422, "请提交所选平台的有效链接，最多 500 条")
         task_payload["urls"] = list(dict.fromkeys(urls))
+    if platform == "xhs" and kind == "links":
+        destination = task_payload.get("destination", "batch")
+        if destination not in {"batch", "single"}:
+            raise HTTPException(422, "保存类型无效")
+        if destination == "single" and len(task_payload["urls"]) != 1:
+            raise HTTPException(422, "单个作品发送只能包含一条链接")
+        task_payload["destination"] = destination
     identifier, created = store.enqueue(
         platform, payload.get("kind", "sync"), task_payload
     )
@@ -557,7 +571,10 @@ def browser_push_token():
 @app.post("/api/xhs/links")
 def browser_links(payload: dict):
     urls = payload.get("urls", [])
-    result = add_task({"platform": "xhs", "kind": "links", "payload": {"urls": urls}})
+    result = add_task({
+        "platform": "xhs", "kind": "links",
+        "payload": {"urls": urls, "destination": payload.get("destination", "batch")},
+    })
     return {
         "ok": True,
         "submitted": len(urls),
