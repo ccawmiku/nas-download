@@ -1,0 +1,37 @@
+const {chromium}=require('playwright');
+const fs=require('fs');const assert=require('node:assert/strict');
+const script=fs.readFileSync(require('path').join(__dirname,'../tools/userscripts/xhs-docker-queue.user.js'),'utf8');
+(async()=>{
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? {executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH} : {})});
+const page=await browser.newPage({viewport:{width:1280,height:1000}});
+await page.route('https://www.xiaohongshu.com/**',route=>route.fulfill({contentType:'text/html; charset=utf-8',body:'<html><body><div class="reds-tab-item">笔记</div><div class="reds-tab-item">收藏</div><div class="reds-tab-item">点赞</div></body></html>'}));
+const ids=['aaaaaaaaaaaaaaaaaaaaaaaa','bbbbbbbbbbbbbbbbbbbbbbbb','cccccccccccccccccccccccc'];
+await page.addInitScript(({script,ids})=>{
+window.GM_getValue=(key, fallback)=>JSON.parse(localStorage.getItem(key)||'null')??fallback;
+window.GM_setValue=(key,value)=>localStorage.setItem(key,JSON.stringify(value));
+window.GM_registerMenuCommand=()=>{};window.unsafeWindow=window;
+window.sent=[];window.GM_xmlhttpRequest=options=>{const payload=JSON.parse(options.data);sent.push(payload);options.onload({status:200,responseText:JSON.stringify({ok:true,valid:payload.urls.length,accepted:payload.urls.length,skipped:0})});};
+const notes=ids.map((id,i)=>({id,xsecToken:'signature-'+i,noteCard:{displayTitle:['今天的收藏','想留下的一刻','周末小记'][i],user:{nickName:'旅行日记'}}}));
+window.__INITIAL_STATE__={user:{notes:{_rawValue:[notes,notes,notes]}}};
+document.addEventListener('DOMContentLoaded',()=>{const el=document.createElement('script');el.textContent=script;document.body.append(el);});
+},{script,ids});
+await page.goto('https://www.xiaohongshu.com/user/profile/alice');
+const ui=page.locator('#nas-xhs-workbench');
+await ui.locator('.launch').click();
+await ui.locator('#scan').click();
+await ui.locator('.note').nth(1).getByRole('button',{name:'设为截止'}).click();
+assert.match(await ui.locator('#count').textContent(),/范围内 1/);
+await ui.locator('#send-batch').click();
+let sent=await page.evaluate(()=>sent);assert.equal(sent[0].destination,'batch');assert.equal(sent[0].urls.length,1);assert.ok(sent[0].urls[0].includes('signature-0'));
+await page.reload();await ui.locator('.launch').click();assert.ok((await ui.locator('#cutoff').textContent()).includes(ids[1]));
+await ui.locator('#scan').click();await ui.locator('.note').nth(2).getByRole('button',{name:'单独发送'}).click();
+sent=await page.evaluate(()=>sent);assert.equal(sent[0].destination,'single');assert.ok(sent[0].urls[0].includes(ids[2]));
+await ui.locator('[data-mode="saved"]').click();assert.match(await ui.locator('#cutoff').textContent(),/未设置/);
+await ui.locator('#scan').click();await ui.locator('#cutoff-input').fill('dddddddddddddddddddddddd');await ui.locator('#save-cutoff').click();
+await ui.locator('#send-batch').click();assert.match(await ui.locator('#status').textContent(),/未找到截止作品/);assert.equal(await page.evaluate(()=>sent.length),1);
+await ui.locator('[data-mode="liked"]').click();assert.ok((await ui.locator('#cutoff').textContent()).includes(ids[1]));
+await ui.locator('#scan').click();
+if(process.env.XHS_SCREENSHOT) await page.screenshot({path:process.env.XHS_SCREENSHOT});
+await page.goto('https://www.xiaohongshu.com/user/profile/bob');await ui.locator('.launch').click();assert.match(await ui.locator('#cutoff').textContent(),/未设置/);
+await browser.close();console.log('PASS: exclusive cutoff, signature preservation, reload persistence, account/category isolation, fail-closed cutoff, single routing');
+})().catch(e=>{console.error(e);process.exit(1)});

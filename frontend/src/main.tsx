@@ -1251,8 +1251,9 @@ function BrowserPush() {
   return (
     <Panel title="小红书浏览器推送">
       <p className="panel-description">
-        现有用户脚本继续使用
-        /api/xhs/links。启用控制台密码后，在脚本设置中填写推送授权。
+        油猴脚本使用 /api/xhs/links。点赞与收藏支持分别保存截止作品（不含截止作品），
+        单个作品发送到独立目录，可在小红书「归档与命名」中设置。
+        启用控制台密码后，在脚本设置中填写推送授权。
       </p>
       <div className="oauth-row">
         {token ? (

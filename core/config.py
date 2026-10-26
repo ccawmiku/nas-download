@@ -181,6 +181,7 @@ def initialize_configs():
         "xhs": {
             "database": "/state/xhs/xhs_queue.sqlite3",
             "queue_files": ["/queue/xhs/links.txt"],
+            "single_work_path": "",
             "request_delay_seconds": 1,
         },
         "instagram": {
