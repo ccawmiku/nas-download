@@ -218,7 +218,7 @@ def sanitize(message):
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     text = re.sub(r"(?i)(cookie\s*[:=]).*", r"\1 [已隐藏]", text)
     text = re.sub(
-        r"(?i)((?:token|api_hash|api_key|password|authorization)\s*[=:]\s*)[^\s,;]+",
+        r"(?i)((?:[\w]*token|ct0|auth_token|api_hash|api_key|password|authorization)\s*[=:]\s*)[^\s,;]+",
         r"\1[已隐藏]",
         text,
     )

@@ -212,10 +212,16 @@ class Store:
             )
             return cur.rowcount == 1
 
-    def page(self, table, page=1, limit=30, platform="", state="", query=""):
+    def page(self, table, page=1, limit=30, platform="", state="", query="", errors=False):
         if table not in {"tasks", "assets", "logs", "records"}:
             raise ValueError("invalid table")
         conditions, args = [], []
+        if errors:
+            conditions.extend([
+                "platform='x'", "state='failed'",
+                "COALESCE(json_extract(metadata,'$.retry_exhausted'),0)=1",
+                "COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
+            ])
         for key, value in (("platform", platform), ("state", state)):
             if value and not (key == "state" and table == "logs"):
                 conditions.append(f"{key}=?")

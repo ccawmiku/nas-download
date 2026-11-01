@@ -869,11 +869,14 @@ class BrowserCollector:
     async def _resolve_screen_name(self, page: Any, user_id: str) -> str:
         timeout = int(self.config["browser"].get("target_timeout_ms", 45000))
         for url in (f"https://x.com/i/user/{user_id}", "https://x.com/home"):
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            await page.wait_for_timeout(random.randint(2500, 4200))
-            screen_name = await self._screen_name_from_page(page)
-            if screen_name:
-                return screen_name
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await page.wait_for_selector('a[data-testid="AppTabBar_Profile_Link"]', timeout=timeout)
+                screen_name = await self._screen_name_from_page(page)
+                if screen_name:
+                    return screen_name
+            except Exception:
+                self.log.write("X 账号页面未就绪，尝试下一个入口")
         raise RuntimeError("could not resolve current X screen name from cookie; set browser.screen_name or browser.likes_url")
 
     async def _screen_name_from_page(self, page: Any) -> str:
@@ -889,9 +892,6 @@ class BrowserCollector:
               const profile = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
               const candidates = [];
               if (profile) candidates.push(profile.getAttribute("href") || "");
-              for (const a of document.querySelectorAll('a[href^="/"]')) {
-                candidates.push(a.getAttribute("href") || "");
-              }
               for (const href of candidates) {
                 const match = href.match(/^\\/([A-Za-z0-9_]{1,15})(?:\\?|#|\\/)?$/);
                 if (match && !reserved.has(match[1])) return match[1];
@@ -1179,7 +1179,16 @@ class Downloader:
                 return False
             tmp = path.with_suffix(path.suffix + ".part")
             try:
-                with tmp.open("wb") as file:
+                # The media worker can prune an empty staging directory between downloads.
+                for attempt in range(3):
+                    tmp.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        handle = tmp.open("wb")
+                        break
+                    except FileNotFoundError:
+                        if attempt == 2:
+                            raise
+                with handle as file:
                     for chunk in response.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             file.write(chunk)
@@ -1228,6 +1237,38 @@ class Downloader:
                     self.log.write(f"Image candidate failed: {media_id} {error}")
             if not done:
                 self.log.write(f"No image candidate worked for media id: {media_id}")
+        return files
+
+    def download_fallback(self, item: dict[str, Any]) -> list[str]:
+        """Use the tweet API when the browser does not expose a media card."""
+        dirs = self._media_dirs()
+        tmp_dir = dirs['tmp'] / (item['tweet_id'] + '-gallery')
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            'gallery-dl', '--config-ignore', '--no-input', '--no-colors',
+            '--cookies', str(cookie_file_for_tools(self.config)),
+            '--retries', '2', '--http-timeout', '45',
+            '-o', 'extractor.twitter.retries-api=2',
+            '-o', 'extractor.twitter.ratelimit=abort',
+            '-o', 'extractor.twitter.retweets=false',
+            '-o', 'extractor.twitter.quoted=false',
+            '-D', str(tmp_dir), item['url'],
+        ]
+        self.log.write(f"页面未解析到媒体，使用 gallery-dl：{item['url']}")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        if result.returncode:
+            # Do not echo tool diagnostics that may contain cookies or signed URLs.
+            raise RuntimeError(f'gallery-dl 未能下载推文（退出码 {result.returncode}）')
+        media = self._valid_media_files([str(p) for p in sorted(tmp_dir.rglob('*')) if p.is_file()])
+        files = []
+        for index, name in enumerate(media, 1):
+            source = Path(name)
+            directory = dirs['videos'] if source.suffix.lower() in VIDEO_EXTENSIONS else dirs['images']
+            directory.mkdir(parents=True, exist_ok=True)
+            target = self._unique_path(directory / f"{self._safe_stem(item, str(index))}{source.suffix}")
+            shutil.move(str(source), target)
+            files.append(str(target))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return files
 
     def download_video(self, item: dict[str, Any]) -> list[str]:
@@ -1389,6 +1430,8 @@ class Downloader:
             if image_count < len(item.get("media_ids") or []):
                 raise RuntimeError(f"incomplete image download: {image_count}/{len(item['media_ids'])}")
             files = self._valid_media_files(files)
+            if not files and not item.get('media_ids') and not item.get('has_video') and self.config.get('gallery_fallback'):
+                files = self._valid_media_files(self.download_fallback(item))
             file_hint = media_hint_from_files(files)
             if file_hint:
                 media_hint = file_hint

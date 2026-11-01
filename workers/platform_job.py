@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from core.config import CONFIG_PATHS, read_json, write_json
+from core.x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS, terminal as x_terminal
 from .client import Client, prepare, record, submit
 from .stopping import KnownRun, lookup, completed, legacy_completed, threshold, summary
 
@@ -128,6 +129,9 @@ def bind_catalog(platform, old_store, staging, final, config):
                 raw = old_store.get_tweet(identifier)
                 url = raw["url"] if raw else ""
             metadata = {"error": error, "url": url, "download_incomplete": True}
+            if platform == 'x':
+                attempts = int(raw['attempts']) + 1 if raw else 1
+                metadata.update(attempts=attempts, retry_exhausted=attempts >= X_MAX_ATTEMPTS)
             files = list(files)
             if platform == "pixiv" and staging:
                 folder = Path(staging) / "images" / str(identifier)
@@ -154,6 +158,8 @@ def bind_catalog(platform, old_store, staging, final, config):
     def should(identifier, *args, **kwargs):
         try:
             value = Client().request(f"/internal/record/{platform}/{identifier}")
+            if platform == 'x' and x_terminal(value['metadata']):
+                return False
             if value["state"] == "processing":
                 return False
             if value["state"] == "complete":
@@ -190,7 +196,8 @@ def failed_urls(platform, automatic=False):
         urls.extend(
             row["metadata"].get("url", "")
             for row in data["items"]
-            if not automatic or not row["metadata"].get("imported")
+            if (not automatic or not row["metadata"].get("imported"))
+            and (platform != 'x' or not x_terminal(row['metadata']))
         )
         if page * 100 >= data["total"]:
             break
@@ -225,7 +232,7 @@ async def x_collect(mod, config, old_store, checkpoint, log, process_batch):
         else ""
     )
     async with collector._browser_page(cookies) as page:
-        if not screen_name:
+        if not screen_name and not cfg.get('likes_url'):
             screen_name = await collector._resolve_screen_name(page, user_id or "")
         url = cfg.get("likes_url") or f"https://x.com/{screen_name}/likes"
 
@@ -300,6 +307,8 @@ async def x_collect(mod, config, old_store, checkpoint, log, process_batch):
 def x_job(job):
     mod = module("x")
     config = mod.load_config(CONFIG_PATHS["x"])
+    config['max_download_attempts'] = X_MAX_ATTEMPTS
+    config['gallery_fallback'] = True
     staging, final = staging_config("x", config, job["id"])
     log = Log()
     old_store = mod.Store(Path(config["database"]), log)
@@ -322,6 +331,7 @@ def x_job(job):
     bind_catalog("x", old_store, staging, final, config)
     downloader = mod.Downloader(config, old_store, log)
     stats = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+    attempted = set()
 
     def process(item, known=False, guard=None):
         stats["discovered"] += 1
@@ -329,6 +339,7 @@ def x_job(job):
         if known:
             status, files, error = "skipped", [], ""
         else:
+            attempted.add(item['url'])
             status, files, error = downloader.download_item(
                 item,
                 force=job["kind"] == "retry" and not job["payload"].get("automatic"),
@@ -340,14 +351,6 @@ def x_job(job):
             if status == "skipped"
             else "failed"
         ] += 1
-        if status not in {"done", "skipped"}:
-            record(
-                "x",
-                item["tweet_id"],
-                "failed",
-                files,
-                {"error": error, "url": item["url"]},
-            )
         if guard:
             stats.update(
                 phase="syncing",
@@ -358,6 +361,7 @@ def x_job(job):
         if not known:
             time.sleep(float(config.get("request_delay_seconds", 3)))
 
+    sync_error = None
     try:
         if job["kind"] == "sync":
             head, outcome = asyncio.run(
@@ -369,10 +373,27 @@ def x_job(job):
         else:
             collector = mod.BrowserCollector(config, log, old_store)
             for url in job["payload"].get("urls", []):
-                process(asyncio.run(collector.collect_single(url)))
+                item = mod.item_from_url(url)
+                old_store.upsert_seen(item)
+                manual = job['kind'] == 'retry' and not job['payload'].get('automatic')
+                if not manual and not old_store.should_download(item['tweet_id'], True, X_MAX_ATTEMPTS, False):
+                    continue
+                try:
+                    item = asyncio.run(collector.collect_single(url))
+                except Exception as error:
+                    # A single inaccessible page must not abort the remaining URLs.
+                    stats['discovered'] += 1
+                    stats['failed'] += 1
+                    old_store.mark_result(item['tweet_id'], 'failed', [], str(error))
+                    print(json.dumps(stats), flush=True)
+                    continue
+                process(item)
             stats["stop_reason"] = "manual"
+    except Exception as error:
+        sync_error = error
     finally:
         downloader.close()
+    previous_failures = [url for url in previous_failures if url not in attempted]
     if previous_failures:
         stats["retried"] = x_job(
             {
@@ -382,6 +403,8 @@ def x_job(job):
                 "payload": {"urls": previous_failures, "automatic": True},
             }
         )
+    if sync_error:
+        raise sync_error
     return stats
 
 

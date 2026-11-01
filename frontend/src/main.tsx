@@ -95,6 +95,7 @@ const nav = [
   ["downloads", "下载", Download],
   ["workspace", "工作区", Layers3],
   ["records", "媒体记录", Images],
+  ["errors", "错误列表", TriangleAlert],
   ["settings", "平台与设置", SlidersHorizontal],
   ["logs", "日志", ScrollText],
 ] as const;
@@ -1083,6 +1084,37 @@ function Collection({
       </Panel>
     </>
   );
+}
+function Errors({ act }: { act: Act }) {
+  const [page, setPage] = useState(1), [q, setQ] = useState("");
+  const { value: data, error } = useData(`/api/errors?page=${page}&q=${encodeURIComponent(q)}`);
+  useEffect(() => setPage(1), [q]);
+  useEffect(() => {
+    if (data && page > 1 && !data.items.length) setPage(page - 1);
+  }, [data, page]);
+  return <>
+    <div className="page-title"><div><h1>错误列表</h1>
+      <p>仅显示 X：首次下载失败后重试 3 轮仍失败的推文，已停止自动重试。手动下载后可逐条删除。</p>
+    </div></div>
+    <Panel title={`X 下载错误${data ? ` · ${data.total}` : ""}`}>
+      <div className="filters"><input aria-label="搜索错误链接" placeholder="搜索链接或失败原因" value={q} onChange={e => setQ(e.target.value)} /></div>
+      {error && <p className="inline-error">{error}</p>}
+      {data?.items.map((row: any) => {
+        const raw = row.metadata.url || "";
+        const url = /^https:\/\/(?:x|twitter)\.com\//i.test(raw) ? raw : `https://x.com/i/web/status/${encodeURIComponent(row.source_id)}`;
+        return <div className="data-row error-row" key={row.source_id}>
+          <div className="row-content"><Mark platform="x" /><div>
+            <a href={url} target="_blank" rel="noopener noreferrer">{url} <ArrowUpRight size={14} /></a>
+            <small>已尝试 {row.metadata.attempts} 次 · {stamp(row.updated)}</small>
+            <small>{row.metadata.error || "未能下载媒体"}</small>
+          </div></div>
+          <div className="row-actions"><button className="danger-text" onClick={() => act(`/api/errors/x/${encodeURIComponent(row.source_id)}`, {}, "DELETE")}>删除</button></div>
+        </div>;
+      })}
+      {data && !data.items.length && <Empty title="没有待处理的 X 错误" text="失败重试达到上限的推文会显示在这里。删除仅移除错误条目，保留已下载文件。" />}
+      {data && <Pager page={page} total={data.total} limit={30} onPage={setPage} />}
+    </Panel>
+  </>;
 }
 function Logs() {
   const [platform, setPlatform] = useState(""),
@@ -2285,6 +2317,8 @@ function App() {
             <Collection kind="assets" {...{ act, open }} />
           ) : active === "records" ? (
             <Collection kind="records" {...{ act, open }} />
+          ) : active === "errors" ? (
+            <Errors act={act} />
           ) : active === "settings" ? (
             <Settings key={route} initial={parameter} act={act} />
           ) : active === "logs" ? (

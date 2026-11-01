@@ -10,6 +10,7 @@ v4 重写了网页、调度、持久任务与媒体处理。平台下载能力�
 - 下载：链接、增量同步、任务进度、取消/重试；Telegram 下载控制与分页历史。
 - 工作区：新文件的转换、校验、入库结果、重试和删除；没有暂停操作。
 - 媒体记录：每份来源内容的下载结果、归档文件和预览，独立于采集边界。
+- 错误列表：目前仅收录 X 首次下载失败后重试 3 轮仍失败的推文。显示原链接、尝试次数和错误原因，停止自动重试；手动下载后可逐条删除，删除只隐藏该错误并保留已下载文件，也不会重新加入自动队列。
 - 平台与设置：六个平台配置、工作区开关、分钟上限、同步周期、可选密码登录。
 - 日志：默认最近 30 行，全部日志可分页/导出。
 
@@ -25,7 +26,9 @@ Instagram 收藏下载的配置、目录和停止规则见 [Instagram 使用说�
 
 新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
 
-发布标签 `v4.0.5` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.5`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+发布标签 `v4.0.6` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.6`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+
+v4.0.6 修复 X 已配置收藏页地址时仍强制解析用户名、工作区空目录被清理后图片写入失败的问题。页面无媒体卡片时使用 gallery-dl 补救，单条页面异常不会中断后续链接；同一次同步对同一推文最多尝试一次。已有失败记录沿用原尝试次数，超过重试上限的记录直接进入错误列表。下载器固定为 yt-dlp `2026.10.26` 与 gallery-dl `1.32.19`，镜像构建会核对实际安装版本。
 
 - [需求约定](docs/REBUILD_CONTRACT.md)
 - [架构与数据流程](docs/V4_ARCHITECTURE.md)

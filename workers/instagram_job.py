@@ -1,4 +1,4 @@
-"""Saved-only adapter for gallery-dl 1.32.16; keep private upstream APIs here.
+"""Saved-only adapter for gallery-dl 1.32.19; keep private upstream APIs here.
 
 The core catalog owns completion. A local manifest owns partially downloaded
 files, so interrupted carousels can resume without trusting arbitrary filenames.
@@ -55,8 +55,8 @@ class GallerySource:
     def __init__(self, settings):
         from gallery_dl import config, extractor, version
 
-        if version.__version__ != "1.32.16":
-            raise SourceError("Instagram 适配器需要 gallery-dl 1.32.16")
+        if version.__version__ != "1.32.19":
+            raise SourceError("Instagram 适配器需要 gallery-dl 1.32.19")
         self.account = validate_cookies(Path(settings["cookie_file"]).read_text(encoding="utf-8-sig"))
         config.clear()
         for key, value in {

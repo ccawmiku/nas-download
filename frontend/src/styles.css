@@ -764,6 +764,13 @@ main {
   text-align: left;
   gap: 13px;
 }
+.error-row .row-content {
+  display: flex;
+  align-items: center;
+}
+.error-row a {
+  overflow-wrap: anywhere;
+}
 .row-content:hover:not(:disabled) {
   background: transparent;
 }

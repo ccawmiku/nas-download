@@ -204,6 +204,26 @@ def test_stopping_threshold_validation_and_batch_record_lookup(
     )
 
 
+def test_x_error_api_paginates_and_deletes_only_selected_error(client, tmp_path):
+    keep = tmp_path / 'manual.jpg'
+    keep.write_bytes(b'manual-download')
+    for index in range(32):
+        server.record({'platform': 'x', 'source_id': str(index), 'state': 'failed', 'files': [str(keep)],
+                       'metadata': {'url': f'https://x.com/user/status/{index}', 'attempts': 4, 'retry_exhausted': True, 'error': 'ct0=private-csrf'}})
+    server.record({'platform': 'pixiv', 'source_id': 'x', 'state': 'failed', 'metadata': {'retry_exhausted': True}})
+    data = client.get('/api/errors').json()
+    assert data['total'] == 32 and len(data['items']) == 30
+    assert len(client.get('/api/errors?page=2').json()['items']) == 2
+    assert 'private-csrf' not in json.dumps(data)
+    identifier = data['items'][0]['source_id']
+    assert client.delete('/api/errors/x/' + identifier).status_code == 200
+    assert client.delete('/api/errors/x/' + identifier).status_code == 404
+    assert client.get('/api/errors').json()['total'] == 31
+    assert keep.read_bytes() == b'manual-download'
+    assert server.get_record('x', identifier)['metadata']['error_dismissed']
+    assert client.delete('/api/errors/pixiv/x').status_code in {404, 405}
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "store", Store(tmp_path / "state.sqlite3"))
@@ -766,7 +786,7 @@ def test_upstream_date_versions_ignore_zero_padding(monkeypatch):
         },
     )
     assert (
-        updates.check_one("yt-dlp", updates.SOURCES["yt-dlp"], {})["status"]
+        updates.check_one("yt-dlp", {**updates.SOURCES["yt-dlp"], "version": "2026.8.19"}, {})["status"]
         == "current"
     )
 

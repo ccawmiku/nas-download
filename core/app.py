@@ -34,7 +34,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.5")
+VERSION = os.getenv("APP_VERSION", "4.0.6")
 
 
 def settings():
@@ -125,6 +125,9 @@ async def lifespan(app):
         from .migrate import import_legacy
 
         await asyncio.to_thread(import_legacy, store)
+    from .x_errors import migrate_attempts
+
+    await asyncio.to_thread(migrate_attempts, store, read_json(CONFIG_PATHS['x']))
     task = (
         asyncio.create_task(scheduler())
         if os.getenv("NAS_SCHEDULER", "true") == "true"
@@ -453,9 +456,29 @@ def list_rows(
 ):
     if table == "workspace":
         return workspace_status()
+    if table == "errors":
+        data = store.page("records", page, limit, query=q, errors=True)
+        for row in data['items']:
+            row['metadata']['error'] = sanitize(row['metadata'].get('error', ''))
+        return data
     if table not in {"tasks", "assets", "records", "logs"}:
         raise HTTPException(404)
     return store.page(table, page, limit, platform, state, q)
+
+
+@app.delete("/api/errors/x/{identifier}")
+def dismiss_x_error(identifier: str):
+    with store.connect() as db:
+        updated = db.execute(
+            "UPDATE records SET metadata=json_set(metadata,'$.error_dismissed',json('true')) "
+            "WHERE platform='x' AND source_id=? AND state='failed' "
+            "AND json_extract(metadata,'$.retry_exhausted')=1 "
+            "AND COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
+            (identifier,),
+        ).rowcount
+    if not updated:
+        raise HTTPException(404, "错误记录不存在或已删除")
+    return {"ok": True}
 
 
 @app.get("/api/logs/export/all")
@@ -802,6 +825,12 @@ async def checkpoint(platform: str, source: str, request: Request):
 def record(payload: dict):
     with store.connect() as db:
         metadata = payload.get("metadata", {})
+        if payload['platform'] == 'x':
+            old = db.execute("SELECT metadata FROM records WHERE platform='x' AND source_id=?", (str(payload['source_id']),)).fetchone()
+            previous_metadata = json.loads(old[0]) if old else {}
+            if previous_metadata.get('error_dismissed'):
+                metadata['error_dismissed'] = True
+            payload['metadata'] = metadata
         previous = metadata.get("replaces_source_id")
         if previous and str(previous).startswith("url-"):
             db.execute(

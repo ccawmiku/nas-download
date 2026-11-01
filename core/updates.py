@@ -25,13 +25,13 @@ SOURCES = {
     },
     "yt-dlp": {
         "repo": "yt-dlp/yt-dlp",
-        "installed": "2026.8.19",
-        "version": "2026.8.19",
+        "installed": "2026.10.26",
+        "version": "2026.10.26",
     },
     "gallery-dl": {
         "repo": "mikf/gallery-dl",
-        "installed": "1.32.16",
-        "version": "1.32.16",
+        "installed": "1.32.19",
+        "version": "1.32.19",
     },
 }
 LOCK = Lock()
