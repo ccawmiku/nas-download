@@ -77,15 +77,22 @@ def test_last_success_uses_sync_not_test_or_partial_failure(client):
 def test_instagram_retirement_stops_old_tasks_without_removing_media(client, tmp_path):
     media = tmp_path / 'saved-instagram.jpg'
     media.write_bytes(b'preserve')
+    asset = client.post('/internal/intake', headers={'X-NAS-Download-Token':'test-key'}, json={
+        'platform':'pixiv', 'source':str(media), 'target':str(tmp_path/'archive'/'saved.jpg'),
+    }).json()['id']
     with server.store.connect() as db:
         db.execute("INSERT INTO tasks(id,platform,kind,payload,state,created,updated) VALUES('retired','instagram','sync','{}','queued',1,1)")
         db.execute("INSERT INTO records VALUES('instagram','archived','complete',?,'{}',1)", (json.dumps([str(media)]),))
+        db.execute("UPDATE assets SET platform='instagram' WHERE id=?", (asset,))
     assert server.store.claim('tasks', 'old-engine', ['instagram']) is None
+    assert server.store.claim('assets', 'media') is None
     assert client.post('/api/tasks/retired/retry', json={}).status_code == 409
     server.retire_instagram()
     with server.store.connect() as db:
         assert db.execute("SELECT state FROM tasks WHERE id='retired'").fetchone()[0] == 'cancelled'
         assert db.execute("SELECT COUNT(*) FROM records WHERE platform='instagram'").fetchone()[0] == 1
+        assert db.execute('SELECT state FROM assets WHERE id=?', (asset,)).fetchone()[0] == 'interrupted'
+    assert client.post('/api/assets/'+asset+'/retry',json={}).status_code == 409
     assert client.get('/api/records').json()['total'] == 0
     assert media.read_bytes() == b'preserve'
 
