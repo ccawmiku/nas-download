@@ -34,15 +34,23 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.6")
+VERSION = os.getenv("APP_VERSION", "4.0.7")
 
 
 def settings():
     saved = store.get("preferences", {})
     value = {**DEFAULTS, **saved}
     for key in ("workspace", "max_minutes", "schedule"):
-        value[key] = {**DEFAULTS[key], **saved.get(key, {})}
+        value[key] = {name: saved.get(key, {}).get(name, default) for name, default in DEFAULTS[key].items()}
     return value
+
+
+def retire_instagram():
+    # Retire access to the account; keep historical records and downloaded files.
+    store.set("preferences", settings())
+    with store.connect() as db:
+        db.execute("UPDATE tasks SET state='cancelled',error='Instagram integration removed by user',updated=? "
+                   "WHERE platform='instagram' AND state IN ('queued','running','interrupted')", (time.time(),))
 
 
 def session_secret():
@@ -87,6 +95,18 @@ async def scheduler():
         await asyncio.sleep(10)
 
 
+async def notification_monitor():
+    from .notifications import tick
+
+    while True:
+        try:
+            await asyncio.to_thread(tick, store, DATA / "bark.json", settings())
+        except Exception:
+            # Transport exceptions may contain the private Bark address.
+            store.log("system", "异常通知检查未完成，将在下次检查重试", "warning")
+        await asyncio.sleep(300)
+
+
 def schedule_xhs_retries(now):
     config = read_json(CONFIG_PATHS["xhs"])
     if not config.get("retry_failed", True):
@@ -117,6 +137,7 @@ def schedule_xhs_retries(now):
 
 @asynccontextmanager
 async def lifespan(app):
+    retire_instagram()
     if os.getenv("NAS_INITIALIZE_CONFIGS", "true") == "true":
         from .config import initialize_configs
 
@@ -133,7 +154,15 @@ async def lifespan(app):
         if os.getenv("NAS_SCHEDULER", "true") == "true"
         else None
     )
+    notifications = (
+        asyncio.create_task(notification_monitor())
+        if task and os.getenv("NAS_PREVIEW", "false").lower() not in {"true", "1", "yes"}
+        else None
+    )
     yield
+    if notifications:
+        notifications.cancel()
+        await asyncio.gather(notifications, return_exceptions=True)
     if task:
         task.cancel()
         try:
@@ -142,7 +171,7 @@ async def lifespan(app):
             pass
 
 
-app = FastAPI(title="NAS Download", lifespan=lifespan)
+app = FastAPI(title="NAS自动下载", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -313,6 +342,24 @@ def save_settings(payload: dict):
     return get_settings()
 
 
+@app.get("/api/notifications")
+def notification_settings():
+    from .notifications import public_settings
+
+    return public_settings(store, DATA / "bark.json")
+
+
+@app.patch("/api/notifications")
+def save_notification_settings(payload: dict):
+    from .notifications import save_settings as save_notifications
+
+    try:
+        save_notifications(DATA / "bark.json", payload)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+    return notification_settings()
+
+
 @app.get("/api/overview")
 def overview():
     with store.connect() as db:
@@ -320,7 +367,8 @@ def overview():
         counts = {
             table: dict(
                 db.execute(
-                    f"SELECT state,count(*) FROM {table} GROUP BY state"
+                    f"SELECT state,count(*) FROM {table} WHERE platform IN (" + ",".join("?" for _ in PLATFORMS) + ") GROUP BY state",
+                    list(PLATFORMS),
                 ).fetchall()
             )
             for table in ("tasks", "assets")
@@ -336,6 +384,12 @@ def overview():
             else None
             for key in PLATFORMS
         }
+        last_sync = dict(db.execute(
+            "SELECT platform,MAX(updated) FROM tasks WHERE state='complete' AND kind='sync' GROUP BY platform"
+        ).fetchall())
+        last_download = dict(db.execute(
+            "SELECT platform,MAX(updated) FROM records WHERE state='complete' GROUP BY platform"
+        ).fetchall())
     return {
         "version": VERSION,
         "counts": counts,
@@ -347,6 +401,10 @@ def overview():
                 "configured": public_config(key)["configured"],
                 "workspace": settings()["workspace"][key],
                 "latest": latest[key],
+                "last_success": (
+                    max(last_download.get(key, 0), store.get("telegram_last_success", 0))
+                    if key == "telegram" else last_download.get(key) if key == "xhs" else last_sync.get(key)
+                ),
                 "next_run": store.get("due:" + key),
                 "max_minutes": settings()["max_minutes"].get(key),
             }
@@ -381,15 +439,6 @@ async def save_platform_config(platform: str, payload: dict):
             type(fields[key]) is not int or not 1 <= fields[key] <= 1000
         ):
             raise HTTPException(422, "连续已下载停止数须为 1–1000 的整数")
-    if platform == "instagram":
-        from .instagram import validate_settings, validate_cookies
-
-        try:
-            validate_settings({**config, **fields})
-            if payload.get("credential"):
-                validate_cookies(str(payload["credential"]))
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from None
     if platform == "telegram":
         async with httpx.AsyncClient(timeout=90) as client:
             try:
@@ -435,7 +484,7 @@ async def save_platform_config(platform: str, payload: dict):
             value = read_json(upstream)
             value["cookie"] = str(credential)
             write_json(upstream, value)
-        elif platform in {"x", "douyin", "pixiv", "instagram"}:
+        elif platform in {"x", "douyin", "pixiv"}:
             key = "refresh_token_file" if platform == "pixiv" else "cookie_file"
             target = Path(config.get(key) or f"/config/{platform}/{key}.txt")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -457,7 +506,9 @@ def list_rows(
     if table == "workspace":
         return workspace_status()
     if table == "errors":
-        data = store.page("records", page, limit, query=q, errors=True)
+        if platform and platform not in PLATFORMS:
+            raise HTTPException(422, "未知平台")
+        data = store.page("records", page, limit, platform=platform, query=q, errors=True)
         for row in data['items']:
             row['metadata']['error'] = sanitize(row['metadata'].get('error', ''))
         return data
@@ -468,13 +519,20 @@ def list_rows(
 
 @app.delete("/api/errors/x/{identifier}")
 def dismiss_x_error(identifier: str):
+    return dismiss_error("x", identifier)
+
+
+@app.delete("/api/errors/{platform}/{identifier}")
+def dismiss_error(platform: str, identifier: str):
+    if platform not in PLATFORMS:
+        raise HTTPException(404)
     with store.connect() as db:
         updated = db.execute(
             "UPDATE records SET metadata=json_set(metadata,'$.error_dismissed',json('true')) "
-            "WHERE platform='x' AND source_id=? AND state='failed' "
-            "AND json_extract(metadata,'$.retry_exhausted')=1 "
+            "WHERE platform=? AND source_id=? AND state IN ('failed','interrupted') "
+            "AND (platform!='x' OR json_extract(metadata,'$.retry_exhausted')=1) "
             "AND COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
-            (identifier,),
+            (platform, identifier),
         ).rowcount
     if not updated:
         raise HTTPException(404, "错误记录不存在或已删除")
@@ -535,14 +593,12 @@ def add_task(payload: dict):
     platform = payload.get("platform")
     kind = payload.get("kind", "sync")
     if (
-        platform not in {"x", "pixiv", "douyin", "xhs", "instagram"}
+        platform not in {"x", "pixiv", "douyin", "xhs"}
         or kind not in {"sync", "links", "retry", "test", "oauth-start", "oauth-finish"}
         or kind.startswith("oauth-")
         and platform != "pixiv"
         or kind == "test"
         and platform == "xhs"
-        or platform == "instagram"
-        and kind not in {"sync", "retry", "test"}
     ):
         raise HTTPException(422, "任务无效")
     task_payload = payload.get("payload", {})
@@ -617,6 +673,8 @@ def task_action(identifier: str, action: str):
         row = db.execute("SELECT * FROM tasks WHERE id=?", (identifier,)).fetchone()
         if not row:
             raise HTTPException(404)
+        if action == "retry" and row["platform"] not in PLATFORMS:
+            raise HTTPException(409, "该平台已移除，无法重试")
         if action == "retry" and row["state"] in {
             "failed",
             "interrupted",
@@ -679,6 +737,17 @@ def worker_heartbeat(payload: dict):
             ),
         )
     return {"settings": settings()}
+
+
+@app.post("/internal/telegram/history")
+def telegram_history(payload: dict):
+    from .telegram import apply_history
+
+    try:
+        apply_history(store, payload.get("items"))
+    except ValueError:
+        raise HTTPException(422, "Telegram 历史格式无效") from None
+    return {"ok": True}
 
 
 @app.post("/internal/bypass/claim")
@@ -825,10 +894,12 @@ async def checkpoint(platform: str, source: str, request: Request):
 def record(payload: dict):
     with store.connect() as db:
         metadata = payload.get("metadata", {})
-        if payload['platform'] == 'x':
-            old = db.execute("SELECT metadata FROM records WHERE platform='x' AND source_id=?", (str(payload['source_id']),)).fetchone()
-            previous_metadata = json.loads(old[0]) if old else {}
-            if previous_metadata.get('error_dismissed'):
+        old = db.execute("SELECT state,metadata FROM records WHERE platform=? AND source_id=?", (payload['platform'], str(payload['source_id']))).fetchone()
+        if old:
+            previous_metadata = json.loads(old['metadata'])
+            if previous_metadata.get('error_dismissed') and (
+                payload['platform'] == 'x' or old['state'] in {'failed', 'interrupted'} and payload['state'] in {'failed', 'interrupted'}
+            ):
                 metadata['error_dismissed'] = True
             payload['metadata'] = metadata
         previous = metadata.get("replaces_source_id")
@@ -1052,6 +1123,16 @@ async def telegram_proxy(path: str, request: Request):
 
 if STATIC.is_dir():
     app.mount("/assets", StaticFiles(directory=STATIC / "assets"), name="assets")
+
+
+@app.get("/logo.svg")
+@app.get("/favicon.png")
+@app.get("/apple-touch-icon.png")
+def branding_asset(request: Request):
+    path = STATIC / request.url.path.lstrip("/")
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path)
 
 
 @app.get("/{path:path}")

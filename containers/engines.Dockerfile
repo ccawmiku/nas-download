@@ -9,7 +9,7 @@ COPY workers/ ./workers/
 COPY _src/x-auto-download-nas-main/ ./x/
 COPY _src/pixiv-auto-download-nas-main/ ./pixiv/
 COPY _src/douyin-f2-auto-main/ ./douyin/
-ENV NAS_CORE_URL=http://console:14001 NAS_EXECUTION_DATA=/state/execution WORKER_PLATFORMS=x,pixiv,douyin,instagram
+ENV NAS_CORE_URL=http://console:14001 NAS_EXECUTION_DATA=/state/execution WORKER_PLATFORMS=x,pixiv,douyin
 HEALTHCHECK NONE
 ENTRYPOINT []
 CMD ["python","-m","workers.engine"]

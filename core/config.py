@@ -11,7 +11,6 @@ THRESHOLDS = {
     "x": ("known_stop_consecutive", 10),
     "pixiv": ("stop_after_consecutive_done", 20),
     "douyin": ("fallback_stop_consecutive_skipped", 50),
-    "instagram": ("known_stop_consecutive", 20),
 }
 
 CONFIG_PATHS = {
@@ -25,10 +24,10 @@ CONFIG_PATHS["telegram"] = Path(
 
 DEFAULTS = {
     "workspace": {key: key in {"telegram", "xhs"} for key in PLATFORMS},
-    "max_minutes": {"x": 15, "pixiv": 15, "douyin": 15, "instagram": 15},
+    "max_minutes": {"x": 15, "pixiv": 15, "douyin": 15},
     "schedule": {
-        key: {"enabled": False, "hours": 72 if key == "instagram" else 12}
-        for key in ("x", "pixiv", "douyin", "xhs", "instagram")
+        key: {"enabled": False, "hours": 12}
+        for key in ("x", "pixiv", "douyin", "xhs")
     },
     "workspace_root": os.getenv("NAS_WORKSPACE_ROOT", "/media/.nas-workspace"),
     "auth_enabled": False,
@@ -184,21 +183,6 @@ def initialize_configs():
             "single_work_path": "",
             "request_delay_seconds": 1,
         },
-        "instagram": {
-            "cookie_file": "/config/instagram/cookies.txt",
-            "state_dir": "/state/instagram",
-            "image_dir": "/downloads/instagram/images",
-            "video_dir": "/downloads/instagram/videos",
-            "known_stop_consecutive": 20,
-            "browser": "chrome",
-            "sleep_request_min": 30,
-            "sleep_request_max": 60,
-            "sleep_download_min": 5,
-            "sleep_download_max": 10,
-            "retry_failed": True,
-            "max_download_attempts": 3,
-            "proxy": "",
-        },
     }
     for key, value in seeds.items():
         if not CONFIG_PATHS[key].exists():
@@ -215,6 +199,7 @@ def sanitize(message):
     import re
 
     text = str(message)
+    text = re.sub(r"https?://api\.day\.app/[^\s\"'<>]+", "https://api.day.app/[已隐藏]", text, flags=re.I)
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     text = re.sub(r"(?i)(cookie\s*[:=]).*", r"\1 [已隐藏]", text)
     text = re.sub(

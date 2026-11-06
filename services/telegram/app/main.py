@@ -302,9 +302,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             await asyncio.sleep(10)
             await asyncio.to_thread(replay_receipts)
             try:
-                from workers.telegram_delivery import recover_handoffs
+                from workers.telegram_delivery import recover_handoffs, sync_history
                 await asyncio.to_thread(Client().request, '/internal/heartbeat', {'owner':'telegram-service','platforms':['telegram'],'details':{'running':bot_manager.running and bot_manager.connection_status == 'online','connection_status':bot_manager.connection_status}})
                 await asyncio.to_thread(recover_handoffs, history)
+                await asyncio.to_thread(sync_history, history)
             except Exception:
                 pass
             try:

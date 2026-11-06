@@ -211,17 +211,17 @@ def test_x_error_api_paginates_and_deletes_only_selected_error(client, tmp_path)
         server.record({'platform': 'x', 'source_id': str(index), 'state': 'failed', 'files': [str(keep)],
                        'metadata': {'url': f'https://x.com/user/status/{index}', 'attempts': 4, 'retry_exhausted': True, 'error': 'ct0=private-csrf'}})
     server.record({'platform': 'pixiv', 'source_id': 'x', 'state': 'failed', 'metadata': {'retry_exhausted': True}})
-    data = client.get('/api/errors').json()
+    data = client.get('/api/errors?platform=x').json()
     assert data['total'] == 32 and len(data['items']) == 30
-    assert len(client.get('/api/errors?page=2').json()['items']) == 2
+    assert len(client.get('/api/errors?platform=x&page=2').json()['items']) == 2
     assert 'private-csrf' not in json.dumps(data)
     identifier = data['items'][0]['source_id']
     assert client.delete('/api/errors/x/' + identifier).status_code == 200
     assert client.delete('/api/errors/x/' + identifier).status_code == 404
-    assert client.get('/api/errors').json()['total'] == 31
+    assert client.get('/api/errors?platform=x').json()['total'] == 31
     assert keep.read_bytes() == b'manual-download'
     assert server.get_record('x', identifier)['metadata']['error_dismissed']
-    assert client.delete('/api/errors/pixiv/x').status_code in {404, 405}
+    assert client.delete('/api/errors/pixiv/x').status_code == 200
 
 
 @pytest.fixture
@@ -238,49 +238,40 @@ def client(tmp_path, monkeypatch):
         yield http
 
 
-def test_instagram_default_schedule_upgrade_and_task_scope(client):
-    server.store.set("preferences", {"schedule": {"x": {"enabled": True, "hours": 6}}})
+def test_instagram_is_removed_from_settings_and_task_scope(client):
+    server.store.set("preferences", {"schedule": {"x": {"enabled": True, "hours": 6}, "instagram": {"enabled": True, "hours": 72}}, "workspace": {"instagram": True}, "max_minutes": {"instagram": 120}})
     prefs = client.get("/api/settings").json()
-    assert prefs["schedule"]["instagram"] == {"enabled": False, "hours": 72}
+    assert all('instagram' not in prefs[key] for key in ['schedule', 'workspace', 'max_minutes'])
     assert prefs["schedule"]["x"] == {"enabled": True, "hours": 6}
-    prefs["schedule"]["instagram"]["enabled"] = True
     assert client.patch("/api/settings", json={"schedule": prefs["schedule"]}).status_code == 200
-    for kind in ("sync", "test", "retry"):
-        assert client.post("/api/tasks", json={"platform": "instagram", "kind": kind}).status_code == 200
-    for kind in ("links", "oauth-start"):
+    for kind in ("sync", "test", "retry", "links", "oauth-start"):
         assert client.post("/api/tasks", json={"platform": "instagram", "kind": kind}).status_code == 422
 
 
-def test_instagram_cookie_validation_is_atomic_and_private(client, tmp_path, monkeypatch):
-    from core.config import CONFIG_PATHS, read_json, sanitize
+def test_removed_instagram_cannot_save_credentials(client, tmp_path, monkeypatch):
+    from core.config import CONFIG_PATHS, read_json
     path, cookies = tmp_path / "instagram.json", tmp_path / "cookies.txt"
     monkeypatch.setitem(CONFIG_PATHS, "instagram", path)
     write_json(path, {"cookie_file": str(cookies)})
     url = "/api/platforms/instagram/settings"
     bad = client.patch(url, json={"fields": {"known_stop_consecutive": 5}, "credential": "sessionid=must-stay-secret"})
-    assert bad.status_code == 422 and "must-stay-secret" not in bad.text
+    assert bad.status_code == 404 and "must-stay-secret" not in bad.text
     assert not cookies.exists() and "known_stop_consecutive" not in read_json(path)
-    credential = ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tprivate-session-secret\n.instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t42\n"
-    response = client.patch(url, json={"fields": {"known_stop_consecutive": 5}, "credential": credential})
-    assert response.status_code == 200 and response.json()["credential_set"]
-    assert "private-session-secret" not in response.text
-    assert "private-session-secret" not in sanitize("error private-session-secret")
-    assert cookies.read_text() == credential
-    assert client.patch(url, json={"fields": {"sleep_request_min": 0}}).status_code == 422
+    assert client.get(url).status_code == 404
 
 
-def test_instagram_partial_download_cannot_be_completed_by_one_asset(client, tmp_path):
+def test_partial_download_cannot_be_completed_by_one_asset(client, tmp_path):
     source = Path(server.settings()["workspace_root"]) / "5_51.jpg"
     source.write_bytes(b"owned-test-source")
     target = tmp_path / "archive" / source.name
     headers = {"X-NAS-Download-Token": "private-test-key"}
-    payload = {"platform": "instagram", "source_id": "5", "state": "failed", "files": [str(source)], "metadata": {"download_incomplete": True, "media_ids": ["51", "52"]}}
+    payload = {"platform": "pixiv", "source_id": "5", "state": "failed", "files": [str(source)], "metadata": {"download_incomplete": True, "media_ids": ["51", "52"]}}
     client.post("/internal/records", headers=headers, json=payload)
-    identifier = client.post("/internal/intake", headers=headers, json={"platform": "instagram", "source": str(source), "target": str(target), "details": {"source_id": "5"}}).json()["id"]
+    identifier = client.post("/internal/intake", headers=headers, json={"platform": "pixiv", "source": str(source), "target": str(target), "details": {"source_id": "5"}}).json()["id"]
     with server.store.connect() as db:
         db.execute("UPDATE assets SET state='complete' WHERE id=?", (identifier,))
     server.reconcile_asset(identifier)
-    value = client.get("/internal/record/instagram/5", headers=headers).json()
+    value = client.get("/internal/record/pixiv/5", headers=headers).json()
     assert value["state"] == "failed" and value["metadata"]["download_incomplete"]
 
 
