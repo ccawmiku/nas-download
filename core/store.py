@@ -125,7 +125,8 @@ class Store:
                 else "UPDATE tasks SET state='interrupted',error='执行连接中断',updated=? WHERE state='running' AND lease<?",
                 (now, now),
             )
-            where, args = "state='queued'", []
+            where = "state='queued' AND platform IN (" + ",".join("?" for _ in PLATFORMS) + ")"
+            args = list(PLATFORMS)
             if platforms:
                 where += " AND platform IN (" + ",".join("?" for _ in platforms) + ")"
                 args.extend(platforms)

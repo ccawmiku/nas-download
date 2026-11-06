@@ -34,7 +34,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.7")
+VERSION = os.getenv("APP_VERSION", "4.0.8")
 
 
 def settings():
@@ -51,6 +51,8 @@ def retire_instagram():
     with store.connect() as db:
         db.execute("UPDATE tasks SET state='cancelled',error='Instagram integration removed by user',updated=? "
                    "WHERE platform='instagram' AND state IN ('queued','running','interrupted')", (time.time(),))
+        db.execute("UPDATE assets SET state='interrupted',reason='Instagram integration removed by user',updated=? "
+                   "WHERE platform='instagram' AND state='queued'", (time.time(),))
 
 
 def session_secret():
@@ -1047,6 +1049,8 @@ def asset_action(identifier: str, action: str):
         source = allowed_path(row["source"])
         if source.with_name(".archive-" + identifier + ".json").is_file():
             raise HTTPException(409, "文件正在恢复入库记录，请先恢复处理服务")
+        if action == "retry" and row["platform"] not in PLATFORMS:
+            raise HTTPException(409, "该平台已移除，无法重试")
         if action == "retry" and row["state"] in {"failed", "interrupted"}:
             if row["lease"] and row["lease"] > time.time():
                 raise HTTPException(409, "执行仍在结束中")
