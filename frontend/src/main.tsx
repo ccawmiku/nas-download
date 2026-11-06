@@ -27,6 +27,7 @@ import {
   LogOut,
 } from "lucide-react";
 import { definitions, hidden, type Spec } from "./fields";
+import { taskOutcome } from "./taskOutcome";
 import "./styles.css";
 
 const names: Record<string, string> = {
@@ -52,6 +53,9 @@ const stateNames: Record<string, string> = {
   publishing: "正在入库",
   complete: "已完成",
   failed: "失败",
+  partial_failed: "部分失败",
+  all_failed: "全部失败",
+  execution_failed: "执行失败",
   interrupted: "已中断",
   limited: "达到时长上限",
   cancelled: "已取消",
@@ -377,7 +381,7 @@ function Home({
                 </div>
                 <div className="tile-bottom">
                   {p.latest ? (
-                    <Badge state={p.latest.state} />
+                    <Badge state={taskOutcome(p.latest).state} />
                   ) : (
                     <span className="muted">等待新内容</span>
                   )}
@@ -396,6 +400,11 @@ function Home({
                         : "立即同步"}
                   </button>
                 </div>
+                {p.latest && taskOutcome(p.latest).summary && (
+                  <small className="task-summary">
+                    {taskOutcome(p.latest).summary}
+                  </small>
+                )}
                 {p.next_run && (
                   <small className="next-run">
                     下次同步 {stamp(p.next_run)}
@@ -428,8 +437,11 @@ function Home({
                     {names[r.platform]} · {kinds[r.kind]}
                   </strong>
                   <small>{r.error || stamp(r.created)}</small>
+                  {taskOutcome(r).summary && (
+                    <small>{taskOutcome(r).summary}</small>
+                  )}
                 </span>
-                <Badge state={r.state} />
+                <Badge state={taskOutcome(r).state} />
               </button>
             ))
           ) : (
@@ -688,18 +700,17 @@ function Downloads({
                           stopText(r.result) ||
                           stamp(r.created)}
                       </small>
-                      {r.progress?.downloaded !== undefined && (
+                      {taskOutcome(r).summary && (
                         <small>
-                          已下载 {r.progress.downloaded} · 失败{" "}
-                          {r.progress.failed || 0}
-                          {r.progress.known_threshold
+                          {taskOutcome(r).summary}
+                          {r.progress?.known_threshold
                             ? ` · 连续已下载 ${r.progress.known_consecutive || 0}/${r.progress.known_threshold}`
                             : ""}
                         </small>
                       )}
                     </div>
                   </button>
-                  <Badge state={r.state} />
+                  <Badge state={taskOutcome(r).state} />
                   <div className="row-actions">
                     {["queued", "running"].includes(r.state) && (
                       <button
@@ -1933,7 +1944,7 @@ function Drawer({
             </>
           ) : (
             <>
-              <Badge state={row.state || row.status} />
+              <Badge state={kind === "task" ? taskOutcome(row).state : row.state || row.status} />
               {mediaUrl && (
                 <div className="media-preview">
                   {video ? (
@@ -2189,7 +2200,7 @@ function App() {
         <span className="brand-symbol">
           <Layers3 size={23} />
         </span>
-        <h1>NAS Download</h1>
+        <h1>NAS自动下载</h1>
         <p>{notice?.text || "正在连接控制台…"}</p>
       </div>
     );
@@ -2212,7 +2223,7 @@ function App() {
           <span className="brand-symbol">
             <Layers3 size={23} />
           </span>
-          <h1>登录 NAS Download</h1>
+          <h1>登录 NAS自动下载</h1>
           <p>使用你在设置中保存的单用户密码。</p>
           <input
             aria-label="登录密码"
@@ -2236,7 +2247,7 @@ function App() {
             <Layers3 size={22} />
           </span>
           <span>
-            NAS Download<small>媒体下载与归档</small>
+            NAS自动下载<small>媒体下载与归档</small>
           </span>
         </a>
         <nav>
@@ -2284,7 +2295,7 @@ function App() {
             </button>
             <span>{nav.find((n) => n[0] === active)?.[1] || "总览"}</span>
             <span className="topbar-divider">/</span>
-            <small>NAS 媒体中心</small>
+            <small>NAS自动下载</small>
           </div>
           <div>
             <span className="refresh-status">
@@ -2328,7 +2339,7 @@ function App() {
           )}
         </main>
         <footer className="app-footer">
-          NAS Download <span>新内容增量同步 · 硬件处理 · 自动归档</span>
+          NAS自动下载 <span>新内容增量同步 · 硬件处理 · 自动归档</span>
         </footer>
       </div>
       {notice && (
