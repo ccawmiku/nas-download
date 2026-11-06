@@ -1,7 +1,7 @@
 {
   "name": "nas-download-console",
   "private": true,
-  "version": "4.0.0-preview",
+  "version": "4.0.7",
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",

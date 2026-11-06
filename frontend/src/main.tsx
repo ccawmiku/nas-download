@@ -27,6 +27,7 @@ import {
   LogOut,
 } from "lucide-react";
 import { definitions, hidden, type Spec } from "./fields";
+import { taskOutcome } from "./taskOutcome";
 import "./styles.css";
 
 const names: Record<string, string> = {
@@ -35,7 +36,6 @@ const names: Record<string, string> = {
   x: "X",
   pixiv: "Pixiv",
   douyin: "抖音",
-  instagram: "Instagram",
 };
 const initials: Record<string, string> = {
   telegram: "TG",
@@ -43,7 +43,6 @@ const initials: Record<string, string> = {
   x: "X",
   pixiv: "Px",
   douyin: "抖",
-  instagram: "IG",
 };
 const stateNames: Record<string, string> = {
   queued: "排队中",
@@ -52,6 +51,9 @@ const stateNames: Record<string, string> = {
   publishing: "正在入库",
   complete: "已完成",
   failed: "失败",
+  partial_failed: "部分失败",
+  all_failed: "全部失败",
+  execution_failed: "执行失败",
   interrupted: "已中断",
   limited: "达到时长上限",
   cancelled: "已取消",
@@ -194,6 +196,9 @@ function Mark({ platform }: { platform: string }) {
     </span>
   );
 }
+function Logo() {
+  return <span className="brand-symbol"><img src="/logo.svg" alt="" width={37} height={37} /></span>;
+}
 function Empty({
   title = "暂时没有记录",
   text = "新的任务开始后会显示在这里。",
@@ -291,18 +296,18 @@ function Home({
       {error && <div className="notice warning">{error}</div>}
       <div className="overview-intro">
         <div>
-          <span className="eyebrow">YOUR MEDIA, IN ORDER</span>
-          <h1>下载有进度，归档有结果。</h1>
-          <p>五个平台，一个队列视图。新媒体在工作区处理后自动入库。</p>
+          <span className="eyebrow">NAS自动下载</span>
+          <h1>下载与归档，一眼掌握。</h1>
+          <p>汇总五个平台的下载任务，集中查看进度、结果与异常。</p>
         </div>
         <div className="system-pill">
-          <Cpu size={17} />
+          <Layers3 size={17} />
           <span>
-            Intel N95 · HEVC 硬编
+            {workspace.value ? workspace.value.available ? "工作区已就绪" : "原件直接归档" : "正在检查工作区"}
             <small>
-              {workspace.value?.available
-                ? "工作区可用 · 单任务半速处理"
-                : "工作区未连接 · 新下载直接入库"}
+              {workspace.value ? workspace.value.available
+                ? "新媒体处理后自动入库"
+                : "工作区暂不可用，保留有效原件" : "正在读取处理服务状态"}
             </small>
           </span>
         </div>
@@ -377,7 +382,7 @@ function Home({
                 </div>
                 <div className="tile-bottom">
                   {p.latest ? (
-                    <Badge state={p.latest.state} />
+                    <Badge state={taskOutcome(p.latest).state} />
                   ) : (
                     <span className="muted">等待新内容</span>
                   )}
@@ -396,6 +401,15 @@ function Home({
                         : "立即同步"}
                   </button>
                 </div>
+                {p.latest && taskOutcome(p.latest).summary && (
+                  <small className="task-summary">
+                    {taskOutcome(p.latest).summary}
+                  </small>
+                )}
+                <small className="next-run">
+                  {p.key === "telegram" || p.key === "xhs" ? "最近成功下载" : "最近成功同步"}{" "}
+                  {p.last_success ? stamp(p.last_success) : "暂无记录"}
+                </small>
                 {p.next_run && (
                   <small className="next-run">
                     下次同步 {stamp(p.next_run)}
@@ -428,8 +442,11 @@ function Home({
                     {names[r.platform]} · {kinds[r.kind]}
                   </strong>
                   <small>{r.error || stamp(r.created)}</small>
+                  {taskOutcome(r).summary && (
+                    <small>{taskOutcome(r).summary}</small>
+                  )}
                 </span>
-                <Badge state={r.state} />
+                <Badge state={taskOutcome(r).state} />
               </button>
             ))
           ) : (
@@ -647,7 +664,7 @@ function Downloads({
                 onClick={async () => {
                   for (const key of platform
                     ? [platform]
-                    : ["x", "pixiv", "douyin", "xhs", "instagram"])
+                    : ["x", "pixiv", "douyin", "xhs"])
                     await act("/api/tasks", { platform: key, kind: "retry" });
                 }}
               >
@@ -688,18 +705,17 @@ function Downloads({
                           stopText(r.result) ||
                           stamp(r.created)}
                       </small>
-                      {r.progress?.downloaded !== undefined && (
+                      {taskOutcome(r).summary && (
                         <small>
-                          已下载 {r.progress.downloaded} · 失败{" "}
-                          {r.progress.failed || 0}
-                          {r.progress.known_threshold
+                          {taskOutcome(r).summary}
+                          {r.progress?.known_threshold
                             ? ` · 连续已下载 ${r.progress.known_consecutive || 0}/${r.progress.known_threshold}`
                             : ""}
                         </small>
                       )}
                     </div>
                   </button>
-                  <Badge state={r.state} />
+                  <Badge state={taskOutcome(r).state} />
                   <div className="row-actions">
                     {["queued", "running"].includes(r.state) && (
                       <button
@@ -1086,32 +1102,40 @@ function Collection({
   );
 }
 function Errors({ act }: { act: Act }) {
-  const [page, setPage] = useState(1), [q, setQ] = useState("");
-  const { value: data, error } = useData(`/api/errors?page=${page}&q=${encodeURIComponent(q)}`);
-  useEffect(() => setPage(1), [q]);
+  const [page, setPage] = useState(1), [q, setQ] = useState(""), [platform, setPlatform] = useState("");
+  const { value: data, error } = useData(`/api/errors?page=${page}&platform=${platform}&q=${encodeURIComponent(q)}`);
+  useEffect(() => setPage(1), [q, platform]);
   useEffect(() => {
     if (data && page > 1 && !data.items.length) setPage(page - 1);
   }, [data, page]);
   return <>
     <div className="page-title"><div><h1>错误列表</h1>
-      <p>仅显示 X：首次下载失败后重试 3 轮仍失败的推文，已停止自动重试。手动下载后可逐条删除。</p>
+      <p>集中查看五个平台的下载错误。X 仅收录重试 3 轮后仍失败的内容；其他平台保留原有重试策略。</p>
     </div></div>
-    <Panel title={`X 下载错误${data ? ` · ${data.total}` : ""}`}>
-      <div className="filters"><input aria-label="搜索错误链接" placeholder="搜索链接或失败原因" value={q} onChange={e => setQ(e.target.value)} /></div>
+    <Panel title={`${names[platform] || "全部平台"}下载错误${data ? ` · ${data.total}` : ""}`}>
+      <div className="filters">
+        <div className="chips">
+          {[["", "全部平台"], ...Object.entries(names)].map(([key, name]) => (
+            <button className={platform === key ? "selected" : ""} key={key} onClick={() => setPlatform(key)}>{name}</button>
+          ))}
+        </div>
+        <input aria-label="搜索错误链接" placeholder="搜索链接、名称或失败原因" value={q} onChange={e => setQ(e.target.value)} />
+      </div>
       {error && <p className="inline-error">{error}</p>}
       {data?.items.map((row: any) => {
         const raw = row.metadata.url || "";
-        const url = /^https:\/\/(?:x|twitter)\.com\//i.test(raw) ? raw : `https://x.com/i/web/status/${encodeURIComponent(row.source_id)}`;
-        return <div className="data-row error-row" key={row.source_id}>
-          <div className="row-content"><Mark platform="x" /><div>
-            <a href={url} target="_blank" rel="noopener noreferrer">{url} <ArrowUpRight size={14} /></a>
-            <small>已尝试 {row.metadata.attempts} 次 · {stamp(row.updated)}</small>
+        const url = /^https?:\/\//i.test(raw) ? raw : row.platform === "x" ? `https://x.com/i/web/status/${encodeURIComponent(row.source_id)}` : "";
+        return <div className="data-row error-row" key={`${row.platform}:${row.source_id}`}>
+          <div className="row-content"><Mark platform={row.platform} /><div>
+            {url ? <a href={url} target="_blank" rel="noopener noreferrer">{url} <ArrowUpRight size={14} /></a> : <strong>{row.metadata.title || `${names[row.platform]} · ${row.source_id}`}</strong>}
+            <small>{names[row.platform]}{row.metadata.attempts ? ` · 已尝试 ${row.metadata.attempts} 次` : ""} · {stamp(row.updated)}</small>
             <small>{row.metadata.error || "未能下载媒体"}</small>
           </div></div>
-          <div className="row-actions"><button className="danger-text" onClick={() => act(`/api/errors/x/${encodeURIComponent(row.source_id)}`, {}, "DELETE")}>删除</button></div>
+          <div className="row-actions"><button className="danger-text" onClick={() => act(`/api/errors/${row.platform}/${encodeURIComponent(row.source_id)}`, {}, "DELETE")}>隐藏</button></div>
         </div>;
       })}
-      {data && !data.items.length && <Empty title="没有待处理的 X 错误" text="失败重试达到上限的推文会显示在这里。删除仅移除错误条目，保留已下载文件。" />}
+      {data && !data.items.length && <Empty title="没有待处理的下载错误" text="隐藏仅移除列表条目，保留媒体文件和下载记录。" />}
+      <div className="panel-footer">隐藏不删除文件；其他平台仍按原设置重试，X 已达到上限的内容保持停止自动重试。</div>
       {data && <Pager page={page} total={data.total} limit={30} onPage={setPage} />}
     </Panel>
   </>;
@@ -1311,6 +1335,27 @@ function BrowserPush() {
     </Panel>
   );
 }
+function Notifications({ act }: { act: Act }) {
+  const { value: data, error } = useData("/api/notifications", 30000);
+  const [enabled, setEnabled] = useState(false), [url, setUrl] = useState("");
+  useEffect(() => {
+    if (data) setEnabled(data.enabled);
+  }, [data?.enabled]);
+  return <Panel title="Bark 异常通知">
+    {error && <p className="inline-error">{error}</p>}
+    <Switch label="启用低频异常汇总" checked={enabled} onChange={setEnabled}
+      hint="异常持续至少 10 分钟才通知；全天最多 1 条，同一故障至少间隔 72 小时。" />
+    <Field spec={{ key: "bark_url", label: data?.configured ? "更换 Bark 地址（已配置）" : "Bark 推送地址", type: "password", hint: "填写 https://api.day.app/密钥/；留空保留现有地址，保存后不回显。" }} value={url} onChange={setUrl} />
+    <p className="panel-description">静默推送，仅汇总新增未处理错误、连续执行失败、服务断连和磁盘空间不足；成功与恢复不单独通知。通知不含作品链接、文件名或凭证。</p>
+    {data?.last_error && <p className="inline-error">{data.last_error}</p>}
+    <div className="panel-footer notification-footer">
+      <span>最近推送 {stamp(data?.last_sent)}</span>
+      <button className="link-button" disabled={!data} onClick={async () => {
+        if (await act("/api/notifications", { enabled, ...(url ? { url } : {}) }, "PATCH")) setUrl("");
+      }}>保存通知设置</button>
+    </div>
+  </Panel>;
+}
 function Settings({ initial, act }: { initial: string; act: Act }) {
   const [tab, setTab] = useState(initial || "telegram");
   const prefs = useData("/api/settings", 30000);
@@ -1464,6 +1509,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                 />
               </Panel>
               <BrowserPush />
+              <Notifications act={act} />
               <Panel title="日志预览">
                 <Field
                   spec={{
@@ -1585,7 +1631,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                       : "尚未保存凭证"}
                   </div>
                   <label className="field">
-                    <span>{tab === "pixiv" ? "Refresh Token" : tab === "instagram" ? "Netscape Cookies" : "Cookie"}</span>
+                    <span>{tab === "pixiv" ? "Refresh Token" : "Cookie"}</span>
                     <textarea
                       rows={3}
                       spellCheck={false}
@@ -1596,9 +1642,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                     <small>
                       {tab === "pixiv"
                         ? "可粘贴已有 Refresh Token，也可使用下方登录流程。"
-                        : tab === "instagram"
-                          ? "粘贴浏览器导出的 Netscape Cookies 文件内容；保留 sessionid、ds_user_id，并选择对应浏览器。仅用于读取收藏。"
-                          : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
+                        : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
                     </small>
                   </label>
                   <div className="button-group">
@@ -1614,7 +1658,7 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                         生成 Pixiv 登录链接
                       </button>
                     )}
-                    {["pixiv", "douyin", "instagram"].includes(tab) && (
+                    {["pixiv", "douyin"].includes(tab) && (
                       <button
                         onClick={() =>
                           act("/api/tasks", { platform: tab, kind: "test" })
@@ -1933,7 +1977,7 @@ function Drawer({
             </>
           ) : (
             <>
-              <Badge state={row.state || row.status} />
+              <Badge state={kind === "task" ? taskOutcome(row).state : row.state || row.status} />
               {mediaUrl && (
                 <div className="media-preview">
                   {video ? (
@@ -2091,7 +2135,7 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
             value={platform}
             onChange={(e) => setPlatform(e.target.value)}
           >
-            {Object.entries(names).filter(([k]) => k !== "instagram").map(([k, v]) => (
+            {Object.entries(names).map(([k, v]) => (
               <option key={k} value={k}>
                 {v}
               </option>
@@ -2186,10 +2230,8 @@ function App() {
   if (!auth)
     return (
       <div className="boot-screen">
-        <span className="brand-symbol">
-          <Layers3 size={23} />
-        </span>
-        <h1>NAS Download</h1>
+        <Logo />
+        <h1>NAS自动下载</h1>
         <p>{notice?.text || "正在连接控制台…"}</p>
       </div>
     );
@@ -2209,10 +2251,8 @@ function App() {
             }
           }}
         >
-          <span className="brand-symbol">
-            <Layers3 size={23} />
-          </span>
-          <h1>登录 NAS Download</h1>
+          <Logo />
+          <h1>登录 NAS自动下载</h1>
           <p>使用你在设置中保存的单用户密码。</p>
           <input
             aria-label="登录密码"
@@ -2232,11 +2272,9 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${menu ? "open" : ""}`}>
         <a className="brand" href="#home">
-          <span className="brand-symbol">
-            <Layers3 size={22} />
-          </span>
+          <Logo />
           <span>
-            NAS Download<small>媒体下载与归档</small>
+            NAS自动下载<small>媒体下载与归档</small>
           </span>
         </a>
         <nav>
@@ -2284,7 +2322,7 @@ function App() {
             </button>
             <span>{nav.find((n) => n[0] === active)?.[1] || "总览"}</span>
             <span className="topbar-divider">/</span>
-            <small>NAS 媒体中心</small>
+            <small>NAS自动下载</small>
           </div>
           <div>
             <span className="refresh-status">
@@ -2328,7 +2366,7 @@ function App() {
           )}
         </main>
         <footer className="app-footer">
-          NAS Download <span>新内容增量同步 · 硬件处理 · 自动归档</span>
+          NAS自动下载 <span>新内容增量同步 · 硬件处理 · 自动归档</span>
         </footer>
       </div>
       {notice && (

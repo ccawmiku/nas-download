@@ -13,7 +13,6 @@ PLATFORMS = {
     "x": "X",
     "pixiv": "Pixiv",
     "douyin": "抖音",
-    "instagram": "Instagram",
 }
 
 
@@ -112,6 +111,10 @@ class Store:
     def claim(self, table, owner, platforms=None):
         if table not in {"tasks", "assets"}:
             raise ValueError("invalid queue")
+        if table == "tasks":
+            platforms = [key for key in (PLATFORMS if platforms is None else platforms) if key in PLATFORMS]
+            if not platforms:
+                return None
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -216,10 +219,13 @@ class Store:
         if table not in {"tasks", "assets", "logs", "records"}:
             raise ValueError("invalid table")
         conditions, args = [], []
+        if table != "logs":
+            conditions.append("platform IN (" + ",".join("?" for _ in PLATFORMS) + ")")
+            args.extend(PLATFORMS)
         if errors:
             conditions.extend([
-                "platform='x'", "state='failed'",
-                "COALESCE(json_extract(metadata,'$.retry_exhausted'),0)=1",
+                "state IN ('failed','interrupted')",
+                "(platform!='x' OR COALESCE(json_extract(metadata,'$.retry_exhausted'),0)=1)",
                 "COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
             ])
         for key, value in (("platform", platform), ("state", state)):

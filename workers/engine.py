@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 
 from core.config import read_json, write_json
+from core.store import PLATFORMS
 from .client import Client, replay_receipts
 
 
 def main():
     client = Client()
     owner = os.getenv("WORKER_ID", "engine-" + socket.gethostname())
-    platforms = os.getenv("WORKER_PLATFORMS", "x,pixiv,douyin,instagram").split(",")
+    platforms = [key for key in os.getenv("WORKER_PLATFORMS", "x,pixiv,douyin").split(",") if key in PLATFORMS]
     while True:
         try:
             replay_receipts()
@@ -31,7 +32,7 @@ def main():
                     outcome_path.unlink()
                     outcome_path.with_suffix(".task").unlink(missing_ok=True)
                     outcome_path.with_suffix(".result").unlink(missing_ok=True)
-            if any(platform in platforms for platform in ("x", "pixiv", "douyin", "instagram")):
+            if any(platform in platforms for platform in ("x", "pixiv", "douyin")):
                 from .bypass import drain_one
 
                 drain_one()

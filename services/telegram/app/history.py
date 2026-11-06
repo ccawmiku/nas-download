@@ -55,6 +55,7 @@ class DownloadHistory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS downloads(id TEXT PRIMARY KEY,status TEXT,created TEXT,data TEXT); CREATE INDEX IF NOT EXISTS status_idx ON downloads(status,created); CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY);")
+            db.execute("CREATE INDEX IF NOT EXISTS core_updated_idx ON downloads(json_extract(data,'$.updated_at'),id)")
             imported = db.execute("SELECT 1 FROM migrations WHERE name='legacy-json'").fetchone()
         if not imported:
             self._import_legacy()
@@ -178,6 +179,19 @@ class DownloadHistory:
         self.flush()
         with self._connect() as db:
             return dict(db.execute('SELECT status,count(*) FROM downloads GROUP BY status'))
+
+    def core_page(self, cursor, through, limit=100):
+        """Page changed history, never enumerate downloaded files or expose paths."""
+        self.flush()
+        after_time, after_id = cursor
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT data FROM downloads WHERE (json_extract(data,'$.updated_at'),id)>(?,?) "
+                "AND json_extract(data,'$.updated_at')<=? ORDER BY json_extract(data,'$.updated_at'),id LIMIT ?",
+                (after_time, after_id, through, limit),
+            ).fetchall()
+        fields = {'id','status','updated_at','chat_id','message_id','retry_count','error','file_name'}
+        return [{key: value for key, value in json.loads(row[0]).items() if key in fields} for row in rows]
 
     def remove_statuses(self,statuses):
         if not statuses:
