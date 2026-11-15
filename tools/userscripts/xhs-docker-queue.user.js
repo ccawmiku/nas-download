@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.2.0
+// @version      3.2.1
 // @description  点赞/收藏自动保存最近五作品，按顺序增量截止，单个作品独立归档，支持每日一次后台静默直推与 NAS 推送回执
 // @match        https://www.xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
@@ -115,10 +115,35 @@
         return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     };
 
+    const REPORT_PLATFORM = 'xhs';
+
+    const extractErrorMessage = (statusCode, responseText) => {
+        let detail = '';
+        const raw = String(responseText || '').trim();
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (typeof parsed?.detail === 'string') {
+                    detail = parsed.detail.trim();
+                } else if (Array.isArray(parsed?.detail) && parsed.detail.length) {
+                    detail = parsed.detail.map(item => item?.msg || JSON.stringify(item)).join('; ');
+                } else if (typeof parsed?.message === 'string') {
+                    detail = parsed.message.trim();
+                }
+            } catch {
+                detail = raw.slice(0, 160);
+            }
+        }
+        return detail
+            ? `Docker HTTP ${statusCode}：${detail}`
+            : `Docker HTTP ${statusCode}，请检查地址、授权和服务版本。`;
+    };
+
     // Pure helpers are also exercised by the Node regression tests.
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             STORAGE_KEYS,
+            REPORT_PLATFORM,
             noteId,
             accountId,
             range,
@@ -128,6 +153,7 @@
             nextCheckpoint,
             redactXhsUrl,
             parseBgRunHash,
+            extractErrorMessage,
         };
         return;
     }
@@ -342,9 +368,7 @@
                         return;
                     }
                     if (response.status < 200 || response.status >= 300) {
-                        reject(
-                            new Error(`Docker HTTP ${response.status}，请检查地址、授权和服务版本。`)
-                        );
+                        reject(new Error(extractErrorMessage(response.status, response.responseText)));
                         return;
                     }
                     try {
@@ -377,7 +401,7 @@
                 endpoint(cfg.host, cfg.port, '/api/browser-push/report'),
                 cfg.token,
                 {
-                    platform: 'xiaohongshu',
+                    platform: REPORT_PLATFORM,
                     source_mode: report.source_mode || 'workbench',
                     batch_id: report.batch_id || '',
                     account: report.account || '',

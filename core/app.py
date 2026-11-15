@@ -720,6 +720,7 @@ def browser_push_report(payload: dict, request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(422, "上报格式无效")
     platform = str(payload.get("platform") or "").strip().lower()
+    platform = {"xiaohongshu": "xhs", "redbook": "xhs", "twitter": "x"}.get(platform, platform)
     source_mode = str(payload.get("source_mode") or "bg").strip().lower()
     status = str(payload.get("status") or "").strip().lower()
     if platform not in {"x", "xhs"} or status not in {"empty", "error", "ok"}:

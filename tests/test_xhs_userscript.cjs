@@ -99,3 +99,17 @@ test('xhs daily background lock tracks liked and saved sequentially per calendar
   assert.equal(xhsBg.shouldRunDailyBg({config: cfg, dailyState: failState, nowMs: day1 + 120 * 60000}).reason, 'daily_fail_limit_reached');
 });
 
+const {REPORT_PLATFORM, extractErrorMessage} = require('../tools/userscripts/xhs-docker-queue.user.js');
+
+test('xhs report uses canonical xhs platform and surfaces HTTP 422 detail', () => {
+  assert.equal(REPORT_PLATFORM, 'xhs');
+  assert.equal(
+    extractErrorMessage(422, '{"detail":"平台上报参数无效"}'),
+    'Docker HTTP 422：平台上报参数无效'
+  );
+  assert.equal(
+    extractErrorMessage(422, ''),
+    'Docker HTTP 422，请检查地址、授权和服务版本。'
+  );
+});
+

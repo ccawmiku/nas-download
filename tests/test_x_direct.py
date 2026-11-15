@@ -396,3 +396,24 @@ def test_xhs_batch_idempotency_and_failure_classification_stops_infinite_retries
     assert len(tasks) == 1 and tasks[0]["payload"]["urls"] == [
         "https://www.xiaohongshu.com/explore/333333333333333333333333?xsec_token=ok"
     ]
+
+
+def test_browser_push_report_accepts_xhs_and_aliases(client):
+    token = client.get("/api/browser-push/token").json()["token"]
+    headers = {"X-NAS-Submit-Token": token, "Origin": "https://www.xiaohongshu.com"}
+    for reported_platform in ("xhs", "xiaohongshu"):
+        resp = client.post(
+            "/api/browser-push/report",
+            headers=headers,
+            json={
+                "platform": reported_platform,
+                "source_mode": "workbench",
+                "account": "u1",
+                "status": "ok",
+                "discovered": 5,
+                "message": f"test-{reported_platform}",
+            },
+        )
+        assert resp.status_code == 200 and resp.json()["ok"] is True
+    pushes = client.get("/api/browser-push/status?platform=xhs").json()["history"]["items"]
+    assert len(pushes) == 2 and {p["message"] for p in pushes} == {"test-xhs", "test-xiaohongshu"}
