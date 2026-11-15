@@ -1,14 +1,85 @@
 from __future__ import annotations
 import asyncio
 import os
-import json
 import hashlib
+import json
+import os
 import re
+import time
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
-from pathlib import Path
-from core.config import CONFIG_PATHS, read_json
+
+from core.config import CONFIG_PATHS, read_json, sanitize
 from core.media import publish
 from .client import Client, prepare, record, submit
+
+
+def classify_xhs_failure(detail: str) -> dict:
+    raw = str(detail or "").strip()
+    lower = raw.lower()
+    retry_after = 0
+    match = re.search(r"retry[-_\s]?after[:=\s]+(\d+)", lower)
+    if match:
+        retry_after = max(60, min(int(match.group(1)), 86400))
+    if (
+        "429" in lower
+        or "too many requests" in lower
+        or "频繁" in raw
+        or "限流" in raw
+        or "rate limit" in lower
+    ):
+        wait = retry_after or 1800
+        return {
+            "kind": "rate_limit",
+            "retry_paused": False,
+            "retry_exhausted": False,
+            "needs_fresh_token": False,
+            "cooldown_seconds": wait,
+            "message": f"触发上游限流 (429)，已暂停并延后 {wait} 秒后重试",
+        }
+    if (
+        "401" in lower
+        or "403" in lower
+        or "captcha" in lower
+        or "验证码" in raw
+        or "风控" in raw
+        or "未登录" in raw
+        or "登录" in raw
+    ):
+        return {
+            "kind": "auth_required",
+            "retry_paused": True,
+            "retry_exhausted": True,
+            "needs_fresh_token": False,
+            "cooldown_seconds": 0,
+            "message": "小红书要求登录或触发风控验证码，已暂停自动重试",
+        }
+    if (
+        "xsec_token" in lower
+        or "token" in lower
+        or "404" in lower
+        or "已过期" in raw
+        or "参数无效" in raw
+        or "作品不存在" in raw
+        or "无法获取" in raw
+        or "已删除" in raw
+    ):
+        return {
+            "kind": "token_expired",
+            "retry_paused": True,
+            "retry_exhausted": True,
+            "needs_fresh_token": True,
+            "cooldown_seconds": 0,
+            "message": "xsec_token 已失效或作品不可访问，等待浏览器提交新链接后重试",
+        }
+    return {
+        "kind": "network",
+        "retry_paused": False,
+        "retry_exhausted": False,
+        "needs_fresh_token": False,
+        "cooldown_seconds": 0,
+        "message": sanitize(raw) or "上游未确认所有文件完成",
+    }
 
 
 def queue_urls(config):
@@ -38,11 +109,16 @@ def queue_urls(config):
 
 
 def archive_root(settings, config, destination="batch"):
-    root = Path(settings.get("work_path") or "/xhs")
+    raw = str(settings.get("work_path") or "/xhs")
+    root = Path(raw)
     if destination == "single":
         custom = str(config.get("single_work_path") or "").strip()
-        root = Path(custom) if custom else root / "single"
-        if not root.is_absolute():
+        raw = custom if custom else f"{raw.rstrip('/\\')}/single"
+        root = Path(raw)
+        if not (
+            root.is_absolute()
+            or PurePosixPath(str(raw).replace("\\", "/")).is_absolute()
+        ):
             raise ValueError("单个作品保存目录必须是容器绝对路径")
     return root
 
@@ -160,22 +236,31 @@ async def run(job):
                     # Never route a single retry into batch when its receipt is unavailable.
                     raise
                 previous = {}
+            prev_meta = previous.get("metadata", {}) if isinstance(previous, dict) else {}
             destination_kind = job["payload"].get("destination", "batch")
             if job["kind"] == "retry":
-                destination_kind = previous.get("metadata", {}).get("destination", destination_kind)
+                destination_kind = prev_meta.get("destination", destination_kind)
             current["destination"] = destination_kind
             current["final"] = archive_root(settings_original, config, destination_kind)
-            values = await app.extract(
-                url,
-                download=True,
-                check_record=job["kind"] != "retry" and destination_kind != "single",
-                task_id=job["id"],
-                result_callback=lambda value: count.update(value),
-            )
+            extracted_error = ""
+            values = []
+            try:
+                values = await app.extract(
+                    url,
+                    download=True,
+                    check_record=job["kind"] != "retry" and destination_kind != "single",
+                    task_id=job["id"],
+                    result_callback=lambda value: count.update(value),
+                )
+            except Exception as error:
+                extracted_error = str(error)
+            if count.get("error"):
+                extracted_error = extracted_error or str(count.get("error"))
+            values_list = values if isinstance(values, list) else []
             identifier = current.get("identifier") or next(
                 (
                     str(value["作品ID"])
-                    for value in values
+                    for value in values_list
                     if isinstance(value, dict) and value.get("作品ID")
                 ),
                 input_id,
@@ -185,19 +270,35 @@ async def run(job):
                 continue
             await deliver(identifier)
             delivered, processing = current["delivered"], current["processing"]
-            failed = bool(count.get("fail") or not delivered)
+            failed = bool(extracted_error or count.get("fail") or not delivered)
+            fresh_submission = job["kind"] == "links" and bool(prev_meta.get("url")) and url != prev_meta.get("url")
+            attempts = 1 if fresh_submission else int(prev_meta.get("attempts", 0) or 0) + 1
             metadata = {
                 "url": url,
                 "destination": destination_kind,
-                "attempts": int(previous.get("metadata", {}).get("attempts", 0)) + 1,
+                "attempts": attempts,
                 "replaces_source_id": input_id if input_id != identifier else "",
                 "title": next(
-                    (v.get("作品标题", "") for v in values if isinstance(v, dict)), ""
+                    (v.get("作品标题", "") for v in values_list if isinstance(v, dict)),
+                    prev_meta.get("title", ""),
                 ),
             }
+            rate_limited = False
             if failed:
+                classified = classify_xhs_failure(extracted_error)
+                rate_limited = classified["kind"] == "rate_limit"
                 metadata.update(
-                    error="上游未确认所有文件完成", download_incomplete=True
+                    error=classified["message"],
+                    download_incomplete=True,
+                    failure_kind=classified["kind"],
+                    retry_paused=classified["retry_paused"],
+                    retry_exhausted=classified["retry_exhausted"],
+                    needs_fresh_token=classified["needs_fresh_token"],
+                    cooldown_until=(
+                        time.time() + classified["cooldown_seconds"]
+                        if classified["cooldown_seconds"] > 0
+                        else 0
+                    ),
                 )
             record(
                 "xhs",
@@ -207,7 +308,10 @@ async def run(job):
                 metadata,
             )
             stats["failed" if failed else "downloaded"] += 1
-            print(__import__("json").dumps(stats), flush=True)
+            print(json.dumps(stats), flush=True)
+            if rate_limited:
+                stats["stop_reason"] = "rate_limit"
+                break
             await asyncio.sleep(float(config.get("request_delay_seconds", 1)))
     activity.unlink(missing_ok=True)
     for key, seen in checkpoints:

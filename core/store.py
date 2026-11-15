@@ -46,6 +46,17 @@ class Store:
                 CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY,roles TEXT NOT NULL,
                   updated REAL NOT NULL,details TEXT NOT NULL DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS log_events(id TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS browser_pushes(id TEXT PRIMARY KEY,
+                  platform TEXT NOT NULL,source_mode TEXT NOT NULL,batch_id TEXT DEFAULT '',
+                  account TEXT DEFAULT '',status TEXT NOT NULL,submitted INTEGER DEFAULT 0,
+                  accepted INTEGER DEFAULT 0,skipped INTEGER DEFAULT 0,invalid INTEGER DEFAULT 0,
+                  unresolvable INTEGER DEFAULT 0,discovered INTEGER DEFAULT 0,
+                  task_id TEXT DEFAULT '',message TEXT DEFAULT '',client_ip TEXT DEFAULT '',
+                  created REAL NOT NULL,updated REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS browser_pushes_platform_created ON browser_pushes(platform,created DESC);
+                CREATE TABLE IF NOT EXISTS push_batches(platform TEXT NOT NULL,
+                  batch_id TEXT NOT NULL,payload_hash TEXT NOT NULL,response TEXT NOT NULL,
+                  created REAL NOT NULL,PRIMARY KEY(platform,batch_id));
             """)
 
     @contextlib.contextmanager
@@ -258,3 +269,157 @@ class Store:
             "page": page,
             "limit": limit,
         }
+
+    def get_push_batch(self, platform, batch_id):
+        if not batch_id:
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT payload_hash,response FROM push_batches WHERE platform=? AND batch_id=?",
+                (platform, batch_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "payload_hash": row["payload_hash"],
+            "response": json.loads(row["response"]),
+        }
+
+    def save_push_batch(self, platform, batch_id, payload_hash, response_data):
+        if not batch_id:
+            return
+        now = time.time()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO push_batches(platform,batch_id,payload_hash,response,created) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(platform,batch_id) DO UPDATE SET payload_hash=excluded.payload_hash,response=excluded.response,created=excluded.created",
+                (
+                    platform,
+                    batch_id,
+                    payload_hash,
+                    json.dumps(response_data, ensure_ascii=False),
+                    now,
+                ),
+            )
+            db.execute("DELETE FROM push_batches WHERE created < ?", (now - 7 * 86400,))
+
+    def can_record_auth_error(self, platform, cooldown_seconds=30):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT MAX(created) FROM browser_pushes WHERE platform=? AND status='auth_error'",
+                (platform,),
+            ).fetchone()
+        latest = row[0] if row and row[0] else 0
+        return (time.time() - latest) >= cooldown_seconds
+
+    def record_browser_push(
+        self,
+        platform,
+        source_mode,
+        status,
+        *,
+        batch_id="",
+        account="",
+        submitted=0,
+        accepted=0,
+        skipped=0,
+        invalid=0,
+        unresolvable=0,
+        discovered=0,
+        task_id="",
+        message="",
+        client_ip="",
+    ):
+        now = time.time()
+        identifier = secrets.token_hex(10)
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO browser_pushes(id,platform,source_mode,batch_id,account,status,submitted,accepted,skipped,invalid,unresolvable,discovered,task_id,message,client_ip,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    identifier,
+                    platform,
+                    str(source_mode or "unknown")[:32],
+                    str(batch_id or "")[:80],
+                    str(account or "")[:100],
+                    str(status or "queued")[:32],
+                    int(submitted or 0),
+                    int(accepted or 0),
+                    int(skipped or 0),
+                    int(invalid or 0),
+                    int(unresolvable or 0),
+                    int(discovered or 0),
+                    str(task_id or "")[:64],
+                    str(message or "")[:500],
+                    str(client_ip or "")[:64],
+                    now,
+                    now,
+                ),
+            )
+            db.execute(
+                "DELETE FROM browser_pushes WHERE id NOT IN (SELECT id FROM browser_pushes ORDER BY created DESC LIMIT 200)"
+            )
+        return identifier
+
+    def _enrich_push_row(self, db, row):
+        item = dict(row)
+        task_id = item.get("task_id") or ""
+        if task_id:
+            task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if task:
+                decoded = self.decode(task)
+                item["task_state"] = decoded["state"]
+                item["task_progress"] = decoded["progress"]
+                item["task_result"] = decoded["result"]
+                item["task_error"] = decoded["error"]
+        return item
+
+    def list_browser_pushes(self, page=1, limit=30, platform=""):
+        clauses, args = [], []
+        if platform:
+            clauses.append("platform=?")
+            args.append(platform)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as db:
+            total = db.execute(
+                f"SELECT count(*) FROM browser_pushes{where}", args
+            ).fetchone()[0]
+            rows = db.execute(
+                f"SELECT * FROM browser_pushes{where} ORDER BY created DESC LIMIT ? OFFSET ?",
+                (*args, limit, (page - 1) * limit),
+            ).fetchall()
+            items = [self._enrich_push_row(db, row) for row in rows]
+        return {"items": items, "total": total, "page": page, "limit": limit}
+
+    def browser_push_summary(self):
+        local_day = time.localtime()
+        day_start = time.mktime(
+            (local_day.tm_year, local_day.tm_mon, local_day.tm_mday, 0, 0, 0, 0, 0, -1)
+        )
+        summary = {}
+        with self.connect() as db:
+            for key in ("x", "xhs"):
+                latest = db.execute(
+                    "SELECT * FROM browser_pushes WHERE platform=? ORDER BY created DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                last_ok = db.execute(
+                    "SELECT * FROM browser_pushes WHERE platform=? AND status IN ('queued','empty','duplicate','ok') ORDER BY created DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                stats = db.execute(
+                    "SELECT count(*), COALESCE(SUM(accepted),0), "
+                    "COALESCE(SUM(CASE WHEN status IN ('queued','duplicate','empty','ok') THEN 1 ELSE 0 END),0), "
+                    "COALESCE(SUM(CASE WHEN status IN ('error','auth_error') THEN 1 ELSE 0 END),0) "
+                    "FROM browser_pushes WHERE platform=? AND created>=?",
+                    (key, day_start),
+                ).fetchone()
+                summary[key] = {
+                    "last_push": self._enrich_push_row(db, latest) if latest else None,
+                    "last_success_push": self._enrich_push_row(db, last_ok) if last_ok else None,
+                    "today_pushes": int(stats[0] or 0),
+                    "today_accepted": int(stats[1] or 0),
+                    "today_success_count": int(stats[2] or 0),
+                    "today_error_count": int(stats[3] or 0),
+                }
+        return summary

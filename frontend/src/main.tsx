@@ -25,6 +25,12 @@ import {
   Play,
   RotateCcw,
   LogOut,
+  Send,
+  Copy,
+  KeyRound,
+  Eye,
+  EyeOff,
+  Radio,
 } from "lucide-react";
 import { definitions, hidden, type Spec } from "./fields";
 import { taskOutcome } from "./taskOutcome";
@@ -87,13 +93,29 @@ function stopText(value: any) {
 const kinds: Record<string, string> = {
   sync: "增量同步",
   links: "链接下载",
+  direct: "浏览器直推",
   retry: "重试失败下载",
   test: "连接测试",
   "oauth-start": "Pixiv 登录授权",
   "oauth-finish": "保存 Pixiv 授权",
 };
+const pushStatusNames: Record<string, string> = {
+  queued: "新入队",
+  empty: "检查无新增",
+  duplicate: "重复跳过",
+  auth_error: "授权失败 (401)",
+  error: "推送异常",
+  ok: "连通正常",
+};
+const pushSourceNames: Record<string, string> = {
+  bg: "每日后台",
+  workbench: "工作台批量",
+  single: "单条投稿",
+  unknown: "其他来源",
+};
 const nav = [
   ["home", "总览", House],
+  ["push", "浏览器推送", Send],
   ["downloads", "下载", Download],
   ["workspace", "工作区", Layers3],
   ["records", "媒体记录", Images],
@@ -265,6 +287,115 @@ function Switch({
 type Act = (path: string, body?: unknown, method?: string) => Promise<any>;
 type Open = (kind: string, row: any) => void;
 
+function PushBadge({ status }: { status: string }) {
+  return (
+    <span className={`badge push-${status}`}>
+      <i />
+      {pushStatusNames[status] || status}
+    </span>
+  );
+}
+function PushPlatformCard({
+  platform,
+  summary,
+  open,
+  onDetail,
+}: {
+  platform: "x" | "xhs";
+  summary: any;
+  open: Open;
+  onDetail?: () => void;
+}) {
+  const last = summary?.last_push;
+  const okToday = (summary?.today_success_count || 0) > 0;
+  const errToday = (summary?.today_error_count || 0) > 0;
+  const lastErr = last && ["error", "auth_error"].includes(last.status);
+  const pillClass = lastErr || errToday ? "bad" : okToday ? "good" : "idle";
+  const pillText = lastErr
+    ? pushStatusNames[last.status] || "最近推送异常"
+    : errToday
+      ? `今日异常 ${summary.today_error_count} 次`
+      : okToday
+        ? summary.today_accepted > 0
+          ? `今日已入库 ${summary.today_accepted} 条`
+          : "今日已检查（无新增）"
+        : last
+          ? "今日尚未推送"
+          : "暂未收到浏览器推送";
+
+  return (
+    <div className={`push-card ${pillClass}`}>
+      <div className="push-card-head">
+        <Mark platform={platform} />
+        <div className="push-card-title">
+          <strong>{names[platform]} 浏览器推送</strong>
+          <small>
+            今日检查 {summary?.today_pushes || 0} 次 · 新入队{" "}
+            {summary?.today_accepted || 0}
+            {summary?.today_error_count ? ` · 异常 ${summary.today_error_count}` : ""}
+          </small>
+        </div>
+        <span className={`push-pill ${pillClass}`}>{pillText}</span>
+      </div>
+      {last ? (
+        <div className="push-card-body">
+          <div className="push-card-meta">
+            <span className="chip">{pushSourceNames[last.source_mode] || last.source_mode}</span>
+            <PushBadge status={last.status} />
+            <span className="muted-text">{stamp(last.created)}</span>
+            {last.account && <span className="muted-text">账号 {last.account}</span>}
+          </div>
+          <p className="push-card-msg">
+            {last.message ||
+              `发现 ${last.discovered || 0} · 提交 ${last.submitted || 0} · 新入队 ${last.accepted || 0} · 重复跳过 ${last.skipped || 0}`}
+          </p>
+          <div className="push-card-foot">
+            {last.task_id ? (
+              <button
+                className="link-button"
+                onClick={() =>
+                  open("task", {
+                    id: last.task_id,
+                    platform: last.platform || platform,
+                    kind: platform === "x" ? "direct" : "links",
+                    state: last.task_state || "queued",
+                  })
+                }
+              >
+                <Badge state={last.task_state || "queued"} />
+                <span>
+                  任务 #{last.task_id.slice(0, 8)}
+                  {last.task_result?.downloaded !== undefined
+                    ? `（已下 ${last.task_result.downloaded}${last.task_result.failed ? ` / 失败 ${last.task_result.failed}` : ""}）`
+                    : ""}
+                </span>
+                <ArrowUpRight size={14} />
+              </button>
+            ) : (
+              <span className="muted-text">无关联下载任务</span>
+            )}
+            {onDetail && (
+              <button className="link-button" onClick={onDetail}>
+                推送详情 <ArrowRight size={14} />
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="push-card-empty">
+          <p>
+            请在 Chrome 安装对应 ScriptCat 脚本并填写 Token，之后每次同步、检查或出错都会实时上报到这里。
+          </p>
+          {onDetail && (
+            <button className="link-button" onClick={onDetail}>
+              配置推送与 Token <ArrowRight size={14} />
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 function Home({
   act,
   go,
@@ -291,60 +422,96 @@ function Home({
       (task.limited || 0) +
       (assets.failed || 0) +
       (assets.interrupted || 0);
+  const bp = data.browser_push || {};
   return (
     <>
       {error && <div className="notice warning">{error}</div>}
-      <div className="overview-intro">
+      <div className="overview-intro compact">
         <div>
-          <span className="eyebrow">NAS自动下载</span>
-          <h1>下载与归档，一眼掌握。</h1>
-          <p>汇总五个平台的下载任务，集中查看进度、结果与异常。</p>
+          <span className="eyebrow">控制台总览 · {data.version || "v4"}</span>
+          <h1>浏览器直推与自动化归档</h1>
         </div>
-        <div className="system-pill">
-          <Layers3 size={17} />
-          <span>
-            {workspace.value ? workspace.value.available ? "工作区已就绪" : "原件直接归档" : "正在检查工作区"}
-            <small>
-              {workspace.value ? workspace.value.available
-                ? "新媒体处理后自动入库"
-                : "工作区暂不可用，保留有效原件" : "正在读取处理服务状态"}
-            </small>
-          </span>
+        <div className="overview-actions">
+          <button onClick={() => go("push")}>
+            <Radio size={15} />
+            推送监控与授权
+          </button>
+          <div className="system-pill">
+            <Layers3 size={17} />
+            <span>
+              {workspace.value
+                ? workspace.value.available
+                  ? "工作区就绪"
+                  : "原件直存"
+                : "检查工作区…"}
+              <small>
+                {workspace.value
+                  ? workspace.value.available
+                    ? "自动转码 / 压缩入库"
+                    : "工作区不可用 · 直接入库"
+                  : "读取处理服务状态"}
+              </small>
+            </span>
+          </div>
         </div>
       </div>
       <div className="metrics">
         {[
-          [Download, "下载队列", pending, "待运行与正在运行"],
-          [Layers3, "工作区", working, "等待转换与正在入库"],
-          [Check, "已入库", assets.complete || 0, "工作区处理完成"],
-          [TriangleAlert, "需要处理", attention, "失败、中断或时长上限"],
-        ].map(([Icon, title, n, sub]: any) => (
-          <div className="metric" key={title}>
+          [Download, "下载队列", pending, "待运行与正在运行", () => go("downloads")],
+          [Layers3, "工作区", working, "等待转换与正在入库", () => go("workspace")],
+          [Check, "已入库", assets.complete || 0, "工作区处理完成", () => go("records")],
+          [TriangleAlert, "需要处理", attention, "失败、中断或超时", () => go("errors")],
+        ].map(([Icon, title, n, sub, onClick]: any) => (
+          <button className="metric metric-btn" key={title} onClick={onClick}>
             <span className="metric-label">
               <Icon size={16} />
               {title}
             </span>
             <strong>{n}</strong>
             <small>{sub}</small>
-          </div>
+          </button>
         ))}
       </div>
       <Panel
-        title="平台状态"
+        title="Chrome → NAS 实时推送状态"
+        extra={
+          <button className="link-button" onClick={() => go("push")}>
+            查看完整流水与 Token <ArrowRight size={14} />
+          </button>
+        }
+      >
+        <div className="push-summary-grid">
+          <PushPlatformCard
+            platform="x"
+            summary={bp.x}
+            open={open}
+            onDetail={() => go("push:x")}
+          />
+          <PushPlatformCard
+            platform="xhs"
+            summary={bp.xhs}
+            open={open}
+            onDetail={() => go("push:xhs")}
+          />
+        </div>
+      </Panel>
+      <Panel
+        title="平台执行与调度状态"
         extra={
           <button className="link-button" onClick={() => go("settings")}>
             管理平台 <ArrowRight size={14} />
           </button>
         }
       >
-        <div className="platform-grid">
+        <div className="platform-cards">
           {data.platforms.map((p: any) => {
             const online = data.workers.some(
               (w: any) =>
                 w.roles.includes(p.key) && Date.now() / 1000 - w.updated < 60,
             );
+            const isDirectPush = p.key === "x" || p.key === "xhs";
             return (
-              <div className="platform-tile" key={p.key}>
+              <div className="platform-card" key={p.key}>
                 <div className="platform-top">
                   <Mark platform={p.key} />
                   <div>
@@ -358,10 +525,10 @@ function Home({
                               Date.now() / 1000 - w.updated < 60,
                           )
                           ? "机器人已连接"
-                          : "机器人尚未连接"
+                          : "机器人未连接"
                         : online
-                          ? "执行服务在线"
-                          : "执行服务未连接"}
+                          ? "下载服务在线"
+                          : "下载服务离线"}
                     </span>
                   </div>
                   <button
@@ -369,36 +536,42 @@ function Home({
                     className="icon-button"
                     onClick={() => go("settings:" + p.key)}
                   >
-                    <ArrowUpRight size={17} />
+                    <SlidersHorizontal size={16} />
                   </button>
                 </div>
                 <div className="tile-info">
-                  <span>{p.workspace ? "经过工作区" : "直接归档"}</span>
-                  <span>
-                    {p.max_minutes
-                      ? `上限 ${p.max_minutes} 分钟`
-                      : "按队列处理"}
+                  <span className="chip">{p.workspace ? "经过工作区" : "直接归档"}</span>
+                  <span className="chip">
+                    {isDirectPush
+                      ? "浏览器直推"
+                      : p.max_minutes
+                        ? `上限 ${p.max_minutes} 分钟`
+                        : "实时队列"}
                   </span>
                 </div>
                 <div className="tile-bottom">
                   {p.latest ? (
                     <Badge state={taskOutcome(p.latest).state} />
                   ) : (
-                    <span className="muted">等待新内容</span>
+                    <span className="muted-text">等待任务</span>
                   )}
                   <button
                     className="link-button"
                     onClick={() =>
-                      p.key === "telegram"
-                        ? go("downloads:telegram")
-                        : act("/api/tasks", { platform: p.key })
+                      isDirectPush
+                        ? go(`push:${p.key}`)
+                        : p.key === "telegram"
+                          ? go("downloads:telegram")
+                          : act("/api/tasks", { platform: p.key })
                     }
                   >
-                    {p.key === "xhs"
-                      ? "处理链接队列"
-                      : p.key === "telegram"
-                        ? "查看下载"
-                        : "立即同步"}
+                    {p.key === "x"
+                      ? "X 推送明细"
+                      : p.key === "xhs"
+                        ? "小红书推送明细"
+                        : p.key === "telegram"
+                          ? "查看下载"
+                          : "立即同步"}
                   </button>
                 </div>
                 {p.latest && taskOutcome(p.latest).summary && (
@@ -407,12 +580,14 @@ function Home({
                   </small>
                 )}
                 <small className="next-run">
-                  {p.key === "telegram" || p.key === "xhs" ? "最近成功下载" : "最近成功同步"}{" "}
+                  {p.key === "telegram" || isDirectPush
+                    ? "最近成功下载"
+                    : "最近成功同步"}{" "}
                   {p.last_success ? stamp(p.last_success) : "暂无记录"}
                 </small>
-                {p.next_run && (
+                {!isDirectPush && p.next_run && (
                   <small className="next-run">
-                    下次同步 {stamp(p.next_run)}
+                    下次定时 {stamp(p.next_run)}
                   </small>
                 )}
               </div>
@@ -1280,15 +1455,37 @@ function Field({
     </label>
   );
 }
-function BrowserPush() {
+function PushTokenCard({
+  compact = false,
+  act,
+}: {
+  compact?: boolean;
+  act?: Act;
+}) {
   const [token, setToken] = useState("");
-  const [copyLabel, setCopyLabel] = useState("复制授权");
+  const [revealed, setRevealed] = useState(false);
+  const [copyLabel, setCopyLabel] = useState("复制 Token");
+
+  async function revealOrLoad() {
+    if (!token) {
+      const res = await api("/api/browser-push/token");
+      setToken(res.token || "");
+    }
+    setRevealed(true);
+  }
+
   async function copyToken() {
     try {
-      if (navigator.clipboard) await navigator.clipboard.writeText(token);
+      let current = token;
+      if (!current) {
+        const res = await api("/api/browser-push/token");
+        current = res.token || "";
+        setToken(current);
+      }
+      if (navigator.clipboard) await navigator.clipboard.writeText(current);
       else {
         const field = document.createElement("textarea");
-        field.value = token;
+        field.value = current;
         field.style.position = "fixed";
         field.style.opacity = "0";
         document.body.append(field);
@@ -1300,39 +1497,228 @@ function BrowserPush() {
         }
       }
       setCopyLabel("已复制");
+      window.setTimeout(() => setCopyLabel("复制 Token"), 2500);
     } catch {
-      setCopyLabel("复制失败，请手动复制");
+      setCopyLabel("复制失败");
     }
   }
+
+  async function rotateToken() {
+    if (
+      !window.confirm(
+        "轮换后旧 Token 将立即失效（并返回 401），需同步更新 Chrome ScriptCat 脚本设置里的授权 Token。确认轮换吗？",
+      )
+    ) {
+      return;
+    }
+    const res = act
+      ? await act("/api/browser-push/token/rotate", {})
+      : await api("/api/browser-push/token/rotate", {});
+    if (res?.token) {
+      setToken(res.token);
+      setRevealed(true);
+    }
+  }
+
   return (
-    <Panel title="小红书浏览器推送">
-      <p className="panel-description">
-        油猴脚本使用 /api/xhs/links。点赞与收藏支持分别保存截止作品（不含截止作品），
-        单个作品发送到独立目录，可在小红书「归档与命名」中设置。
-        启用控制台密码后，在脚本设置中填写推送授权。
-      </p>
-      <div className="oauth-row">
-        {token ? (
-          <>
-            <input
-              aria-label="浏览器推送授权"
-              type="password"
-              readOnly
-              value={token}
-            />
-            <button onClick={copyToken}>{copyLabel}</button>
-          </>
-        ) : (
-          <button
-            onClick={async () =>
-              setToken((await api("/api/browser-push/token")).token)
-            }
-          >
-            显示推送授权
+    <Panel
+      title="Chrome 脚本推送授权 (X-NAS-Submit-Token)"
+      extra={
+        <div className="button-group">
+          <button onClick={() => (revealed ? setRevealed(false) : revealOrLoad())}>
+            {revealed ? <EyeOff size={15} /> : <Eye size={15} />}
+            {revealed ? "隐藏" : "显示 Token"}
           </button>
-        )}
-      </div>
+          <button onClick={copyToken}>
+            <Copy size={15} />
+            {copyLabel}
+          </button>
+          {!compact && (
+            <button onClick={rotateToken}>
+              <KeyRound size={15} />
+              轮换 Token
+            </button>
+          )}
+        </div>
+      }
+    >
+      <p className="panel-description">
+        无论管理页是否开启密码，浏览器推送接口均强制校验{" "}
+        <code>X-NAS-Submit-Token</code>。请在 Chrome 的「X 浏览器直推工作台」与「小红书 NAS 下载工作台」填写同一份 Token。
+      </p>
+      {token && (
+        <div className="oauth-row">
+          <input
+            aria-label="浏览器推送授权 Token"
+            type={revealed ? "text" : "password"}
+            readOnly
+            value={token}
+          />
+          <button onClick={copyToken}>{copyLabel}</button>
+        </div>
+      )}
+      {!compact && (
+        <div className="endpoint-grid">
+          <div className="endpoint-chip">
+            <strong>X 直推接口（Quote 方案 A）</strong>
+            <code>POST /api/x/direct</code>
+          </div>
+          <div className="endpoint-chip">
+            <strong>小红书增量接口</strong>
+            <code>POST /api/xhs/links</code>
+          </div>
+          <div className="endpoint-chip">
+            <strong>心跳与异常上报</strong>
+            <code>POST /api/browser-push/report</code>
+          </div>
+        </div>
+      )}
     </Panel>
+  );
+}
+function BrowserPush() {
+  return <PushTokenCard compact />;
+}
+function BrowserPushCenter({
+  initial,
+  act,
+  open,
+}: {
+  initial: string;
+  act: Act;
+  open: Open;
+}) {
+  const [platform, setPlatform] = useState(
+    initial === "x" || initial === "xhs" ? initial : "",
+  );
+  const [page, setPage] = useState(1);
+  const query = `/api/browser-push/status?page=${page}&limit=20${
+    platform ? `&platform=${encodeURIComponent(platform)}` : ""
+  }`;
+  const { value: data, error } = useData(query, 5000);
+  const summary = data?.summary || {};
+  const history = data?.history || { items: [], total: 0, limit: 20 };
+
+  return (
+    <>
+      <div className="page-title">
+        <div>
+          <h1>浏览器推送监控</h1>
+          <p>
+            实时查看 Chrome ScriptCat 向 NAS 上报的每次推送、每日例行无新增检查、401 授权错误及下游任务执行情况。
+          </p>
+        </div>
+        <button onClick={refresh}>
+          <RefreshCw size={15} />
+          立即刷新
+        </button>
+      </div>
+      {error && <div className="notice warning">{error}</div>}
+      <div className="push-summary-grid">
+        <PushPlatformCard platform="x" summary={summary.x} open={open} />
+        <PushPlatformCard platform="xhs" summary={summary.xhs} open={open} />
+      </div>
+      <PushTokenCard act={act} />
+      <Panel
+        title="Chrome → NAS 推送历史流水"
+        extra={
+          <div className="filter-pills">
+            {[
+              ["", "全部平台"],
+              ["x", "仅看 X"],
+              ["xhs", "仅看小红书"],
+            ].map(([val, label]) => (
+              <button
+                key={val || "all"}
+                className={platform === val ? "active" : ""}
+                onClick={() => {
+                  setPlatform(val);
+                  setPage(1);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        }
+      >
+        {!data ? (
+          <div className="loading">正在读取浏览器推送记录…</div>
+        ) : history.items.length ? (
+          <div className="push-history-list">
+            {history.items.map((row: any) => (
+              <div className="push-history-row" key={row.id}>
+                <Mark platform={row.platform} />
+                <div className="push-history-main">
+                  <div className="push-history-top">
+                    <strong>{names[row.platform] || row.platform}</strong>
+                    <span className="chip">
+                      {pushSourceNames[row.source_mode] || row.source_mode}
+                    </span>
+                    <PushBadge status={row.status} />
+                    {row.account && (
+                      <span className="muted-text">账号 {row.account}</span>
+                    )}
+                    <span className="muted-text push-time">
+                      {stamp(row.created)}
+                      {row.client_ip ? ` · ${row.client_ip}` : ""}
+                    </span>
+                  </div>
+                  <div className="push-history-detail">
+                    <span>
+                      发现 {row.discovered || 0} · 提交 {row.submitted || 0} · 新入队{" "}
+                      {row.accepted || 0} · 重复跳过 {row.skipped || 0}
+                      {row.unresolvable ? ` · 无直链 ${row.unresolvable}` : ""}
+                    </span>
+                    {row.message && (
+                      <span
+                        className={
+                          row.status === "error" || row.status === "auth_error"
+                            ? "text-danger"
+                            : "muted-text"
+                        }
+                      >
+                        {row.message}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="push-history-actions">
+                  {row.task_id ? (
+                    <button
+                      onClick={() =>
+                        open("task", {
+                          id: row.task_id,
+                          platform: row.platform,
+                          kind: row.platform === "x" ? "direct" : "links",
+                          state: row.task_state || "queued",
+                        })
+                      }
+                    >
+                      <Badge state={row.task_state || "queued"} />
+                      <span>查看下载任务</span>
+                    </button>
+                  ) : (
+                    <span className="muted-text">无下游任务</span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Empty
+            title="暂无浏览器推送流水"
+            text="在 Chrome 触发一次同步、测试连接，或等待每日定时执行后即可在此查看。"
+          />
+        )}
+        <Pager
+          page={page}
+          total={history.total}
+          limit={history.limit || 20}
+          onPage={setPage}
+        />
+      </Panel>
+    </>
   );
 }
 function Notifications({ act }: { act: Act }) {
@@ -1356,7 +1742,15 @@ function Notifications({ act }: { act: Act }) {
     </div>
   </Panel>;
 }
-function Settings({ initial, act }: { initial: string; act: Act }) {
+function Settings({
+  initial,
+  act,
+  go,
+}: {
+  initial: string;
+  act: Act;
+  go: (s: string) => void;
+}) {
   const [tab, setTab] = useState(initial || "telegram");
   const prefs = useData("/api/settings", 30000);
   const config = useData(
@@ -1364,13 +1758,19 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
     30000,
   );
   const [draft, setDraft] = useState<Record<string, any>>({}),
+    [savedDraftJson, setSavedDraftJson] = useState(""),
     [preferences, setPreferences] = useState<any>(null),
+    [savedPrefsJson, setSavedPrefsJson] = useState(""),
     [credential, setCredential] = useState(""),
     [password, setPassword] = useState(""),
     [callback, setCallback] = useState(""),
     [testUrl, setTestUrl] = useState("");
   useEffect(() => {
-    if (prefs.value) setPreferences(structuredClone(prefs.value));
+    if (prefs.value) {
+      const cloned = structuredClone(prefs.value);
+      setPreferences(cloned);
+      setSavedPrefsJson(JSON.stringify(cloned));
+    }
   }, [JSON.stringify(prefs.value)]);
   useEffect(() => {
     setCredential("");
@@ -1385,12 +1785,29 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
               (s.type === "boolean" ? false : s.type === "list" ? [] : "");
         });
       setDraft(fields);
+      setSavedDraftJson(JSON.stringify(fields));
     }
   }, [JSON.stringify(config.value?.fields), tab]);
   const fieldChange = (key: string, v: any) =>
     setDraft((d) => ({ ...d, [key]: v }));
   const prefChange = (key: string, v: any) =>
     setPreferences((p: any) => ({ ...p, [key]: v }));
+  const dirty = Boolean(
+    credential ||
+      password ||
+      (preferences &&
+        savedPrefsJson &&
+        JSON.stringify(preferences) !== savedPrefsJson) ||
+      (config.value &&
+        savedDraftJson &&
+        JSON.stringify(draft) !== savedDraftJson),
+  );
+  function resetChanges() {
+    if (savedPrefsJson) setPreferences(JSON.parse(savedPrefsJson));
+    if (savedDraftJson) setDraft(JSON.parse(savedDraftJson));
+    setCredential("");
+    setPassword("");
+  }
   async function save() {
     if (tab === "general") {
       const result = await act(
@@ -1398,7 +1815,10 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
         { ...preferences, password },
         "PATCH",
       );
-      if (result) setPassword("");
+      if (result) {
+        setPassword("");
+        setSavedPrefsJson(JSON.stringify(preferences));
+      }
       return;
     }
     const values = Object.fromEntries(
@@ -1428,6 +1848,8 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
       "PATCH",
     );
     setCredential("");
+    setSavedPrefsJson(JSON.stringify(preferences));
+    setSavedDraftJson(JSON.stringify(draft));
   }
   const known = new Set(
     Object.values(definitions[tab] || {})
@@ -1453,16 +1875,27 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
       <div className="page-title">
         <div>
           <h1>平台与设置</h1>
-          <p>账号、下载行为和归档策略都在这里管理。</p>
+          <p>账号、下载行为、浏览器直推和归档策略都在这里管理。</p>
         </div>
-        <button
-          className="primary"
-          onClick={save}
-          disabled={!preferences || !config.value}
-        >
-          <Check size={16} />
-          保存设置
-        </button>
+        <div className="button-group">
+          <span className={`dirty-pill ${dirty ? "dirty" : ""}`}>
+            {dirty ? "有未保存修改" : "设置已同步"}
+          </span>
+          {dirty && (
+            <button onClick={resetChanges}>
+              <RotateCcw size={15} />
+              还原
+            </button>
+          )}
+          <button
+            className="primary"
+            onClick={save}
+            disabled={!preferences || !config.value}
+          >
+            <Check size={16} />
+            保存设置
+          </button>
+        </div>
       </div>
       <div className="settings-layout">
         <aside className="settings-nav">
@@ -1564,6 +1997,25 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
             </>
           ) : preferences && config.value && names[tab] ? (
             <>
+              {(tab === "x" || tab === "xhs") && (
+                <div className="callout-banner">
+                  <Radio size={18} />
+                  <div>
+                    <strong>
+                      {tab === "x"
+                        ? "当前主推：Chrome ScriptCat 浏览器直推（Quote 方案 A + 每日一次）"
+                        : "当前主推：Chrome ScriptCat 浏览器增量直推（点赞 / 收藏）"}
+                    </strong>
+                    <p>
+                      无需导出 Cookie 到 NAS。浏览器捕获真实媒体与作品链接后直推入库，NAS
+                      后台无感下载。
+                    </p>
+                  </div>
+                  <button onClick={() => go(`push:${tab}`)}>
+                    查看推送状态与 Token <ArrowRight size={14} />
+                  </button>
+                </div>
+              )}
               <Panel title={names[tab] + " · 处理方式"}>
                 <Switch
                   label="通过工作区处理新媒体"
@@ -1596,7 +2048,11 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                 {preferences.schedule[tab] && (
                   <>
                     <Switch
-                      label="定时增量同步"
+                      label={
+                        tab === "x"
+                          ? "旧版 NAS 定时抓取（Cookie 直推模式建议关闭）"
+                          : "定时增量同步"
+                      }
                       checked={preferences.schedule[tab].enabled}
                       onChange={(v) =>
                         prefChange("schedule", {
@@ -1622,101 +2078,127 @@ function Settings({ initial, act }: { initial: string; act: Act }) {
                   </>
                 )}
               </Panel>
-              {tab !== "telegram" && (
-                <Panel title="账号凭证">
-                  <div className="credential-status">
-                    <ShieldCheck size={17} />
-                    {config.value.credential_set
-                      ? "已保存凭证"
-                      : "尚未保存凭证"}
-                  </div>
-                  <label className="field">
-                    <span>{tab === "pixiv" ? "Refresh Token" : "Cookie"}</span>
-                    <textarea
-                      rows={3}
-                      spellCheck={false}
-                      value={credential}
-                      onChange={(e) => setCredential(e.target.value)}
-                      placeholder="留空保留现有凭证；已保存的内容不会回显"
-                    />
-                    <small>
-                      {tab === "pixiv"
-                        ? "可粘贴已有 Refresh Token，也可使用下方登录流程。"
-                        : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
-                    </small>
-                  </label>
-                  <div className="button-group">
-                    {tab === "pixiv" && (
-                      <button
-                        onClick={() =>
-                          act("/api/tasks", {
-                            platform: "pixiv",
-                            kind: "oauth-start",
-                          })
-                        }
-                      >
-                        生成 Pixiv 登录链接
-                      </button>
-                    )}
-                    {["pixiv", "douyin"].includes(tab) && (
-                      <button
-                        onClick={() =>
-                          act("/api/tasks", { platform: tab, kind: "test" })
-                        }
-                      >
-                        测试连接
-                      </button>
-                    )}
-                  </div>
-                  {tab === "x" && (
-                    <div className="oauth-row">
-                      <input
-                        aria-label="X 测试推文链接"
-                        placeholder="填写一条可访问的推文链接"
-                        value={testUrl}
-                        onChange={(e) => setTestUrl(e.target.value)}
-                      />
-                      <button
-                        disabled={!testUrl}
-                        onClick={() =>
-                          act("/api/tasks", {
-                            platform: "x",
-                            kind: "test",
-                            payload: { url: testUrl },
-                          })
-                        }
-                      >
-                        测试 Cookie
-                      </button>
+              {tab !== "telegram" &&
+                (tab === "x" || tab === "xhs" ? (
+                  <details className="legacy-collapse">
+                    <summary>
+                      备用 / 历史方式：账号 Cookie 凭证（使用 Chrome 直推时无需配置）
+                    </summary>
+                    <Panel title="备用 Cookie 凭证">
+                      <div className="credential-status">
+                        <ShieldCheck size={17} />
+                        {config.value.credential_set
+                          ? "已保存备用凭证"
+                          : "未保存 Cookie（正常 · 直推模式下无需配置）"}
+                      </div>
+                      <label className="field">
+                        <span>Cookie</span>
+                        <textarea
+                          rows={3}
+                          spellCheck={false}
+                          value={credential}
+                          onChange={(e) => setCredential(e.target.value)}
+                          placeholder="仅排查旧链路时填写；留空保持不变"
+                        />
+                        <small>支持浏览器导出的 Cookie；保存后仅用于兼容回退。</small>
+                      </label>
+                      {tab === "x" && (
+                        <div className="oauth-row">
+                          <input
+                            aria-label="X 测试推文链接"
+                            placeholder="填写一条可访问的推文链接"
+                            value={testUrl}
+                            onChange={(e) => setTestUrl(e.target.value)}
+                          />
+                          <button
+                            disabled={!testUrl}
+                            onClick={() =>
+                              act("/api/tasks", {
+                                platform: "x",
+                                kind: "test",
+                                payload: { url: testUrl },
+                              })
+                            }
+                          >
+                            测试 Cookie
+                          </button>
+                        </div>
+                      )}
+                    </Panel>
+                  </details>
+                ) : (
+                  <Panel title="账号凭证">
+                    <div className="credential-status">
+                      <ShieldCheck size={17} />
+                      {config.value.credential_set
+                        ? "已保存凭证"
+                        : "尚未保存凭证"}
                     </div>
-                  )}
-                  {tab === "pixiv" && (
-                    <div className="oauth-row">
-                      <input
-                        aria-label="Pixiv 授权回调"
-                        placeholder="粘贴登录后的 callback URL 或 code"
-                        value={callback}
-                        onChange={(e) => setCallback(e.target.value)}
+                    <label className="field">
+                      <span>{tab === "pixiv" ? "Refresh Token" : "Cookie"}</span>
+                      <textarea
+                        rows={3}
+                        spellCheck={false}
+                        value={credential}
+                        onChange={(e) => setCredential(e.target.value)}
+                        placeholder="留空保留现有凭证；已保存的内容不会回显"
                       />
-                      <button
-                        disabled={!callback}
-                        onClick={() =>
-                          act("/api/tasks", {
-                            platform: tab,
-                            kind: "oauth-finish",
-                            payload: { callback },
-                          })
-                        }
-                      >
-                        完成授权
-                      </button>
                       <small>
-                        生成后的登录链接在下载页的授权任务详情里查看。
+                        {tab === "pixiv"
+                          ? "可粘贴已有 Refresh Token，也可使用下方登录流程。"
+                          : "支持浏览器导出的 Cookie；保存后用于下一次任务。"}
                       </small>
+                    </label>
+                    <div className="button-group">
+                      {tab === "pixiv" && (
+                        <button
+                          onClick={() =>
+                            act("/api/tasks", {
+                              platform: "pixiv",
+                              kind: "oauth-start",
+                            })
+                          }
+                        >
+                          生成 Pixiv 登录链接
+                        </button>
+                      )}
+                      {["pixiv", "douyin"].includes(tab) && (
+                        <button
+                          onClick={() =>
+                            act("/api/tasks", { platform: tab, kind: "test" })
+                          }
+                        >
+                          测试连接
+                        </button>
+                      )}
                     </div>
-                  )}
-                </Panel>
-              )}
+                    {tab === "pixiv" && (
+                      <div className="oauth-row">
+                        <input
+                          aria-label="Pixiv 授权回调"
+                          placeholder="粘贴登录后的 callback URL 或 code"
+                          value={callback}
+                          onChange={(e) => setCallback(e.target.value)}
+                        />
+                        <button
+                          disabled={!callback}
+                          onClick={() =>
+                            act("/api/tasks", {
+                              platform: tab,
+                              kind: "oauth-finish",
+                              payload: { callback },
+                            })
+                          }
+                        >
+                          完成授权
+                        </button>
+                        <small>
+                          生成后的登录链接在下载页的授权任务详情里查看。
+                        </small>
+                      </div>
+                    )}
+                  </Panel>
+                ))}
               {tab === "douyin" && (
                 <Panel title="同步来源">
                   <p className="panel-description">
@@ -2181,6 +2663,16 @@ function App() {
     [add, setAdd] = useState(false),
     [busy, setBusy] = useState(0);
   const [active, parameter] = route.split(":");
+  const overviewBadge = useData(
+    auth?.authenticated ? "/api/overview" : null,
+    15000,
+  );
+  const pushErrorCount =
+    Number(overviewBadge.value?.browser_push?.x?.today_error_count || 0) +
+    Number(overviewBadge.value?.browser_push?.xhs?.today_error_count || 0);
+  const taskAlertCount =
+    Number(overviewBadge.value?.counts?.tasks?.failed || 0) +
+    Number(overviewBadge.value?.counts?.assets?.failed || 0);
   function go(next: string) {
     location.hash = next;
     setMenu(false);
@@ -2278,16 +2770,25 @@ function App() {
           </span>
         </a>
         <nav>
-          {nav.map(([key, label, Icon]) => (
-            <button
-              className={active === key ? "active" : ""}
-              key={key}
-              onClick={() => go(key)}
-            >
-              <Icon size={19} />
-              {label}
-            </button>
-          ))}
+          {nav.map(([key, label, Icon]) => {
+            const count =
+              key === "push"
+                ? pushErrorCount
+                : key === "errors"
+                  ? taskAlertCount
+                  : 0;
+            return (
+              <button
+                className={active === key ? "active" : ""}
+                key={key}
+                onClick={() => go(key)}
+              >
+                <Icon size={19} />
+                <span className="nav-label">{label}</span>
+                {count > 0 && <span className="nav-badge">{count}</span>}
+              </button>
+            );
+          })}
         </nav>
         <div className="sidebar-bottom">
           <span>
@@ -2344,6 +2845,13 @@ function App() {
         <main>
           {active === "home" ? (
             <Home {...{ act, go, open }} />
+          ) : active === "push" ? (
+            <BrowserPushCenter
+              key={route}
+              initial={parameter}
+              act={act}
+              open={open}
+            />
           ) : active === "downloads" ? (
             <Downloads
               key={route}
@@ -2358,7 +2866,7 @@ function App() {
           ) : active === "errors" ? (
             <Errors act={act} />
           ) : active === "settings" ? (
-            <Settings key={route} initial={parameter} act={act} />
+            <Settings key={route} initial={parameter} act={act} go={go} />
           ) : active === "logs" ? (
             <Logs />
           ) : (

@@ -784,21 +784,25 @@ def test_upstream_date_versions_ignore_zero_padding(monkeypatch):
 
 def test_xhs_browser_destination_is_durable_and_backward_compatible(client):
     url = "https://www.xiaohongshu.com/explore/1234567890abcdef12345678?xsec_token=test"
-    batch = client.post('/api/xhs/links', json={'urls': [url]}).json()
-    single = client.post('/api/xhs/links', json={'urls': [url], 'destination': 'single'}).json()
+    # Even when web auth_enabled is False, browser media intake requires X-NAS-Submit-Token.
+    assert client.post('/api/xhs/links', json={'urls': [url]}).status_code == 401
+    token = client.get('/api/browser-push/token').json()['token']
+    headers = {'X-NAS-Submit-Token': token, 'Origin': 'https://www.xiaohongshu.com'}
+    batch = client.post('/api/xhs/links', headers=headers, json={'urls': [url]}).json()
+    single = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'destination': 'single'}).json()
     assert batch['ok'] and single['ok'] and batch['task_id'] != single['task_id']
     for reply, destination in [(batch, 'batch'), (single, 'single')]:
         detail = client.get('/api/detail/tasks/' + reply['task_id']).json()
         assert detail['payload']['destination'] == destination
         assert detail['payload']['urls'] == [url]
-    duplicate = client.post('/api/xhs/links', json={'urls': [url], 'destination': 'single'}).json()
+    duplicate = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'destination': 'single'}).json()
     assert duplicate['skipped'] == 1 and duplicate['accepted'] == 0
     for data in [
         {'urls': [url], 'destination': '../escape'},
         {'urls': [url, url + '&other=1'], 'destination': 'single'},
         {'urls': ['https://example.com/file'], 'destination': 'single'},
     ]:
-        assert client.post('/api/xhs/links', json=data).status_code == 422
+        assert client.post('/api/xhs/links', headers=headers, json=data).status_code == 422
 
 
 def test_xhs_archive_paths():

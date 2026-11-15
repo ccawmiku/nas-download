@@ -11,7 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-from core.config import CONFIG_PATHS, read_json, write_json
+from core.config import CONFIG_PATHS, read_json, sanitize, write_json
+from core.x_direct import download_direct_item
 from core.x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS, terminal as x_terminal
 from .client import Client, prepare, record, submit
 from .stopping import KnownRun, lookup, completed, legacy_completed, threshold, summary
@@ -304,6 +305,102 @@ async def x_collect(mod, config, old_store, checkpoint, log, process_batch):
             await page.wait_for_timeout(random.randint(1800, 3000))
 
 
+def _x_direct_record_meta(entry, previous_meta=None):
+    prev = previous_meta if isinstance(previous_meta, dict) else {}
+    return {
+        "url": entry.get("url") or prev.get("url", ""),
+        "author": entry.get("author") or prev.get("author", ""),
+        "title": entry.get("title") or prev.get("title", ""),
+        "source_mode": "direct",
+        "owner_role": entry.get("owner_role") or prev.get("owner_role", "direct"),
+        "quoted_from": entry.get("quoted_from") or prev.get("quoted_from", ""),
+        "direct_media": list(entry.get("media") or prev.get("direct_media") or []),
+    }
+
+
+def _execute_x_direct_item(entry, config, old_store, staging, final, log, *, force=False, previous_rec=None):
+    tweet_id = str(entry["tweet_id"])
+    old_store.upsert_seen(
+        {
+            "tweet_id": tweet_id,
+            "author": entry.get("author", ""),
+            "url": entry.get("url", f"https://x.com/i/web/status/{tweet_id}"),
+            "text": entry.get("title", ""),
+        }
+    )
+    val = previous_rec
+    if val is None:
+        try:
+            val = Client().request(f"/internal/record/x/{tweet_id}")
+        except Exception:
+            val = None
+    prev_meta = (val or {}).get("metadata") or {}
+    if not force:
+        if val and val.get("state") in {"complete", "processing"}:
+            if val.get("state") == "processing":
+                return "skipped", 0
+            redownload_missing = bool(config.get("redownload_missing_files"))
+            files = val.get("files") or []
+            if not redownload_missing or (files and all(Path(p).is_file() for p in files)):
+                return "skipped", 0
+        elif not val and legacy_completed("x", old_store, tweet_id):
+            return "skipped", 0
+        if val and val.get("state") == "failed" and x_terminal(prev_meta):
+            return "skipped", 0
+
+    download_root = Path(staging or final)
+    status, files, error = download_direct_item(entry, download_root, config, log)
+    metadata = _x_direct_record_meta(entry, prev_meta)
+    if status == "done":
+        delivered = process_files("x", tweet_id, files, staging, final, metadata)
+        old_store.mark_result(tweet_id, "done", delivered, "")
+        return "downloaded", len(delivered)
+
+    attempts = int(prev_meta.get("attempts", 0) or 0) + 1
+    metadata.update(
+        {
+            "error": sanitize(error or "CDN 直链下载失败"),
+            "download_incomplete": True,
+            "attempts": attempts,
+            "retry_exhausted": bool(
+                entry.get("unresolvable_reason") or attempts >= X_MAX_ATTEMPTS
+            ),
+            "direct_unresolvable": bool(entry.get("unresolvable_reason")),
+        }
+    )
+    delivered = []
+    if files:
+        delivered = process_files("x", tweet_id, files, staging, final, metadata)
+    record("x", tweet_id, "failed", delivered, metadata)
+    old_store.mark_result(tweet_id, "failed", delivered, metadata["error"])
+    return "failed", 0
+
+
+def x_direct_job(job, config, old_store, staging, final, log):
+    stats = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+    items = job["payload"].get("items", [])
+    existing_map = lookup("x", [str(item.get("tweet_id", "")) for item in items]) if items else {}
+    delay = max(0.0, float(config.get("request_delay_seconds", 0.5) or 0.5))
+    for idx, entry in enumerate(items):
+        stats["discovered"] += 1
+        outcome, _ = _execute_x_direct_item(
+            entry,
+            config,
+            old_store,
+            staging,
+            final,
+            log,
+            force=bool(job["payload"].get("force")),
+            previous_rec=existing_map.get(str(entry.get("tweet_id", ""))),
+        )
+        stats[outcome] += 1
+        print(json.dumps(stats), flush=True)
+        if outcome != "skipped" and idx + 1 < len(items) and delay > 0:
+            time.sleep(min(delay, 3.0))
+    stats["stop_reason"] = "manual"
+    return stats
+
+
 def x_job(job):
     mod = module("x")
     config = mod.load_config(CONFIG_PATHS["x"])
@@ -313,6 +410,8 @@ def x_job(job):
     log = Log()
     old_store = mod.Store(Path(config["database"]), log)
     client = Client()
+    if job["kind"] == "direct":
+        return x_direct_job(job, config, old_store, staging, final, log)
     checkpoint = client.request("/internal/checkpoint/x/likes")["head"]
     if job["kind"] == "test":
         app = mod.App(CONFIG_PATHS["x"])
@@ -371,14 +470,47 @@ def x_job(job):
             if head:
                 client.request("/internal/checkpoint/x/likes", {"head": head})
         else:
-            collector = mod.BrowserCollector(config, log, old_store)
+            collector = None
             for url in job["payload"].get("urls", []):
                 item = mod.item_from_url(url)
                 old_store.upsert_seen(item)
                 manual = job['kind'] == 'retry' and not job['payload'].get('automatic')
+                rec = None
+                try:
+                    rec = client.request(f"/internal/record/x/{item['tweet_id']}")
+                except Exception:
+                    rec = None
+                rec_meta = (rec or {}).get("metadata") or {}
+                if rec_meta.get("source_mode") == "direct" or rec_meta.get("direct_media"):
+                    stats["discovered"] += 1
+                    direct_entry = {
+                        "tweet_id": str(item["tweet_id"]),
+                        "author": rec_meta.get("author", item.get("author", "")),
+                        "url": rec_meta.get("url", url),
+                        "title": rec_meta.get("title", ""),
+                        "owner_role": rec_meta.get("owner_role", "direct"),
+                        "quoted_from": rec_meta.get("quoted_from", ""),
+                        "media": list(rec_meta.get("direct_media") or []),
+                        "unresolvable_reason": "missing_direct_media" if not rec_meta.get("direct_media") else "",
+                    }
+                    outcome, _ = _execute_x_direct_item(
+                        direct_entry,
+                        config,
+                        old_store,
+                        staging,
+                        final,
+                        log,
+                        force=manual,
+                        previous_rec=rec,
+                    )
+                    stats[outcome] += 1
+                    print(json.dumps(stats), flush=True)
+                    continue
                 if not manual and not old_store.should_download(item['tweet_id'], True, X_MAX_ATTEMPTS, False):
                     continue
                 try:
+                    if collector is None:
+                        collector = mod.BrowserCollector(config, log, old_store)
                     item = asyncio.run(collector.collect_single(url))
                 except Exception as error:
                     # A single inaccessible page must not abort the remaining URLs.
