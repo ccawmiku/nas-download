@@ -7,12 +7,19 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-import requests
-
 from .config import sanitize
+
+if TYPE_CHECKING:
+    import requests
+
+
+def _new_session() -> requests.Session:
+    import requests as _requests
+
+    return _requests.Session()
 
 ALLOWED_MEDIA_HOSTS = frozenset({"pbs.twimg.com", "video.twimg.com"})
 ALLOWED_TWEET_HOSTS = frozenset(
@@ -193,7 +200,7 @@ def download_cdn_file(
     target_dir: Path,
     stem: str,
     *,
-    session: requests.Session | None = None,
+    session: Any = None,
     max_bytes: int = MAX_MEDIA_BYTES,
     timeout: tuple[int, int] = DOWNLOAD_TIMEOUT,
     user_agent: str = "",
@@ -201,7 +208,7 @@ def download_cdn_file(
     validate_media_url(url, media_type)
     headers = {"User-Agent": user_agent} if user_agent else {}
     own_session = session is None
-    client = session or requests.Session()
+    client = session or _new_session()
     tmp_path: Path | None = None
     try:
         with client.get(
@@ -294,7 +301,7 @@ def download_direct_item(
     config: dict[str, Any],
     log: Any = None,
     *,
-    session: requests.Session | None = None,
+    session: Any = None,
     max_bytes: int = MAX_MEDIA_BYTES,
 ) -> tuple[str, list[str], str]:
     tweet_id = str(entry["tweet_id"])
@@ -316,7 +323,7 @@ def download_direct_item(
     convert_gif = bool(config.get("media", {}).get("convert_gif", True))
     user_agent = str(config.get("default_user_agent") or "")
     own_session = session is None
-    client = session or requests.Session()
+    client = session or _new_session()
     downloaded_files: list[str] = []
     errors: list[str] = []
 
