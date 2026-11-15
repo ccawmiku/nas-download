@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.0.0
+// @version      1.0.1
 // @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持 5 锚点增量同步、NAS Token 直推与每日后台配合
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @run-at       document-start
-// @early-start
 // @storageName  nas_prod_x_v1
 // @grant        unsafeWindow
 // @grant        GM.getValue
@@ -16,8 +15,11 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_closeInTab
+// @grant        GM.closeInTab
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        window.close
 // @connect      *
 // @noframes
 // ==/UserScript==
@@ -29,6 +31,7 @@
     CONFIG: 'nas_prod_x_config_v1',
     ANCHORS_PREFIX: 'nas:prod:x:anchors:',
     CUTOFF_PREFIX: 'nas:prod:x:cutoff:',
+    LAST_ACCOUNT: 'nas_prod_x_last_account_v1',
     DAILY_STATE: 'nas_prod_x_daily_state',
     BG_RESULT: 'nas_prod_x_bg_result',
   };
@@ -47,14 +50,49 @@
   const isLikesPagePath = (pathname) =>
     /^\/(?:i\/history\/likes|[^/]+\/likes)\/?$/.test(String(pathname || ''));
 
-  const resolveLikesAccount = (pathname, fallbackHandle = '') => {
+  const cleanAccountHandle = (value) => {
+    const normalized = String(value || '').replace(/^@/, '').trim();
+    if (!normalized || normalized === 'i_history_likes' || normalized === 'default') return '';
+    return normalized;
+  };
+
+  const resolveLikesAccount = (pathname, fallbackHandle = '', cachedHandle = '') => {
     const p = String(pathname || '');
+    const resolved = cleanAccountHandle(fallbackHandle) || cleanAccountHandle(cachedHandle);
     if (/^\/i\/history\/likes\/?$/.test(p)) {
-      return String(fallbackHandle || 'i_history_likes');
+      return resolved || 'i_history_likes';
     }
     const m = p.match(/^\/([^/]+)\/likes\/?$/);
     if (m && m[1] !== 'i') return m[1];
-    return String(fallbackHandle || 'default');
+    return resolved || 'default';
+  };
+
+  const extractInitialStateHandle = (state) => {
+    try {
+      const uid = state?.session?.user_id;
+      const userObj = uid ? state?.entities?.users?.entities?.[uid] : null;
+      return cleanAccountHandle(userObj?.screen_name || '');
+    } catch {
+      return '';
+    }
+  };
+
+  const parseBgHash = (rawHash) => {
+    const src =
+      rawHash !== undefined
+        ? rawHash
+        : typeof location !== 'undefined'
+          ? location.hash
+          : '';
+    const h = String(src || '').replace(/^#/, '');
+    if (!h) return null;
+    const params = new URLSearchParams(h);
+    const runId = params.get('nas_bg_run');
+    if (!runId) return null;
+    return {
+      runId,
+      ignoreLock: params.get('nas_bg_ignore_lock') === '1',
+    };
   };
 
   const tweetIdFromUrl = (raw) =>
@@ -460,13 +498,116 @@
     return url.href;
   };
 
+  const installBgVisibilityBypass = (win) => {
+    if (!win || !win.document) return false;
+    const doc = win.document;
+    const defineVisibleProp = (target, prop, getter) => {
+      try {
+        Object.defineProperty(target, prop, {
+          configurable: true,
+          get: getter,
+        });
+      } catch {}
+    };
+    const docProto = win.Document?.prototype;
+    for (const target of [docProto, doc].filter(Boolean)) {
+      defineVisibleProp(target, 'hidden', () => false);
+      defineVisibleProp(target, 'webkitHidden', () => false);
+      defineVisibleProp(target, 'visibilityState', () => 'visible');
+      defineVisibleProp(target, 'webkitVisibilityState', () => 'visible');
+    }
+    try {
+      if (docProto) {
+        Object.defineProperty(docProto, 'hasFocus', {
+          configurable: true,
+          writable: true,
+          value: () => true,
+        });
+      }
+      doc.hasFocus = () => true;
+    } catch {}
+
+    const BLOCKED_VISIBILITY_EVENTS = new Set(['visibilitychange', 'webkitvisibilitychange']);
+    for (const target of [doc, win]) {
+      if (!target?.addEventListener) continue;
+      const rawAdd = target.addEventListener.bind(target);
+      try {
+        target.addEventListener = function (type, listener, options) {
+          if (BLOCKED_VISIBILITY_EVENTS.has(String(type))) return undefined;
+          return rawAdd(type, listener, options);
+        };
+      } catch {}
+      try {
+        rawAdd('visibilitychange', (ev) => ev.stopImmediatePropagation(), true);
+        rawAdd('webkitvisibilitychange', (ev) => ev.stopImmediatePropagation(), true);
+      } catch {}
+    }
+
+    const rawRaf = typeof win.requestAnimationFrame === 'function' ? win.requestAnimationFrame.bind(win) : null;
+    const rawCancelRaf =
+      typeof win.cancelAnimationFrame === 'function' ? win.cancelAnimationFrame.bind(win) : null;
+    const activeFrames = new Map();
+    let seq = 1;
+    try {
+      win.requestAnimationFrame = (cb) => {
+        if (typeof cb !== 'function') return 0;
+        const id = seq++;
+        let done = false;
+        const state = { rawId: 0, timerId: 0 };
+        activeFrames.set(id, state);
+        const fire = (ts) => {
+          if (done) return;
+          done = true;
+          activeFrames.delete(id);
+          if (state.timerId) clearTimeout(state.timerId);
+          if (state.rawId && rawCancelRaf) {
+            try { rawCancelRaf(state.rawId); } catch {}
+          }
+          const stamp =
+            typeof ts === 'number' && Number.isFinite(ts)
+              ? ts
+              : typeof performance !== 'undefined'
+                ? performance.now()
+                : Date.now();
+          cb(stamp);
+        };
+        if (rawRaf) {
+          try {
+            state.rawId = rawRaf(fire);
+          } catch {}
+        }
+        state.timerId = setTimeout(() => fire(), 40);
+        return id;
+      };
+      win.cancelAnimationFrame = (id) => {
+        const state = activeFrames.get(id);
+        if (!state) {
+          if (rawCancelRaf) {
+            try { rawCancelRaf(id); } catch {}
+          }
+          return;
+        }
+        activeFrames.delete(id);
+        if (state.timerId) clearTimeout(state.timerId);
+        if (state.rawId && rawCancelRaf) {
+          try { rawCancelRaf(state.rawId); } catch {}
+        }
+      };
+    } catch {}
+    return true;
+  };
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       STORAGE_KEYS,
       isLikesGraphqlUrl,
       isTweetDetailGraphqlUrl,
       isLikesPagePath,
+      cleanAccountHandle,
       resolveLikesAccount,
+      extractInitialStateHandle,
+      parseBgHash,
+      installBgVisibilityBypass,
       tweetIdFromUrl,
       toOrigImageUrl,
       extractMediaList,
@@ -482,6 +623,11 @@
   }
 
   const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  // document-start 阶段立刻锁定后台运行标志并注入可见性/rAF 补偿，防止 X SPA 改写 hash 或后台休眠暂停渲染
+  const initialBgRun = parseBgHash();
+  if (initialBgRun) {
+    installBgVisibilityBypass(pageWin);
+  }
   const capturedMap = new Map();
   const capturedOrder = [];
   const cursors = [];
@@ -572,18 +718,6 @@
     }
   };
 
-  const parseBgHash = () => {
-    const h = String(location.hash || '').replace(/^#/, '');
-    if (!h) return null;
-    const params = new URLSearchParams(h);
-    const runId = params.get('nas_bg_run');
-    if (!runId) return null;
-    return {
-      runId,
-      ignoreLock: params.get('nas_bg_ignore_lock') === '1',
-    };
-  };
-
   const gmSetAll = async (obj) => {
     if (typeof GM.setValues === 'function') {
       await GM.setValues(obj);
@@ -592,6 +726,13 @@
     for (const [k, v] of Object.entries(obj)) {
       GM_setValue(k, v);
     }
+  };
+
+  const writeBgResult = async (payload) => {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(STORAGE_KEYS.BG_RESULT, payload);
+    } catch {}
+    await gmSetAll({ [STORAGE_KEYS.BG_RESULT]: payload });
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -640,11 +781,38 @@
   const getOrderedTweets = () =>
     capturedOrder.map((id) => capturedMap.get(id)).filter(Boolean);
 
+  const RESERVED_PATH_ROOTS = new Set(['i', 'home', 'explore', 'notifications', 'messages', 'settings', 'search']);
+
+  const readLiveAccountHandle = () => {
+    const switcher = cleanAccountHandle(
+      document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"] [dir="ltr"]')?.textContent || ''
+    );
+    if (switcher) return switcher;
+
+    const profileHref =
+      document.querySelector('[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href') || '';
+    const profileMatch = profileHref.match(/^\/([A-Za-z0-9_]{1,30})\/?$/);
+    if (profileMatch && !RESERVED_PATH_ROOTS.has(profileMatch[1].toLowerCase())) {
+      return profileMatch[1];
+    }
+
+    return extractInitialStateHandle(pageWin.__INITIAL_STATE__);
+  };
+
+  let lastCachedAccount = '';
   const accountScopeKey = () => {
-    const fallback =
-      document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"] [dir="ltr"]')?.textContent?.replace(/^@/, '').trim() ||
-      '';
-    return resolveLikesAccount(location.pathname, fallback);
+    const cached =
+      typeof GM_getValue === 'function' ? cleanAccountHandle(GM_getValue(STORAGE_KEYS.LAST_ACCOUNT, '')) : '';
+    const live = readLiveAccountHandle();
+    const resolved = resolveLikesAccount(location.pathname, live, cached);
+    const valid = cleanAccountHandle(resolved);
+    if (valid && valid !== cached && valid !== lastCachedAccount && typeof GM_setValue === 'function') {
+      lastCachedAccount = valid;
+      try {
+        GM_setValue(STORAGE_KEYS.LAST_ACCOUNT, valid);
+      } catch {}
+    }
+    return resolved;
   };
 
   const getAnchors = (acct) => {
@@ -722,6 +890,75 @@
     };
   };
 
+  const scrollPageStep = () => {
+    const stepPx = Math.max(480, Math.round((window.innerHeight || 900) * 0.9));
+    try {
+      window.scrollBy(0, stepPx);
+    } catch {}
+    try {
+      const scroller = document.scrollingElement || document.documentElement || document.body;
+      if (scroller) scroller.scrollTop += stepPx;
+    } catch {}
+    try {
+      window.dispatchEvent(new Event('scroll'));
+      document.dispatchEvent(new Event('scroll'));
+    } catch {}
+  };
+
+  const waitForBgInitialState = async (maxWaitMs = 8000) => {
+    const startAt = Date.now();
+    const deadline = startAt + maxWaitMs;
+    while (Date.now() < deadline) {
+      if (/\/i\/flow\/login|\/login/.test(location.pathname)) {
+        throw new Error('X 账号未登录或会话已失效，请在 Chrome 中重新登录 x.com');
+      }
+      const tweetsReady = getOrderedTweets().length > 0;
+      const handleReady = Boolean(readLiveAccountHandle());
+      if (tweetsReady && (handleReady || Date.now() - startAt >= 5000)) {
+        return;
+      }
+      await sleep(350);
+    }
+  };
+
+  const awaitBgResult = ({ storageKey, runId, timeoutMs, timeoutMessage }) =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      let pollTimer = null;
+      let listenerId = null;
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (pollTimer) clearInterval(pollTimer);
+        if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+          try { GM_removeValueChangeListener(listenerId); } catch {}
+        }
+      };
+
+      const finish = (err, val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
+      listenerId = GM_addValueChangeListener(storageKey, (_name, _oldVal, val) => {
+        if (val && val.runId === runId) finish(null, val);
+      });
+      pollTimer = setInterval(async () => {
+        try {
+          const cur =
+            typeof GM.getValue === 'function'
+              ? await GM.getValue(storageKey, null)
+              : GM_getValue(storageKey, null);
+          if (cur && cur.runId === runId) finish(null, cur);
+        } catch {}
+      }, 800);
+    });
+
   // 等待 DOM Ready
   const onReady = (fn) => {
     if (document.readyState !== 'loading') fn();
@@ -729,16 +966,17 @@
   };
 
   onReady(async () => {
-    const bgRun = parseBgHash();
+    const bgRun = initialBgRun || parseBgHash();
     if (bgRun) {
       const cfg = loadConfig();
       let anchorUpdated = false;
+      let acct = '';
       try {
-        await sleep(3500);
+        await waitForBgInitialState(8000);
         if (/\/i\/flow\/login|\/login/.test(location.pathname)) {
           throw new Error('X 账号未登录或会话已失效，请在 Chrome 中重新登录 x.com');
         }
-        const acct = accountScopeKey();
+        acct = accountScopeKey();
         const anchors = getAnchors(acct);
         const cutoff = getCutoff(acct);
         const maxScrolls = Math.max(1, Math.min(200, Number(cfg.maxBgScrolls || 25)));
@@ -753,7 +991,7 @@
           const hitStop = ordered.some((t) => anchorSet.has(t.id) || (cutoff && t.id === cutoff));
           if (hitStop && ordered.length > 0) break;
           const prevCount = ordered.length;
-          window.scrollBy(0, Math.round(window.innerHeight * 0.9));
+          scrollPageStep();
           await sleep(1600);
           stableTicks = getOrderedTweets().length === prevCount ? stableTicks + 1 : 0;
           if (stableTicks >= 4) break;
@@ -772,16 +1010,14 @@
             discovered: ordered.length,
             message: `后台定时检查 ${ordered.length} 条点赞推文，命中断点无新增`,
           });
-          await gmSetAll({
-            [STORAGE_KEYS.BG_RESULT]: {
-              runId: bgRun.runId,
-              platform: 'x',
-              status: 'ok',
-              reason: 'no_new_items',
-              itemCount: 0,
-              anchorUpdated: false,
-              finishedAt: new Date().toISOString(),
-            },
+          await writeBgResult({
+            runId: bgRun.runId,
+            platform: 'x',
+            status: 'ok',
+            reason: 'no_new_items',
+            itemCount: 0,
+            anchorUpdated: false,
+            finishedAt: new Date().toISOString(),
           });
           return;
         }
@@ -793,38 +1029,42 @@
           cfg,
         });
         anchorUpdated = true;
-        await gmSetAll({
-          [STORAGE_KEYS.BG_RESULT]: {
-            runId: bgRun.runId,
-            platform: 'x',
-            status: 'ok',
-            reason: 'pushed',
-            itemCount: summary.accepted,
-            submitted: summary.submitted,
-            skipped: summary.skipped,
-            anchorUpdated: true,
-            finishedAt: new Date().toISOString(),
-          },
+        await writeBgResult({
+          runId: bgRun.runId,
+          platform: 'x',
+          status: 'ok',
+          reason: 'pushed',
+          itemCount: summary.accepted,
+          submitted: summary.submitted,
+          skipped: summary.skipped,
+          anchorUpdated: true,
+          finishedAt: new Date().toISOString(),
         });
       } catch (err) {
         const msg = err?.message || String(err);
         await reportToNas(cfg, {
           source_mode: 'bg',
-          account: accountScopeKey(),
+          account: acct || accountScopeKey(),
           status: 'error',
           discovered: getOrderedTweets().length,
           message: `后台同步失败：${msg}`,
         });
-        await gmSetAll({
-          [STORAGE_KEYS.BG_RESULT]: {
-            runId: bgRun.runId,
-            platform: 'x',
-            status: 'failed',
-            reason: msg,
-            anchorUpdated,
-            finishedAt: new Date().toISOString(),
-          },
+        await writeBgResult({
+          runId: bgRun.runId,
+          platform: 'x',
+          status: 'failed',
+          reason: msg,
+          anchorUpdated,
+          finishedAt: new Date().toISOString(),
         });
+      } finally {
+        // 先留足扩展存储同步时间，再在标签页内自关兜底，避免后台标签长期残留
+        await sleep(1200);
+        try { window.onbeforeunload = null; } catch {}
+        try { pageWin.onbeforeunload = null; } catch {}
+        try {
+          if (typeof window.close === 'function') window.close();
+        } catch {}
       }
       return;
     }
@@ -1106,20 +1346,15 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       const tabUrl = `${targetUrl}#nas_bg_run=${encodeURIComponent(runId)}&nas_bg_ignore_lock=1`;
       setStatus(`正在打开后台静默标签页执行一次采集 (${runId})…`);
       let tab = null;
-      let listenerId = null;
       try {
-        const result = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => {
-            reject(new Error('后台标签页超时（120 秒）未返回回执'));
-          }, 120000);
-          listenerId = GM_addValueChangeListener(STORAGE_KEYS.BG_RESULT, (_name, _oldVal, val) => {
-            if (val && val.runId === runId) {
-              clearTimeout(timer);
-              resolve(val);
-            }
-          });
-          tab = GM_openInTab(tabUrl, { active: false, insert: true, setParent: true });
+        const resultPromise = awaitBgResult({
+          storageKey: STORAGE_KEYS.BG_RESULT,
+          runId,
+          timeoutMs: 120000,
+          timeoutMessage: '后台标签页超时（120 秒）未返回回执',
         });
+        tab = GM_openInTab(tabUrl, { active: false, insert: true, setParent: true });
+        const result = await resultPromise;
         setStatus(
           `后台运行结束：${result.status} (${result.reason || ''}) · 新增 ${result.itemCount || 0} · 锚点更新=${Boolean(result.anchorUpdated)}`,
           result.status !== 'ok'
@@ -1127,10 +1362,11 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       } catch (e) {
         setStatus(e.message || String(e), true);
       } finally {
-        if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
-          try { GM_removeValueChangeListener(listenerId); } catch {}
-        }
-        try { tab?.close?.(); } catch {}
+        const closeTabSafe = () => {
+          try { tab?.close?.(); } catch {}
+        };
+        closeTabSafe();
+        setTimeout(closeTabSafe, 500);
         busy = false;
         refreshView();
       }

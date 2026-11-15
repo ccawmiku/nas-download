@@ -165,3 +165,70 @@ test('x daily scheduler runs once per day and resets on next day', () => {
   assert.equal(xBg.shouldRunDailyBg({config: cfg, dailyState: succeeded, nowMs: day2}).run, true);
   assert.equal(xBg.shouldRunDailyBg({config: cfg, dailyState: succeeded, nowMs: day1 + 3600000, ignoreLock: true}).run, true);
 });
+
+test('resolves cached handle, parses bg hash/state, and installs background visibility/rAF bypass', async () => {
+  assert.equal(xQueue.cleanAccountHandle('@CCCW'), 'CCCW');
+  assert.equal(xQueue.cleanAccountHandle('i_history_likes'), '');
+  assert.equal(xQueue.resolveLikesAccount('/i/history/likes', '', 'CCCW'), 'CCCW');
+  assert.equal(xQueue.resolveLikesAccount('/i/history/likes', 'i_history_likes', 'CCCW'), 'CCCW');
+  assert.equal(xQueue.resolveLikesAccount('/i/history/likes', '@LiveUser', 'CCCW'), 'LiveUser');
+
+  assert.deepEqual(xQueue.parseBgHash('#nas_bg_run=x_daily_1&nas_bg_ignore_lock=1'), {
+    runId: 'x_daily_1',
+    ignoreLock: true,
+  });
+  assert.equal(xQueue.parseBgHash('#other=1'), null);
+
+  assert.equal(
+    xQueue.extractInitialStateHandle({
+      session: {user_id: 'u1'},
+      entities: {users: {entities: {u1: {screen_name: 'CCCW'}}}},
+    }),
+    'CCCW'
+  );
+
+  const registeredEvents = [];
+  let frozenRafCalled = false;
+  const mockDoc = {
+    hidden: true,
+    webkitHidden: true,
+    visibilityState: 'hidden',
+    webkitVisibilityState: 'hidden',
+    hasFocus: () => false,
+    addEventListener: (type) => registeredEvents.push(type),
+  };
+  const mockWin = {
+    document: mockDoc,
+    addEventListener: (type) => registeredEvents.push(`win:${type}`),
+    requestAnimationFrame: () => {
+      frozenRafCalled = true;
+      return 99;
+    },
+    cancelAnimationFrame: () => {},
+  };
+
+  assert.equal(xQueue.installBgVisibilityBypass(mockWin), true);
+  assert.equal(mockDoc.hidden, false);
+  assert.equal(mockDoc.visibilityState, 'visible');
+  assert.equal(mockDoc.hasFocus(), true);
+
+  registeredEvents.length = 0;
+  mockDoc.addEventListener('visibilitychange', () => {});
+  mockWin.addEventListener('webkitvisibilitychange', () => {});
+  mockDoc.addEventListener('DOMContentLoaded', () => {});
+  assert.deepEqual(registeredEvents, ['DOMContentLoaded']);
+
+  let rafFired = false;
+  await new Promise((resolve) => {
+    const cancelled = mockWin.requestAnimationFrame(() => {
+      throw new Error('cancelled rAF should not fire');
+    });
+    mockWin.cancelAnimationFrame(cancelled);
+    mockWin.requestAnimationFrame((ts) => {
+      rafFired = Number.isFinite(ts);
+      resolve();
+    });
+  });
+  assert.equal(frozenRafCalled, true);
+  assert.equal(rafFired, true);
+});

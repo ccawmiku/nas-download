@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书 · 每日一次 NAS 后台自动采集
 // @namespace    xhs_downloader
-// @version      1.0.0
+// @version      1.0.1
 // @description  每天自动完成一次小红书点赞/收藏增量采集并提交至 NAS（当天全部完成即锁定跳过，分段完成持久化，失败限次退避）
 // @crontab      */30 * * * *
 // @storageName  nas_prod_xhs_v1
@@ -12,6 +12,8 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_closeInTab
+// @grant        GM.closeInTab
 // @grant        GM_notification
 // @noframes
 // ==/UserScript==
@@ -160,56 +162,85 @@
       } catch {}
     }
   };
+  const getValue = async (key, fallback) => {
+    if (typeof GM !== 'undefined' && typeof GM.getValue === 'function') {
+      return GM.getValue(key, fallback);
+    }
+    return GM_getValue(key, fallback);
+  };
   const setValues = async (obj) => {
     if (typeof GM !== 'undefined' && typeof GM.setValues === 'function') return GM.setValues(obj);
     for (const [k, v] of Object.entries(obj)) GM_setValue(k, v);
   };
+  const awaitBgResult = ({ storageKey, runId, timeoutMs, timeoutMessage }) =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      let pollTimer = null;
+      let listenerId = null;
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (pollTimer) clearInterval(pollTimer);
+        if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+          try { GM_removeValueChangeListener(listenerId); } catch {}
+        }
+      };
+
+      const finish = (err, val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
+      listenerId = GM_addValueChangeListener(storageKey, (_n, _o, val) => {
+        if (val && val.runId === runId) finish(null, val);
+      });
+      pollTimer = setInterval(async () => {
+        try {
+          const cur = await getValue(storageKey, null);
+          if (cur && cur.runId === runId) finish(null, cur);
+        } catch {}
+      }, 800);
+    });
 
   const runSingleMode = async (targetUrl, mode) => {
     const runId = `xhs_daily_${mode}_${Date.now()}`;
     const tabUrl = buildRunTabUrl(targetUrl, runId, mode);
     let tab = null;
-    let listenerId = null;
 
     try {
-      const result = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error(`小红书(${mode})后台采集超时 (150s)`));
-        }, TAB_TIMEOUT_MS);
-        listenerId = GM_addValueChangeListener(STORAGE_KEYS.BG_RESULT, (_n, _o, val) => {
-          if (val && val.runId === runId) {
-            clearTimeout(timer);
-            resolve(val);
-          }
-        });
-        tab = GM_openInTab(tabUrl, { active: false, insert: true });
+      const resultPromise = awaitBgResult({
+        storageKey: STORAGE_KEYS.BG_RESULT,
+        runId,
+        timeoutMs: TAB_TIMEOUT_MS,
+        timeoutMessage: `小红书(${mode})后台采集超时 (150s)`,
       });
+      tab = GM_openInTab(tabUrl, { active: false, insert: true });
+      const result = await resultPromise;
 
       if (result.status !== 'ok') {
         throw new Error(result.reason || `小红书(${mode})后台采集返回失败`);
       }
       return result;
     } finally {
-      if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+      const closeTabSafe = () => {
         try {
-          GM_removeValueChangeListener(listenerId);
+          tab?.close?.();
         } catch {}
-      }
-      try {
-        tab?.close?.();
-      } catch {}
+      };
+      closeTabSafe();
+      await sleep(300);
+      closeTabSafe();
     }
   };
 
   return (async () => {
-    const config =
-      typeof GM !== 'undefined' && typeof GM.getValue === 'function'
-        ? await GM.getValue(STORAGE_KEYS.CONFIG, {})
-        : GM_getValue(STORAGE_KEYS.CONFIG, {});
-    let dailyState =
-      typeof GM !== 'undefined' && typeof GM.getValue === 'function'
-        ? await GM.getValue(STORAGE_KEYS.DAILY_STATE, {})
-        : GM_getValue(STORAGE_KEYS.DAILY_STATE, {});
+    const config = await getValue(STORAGE_KEYS.CONFIG, {});
+    let dailyState = await getValue(STORAGE_KEYS.DAILY_STATE, {});
 
     if (!config?.token) {
       return 'skipped:no_nas_token';

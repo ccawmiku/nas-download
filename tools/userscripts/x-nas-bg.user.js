@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X · 每日一次 NAS 后台自动采集
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.0.0
+// @version      1.0.1
 // @description  每天自动执行一次 X 点赞增量直推 NAS（当天成功一次后不再重复运行，随机错峰 + 失败限次退避）
 // @crontab      */30 * * * *
 // @storageName  nas_prod_x_v1
@@ -12,6 +12,8 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_closeInTab
+// @grant        GM.closeInTab
 // @grant        GM_notification
 // @noframes
 // ==/UserScript==
@@ -107,18 +109,54 @@
       } catch {}
     }
   };
+  const getValue = async (key, fallback) => {
+    if (typeof GM !== 'undefined' && typeof GM.getValue === 'function') {
+      return GM.getValue(key, fallback);
+    }
+    return GM_getValue(key, fallback);
+  };
   const setValues = async (obj) => {
-    if (typeof GM.setValues === 'function') return GM.setValues(obj);
+    if (typeof GM !== 'undefined' && typeof GM.setValues === 'function') return GM.setValues(obj);
     for (const [k, v] of Object.entries(obj)) GM_setValue(k, v);
   };
+  const awaitBgResult = ({ storageKey, runId, timeoutMs, timeoutMessage }) =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      let pollTimer = null;
+      let listenerId = null;
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (pollTimer) clearInterval(pollTimer);
+        if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+          try { GM_removeValueChangeListener(listenerId); } catch {}
+        }
+      };
+
+      const finish = (err, val) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (err) reject(err);
+        else resolve(val);
+      };
+
+      timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
+      listenerId = GM_addValueChangeListener(storageKey, (_n, _o, val) => {
+        if (val && val.runId === runId) finish(null, val);
+      });
+      pollTimer = setInterval(async () => {
+        try {
+          const cur = await getValue(storageKey, null);
+          if (cur && cur.runId === runId) finish(null, cur);
+        } catch {}
+      }, 800);
+    });
 
   return (async () => {
-    const config = typeof GM.getValue === 'function'
-      ? await GM.getValue(STORAGE_KEYS.CONFIG, {})
-      : GM_getValue(STORAGE_KEYS.CONFIG, {});
-    const dailyState = typeof GM.getValue === 'function'
-      ? await GM.getValue(STORAGE_KEYS.DAILY_STATE, {})
-      : GM_getValue(STORAGE_KEYS.DAILY_STATE, {});
+    const config = await getValue(STORAGE_KEYS.CONFIG, {});
+    const dailyState = await getValue(STORAGE_KEYS.DAILY_STATE, {});
 
     if (!config?.token) {
       return 'skipped:no_nas_token';
@@ -134,26 +172,22 @@
     const runId = `x_daily_${Date.now()}`;
     const tabUrl = `${decision.targetUrl}#nas_bg_run=${encodeURIComponent(runId)}`;
     let tab = null;
-    let listenerId = null;
 
     try {
-      const result = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error('X 后台采集超时 (150s)'));
-        }, TAB_TIMEOUT_MS);
-        listenerId = GM_addValueChangeListener(STORAGE_KEYS.BG_RESULT, (_n, _o, val) => {
-          if (val && val.runId === runId) {
-            clearTimeout(timer);
-            resolve(val);
-          }
-        });
-        tab = GM_openInTab(tabUrl, { active: false, insert: true });
+      const resultPromise = awaitBgResult({
+        storageKey: STORAGE_KEYS.BG_RESULT,
+        runId,
+        timeoutMs: TAB_TIMEOUT_MS,
+        timeoutMessage: 'X 后台采集超时 (150s)',
       });
+      tab = GM_openInTab(tabUrl, { active: false, insert: true });
+      const result = await resultPromise;
 
+      const latestState = await getValue(STORAGE_KEYS.DAILY_STATE, dailyState);
       if (result.status === 'ok') {
         const summary = `${result.reason || 'ok'} (新增 ${result.itemCount || 0})`;
         await setValues({
-          [STORAGE_KEYS.DAILY_STATE]: markDailySuccess(dailyState, Date.now(), summary),
+          [STORAGE_KEYS.DAILY_STATE]: markDailySuccess(latestState, Date.now(), summary),
         });
         if (Number(result.itemCount || 0) > 0) {
           notify('X 今日自动同步完成', `已向 NAS 提交 ${result.itemCount} 条新推文清单。`);
@@ -163,16 +197,19 @@
       throw new Error(result.reason || 'X 后台采集返回失败');
     } catch (error) {
       const msg = error?.message || String(error);
+      const latestState = await getValue(STORAGE_KEYS.DAILY_STATE, dailyState);
       await setValues({
-        [STORAGE_KEYS.DAILY_STATE]: markDailyFailure(dailyState, Date.now(), msg),
+        [STORAGE_KEYS.DAILY_STATE]: markDailyFailure(latestState, Date.now(), msg),
       });
       notify('X 自动同步异常（未推进断点）', msg);
       return `failed:${msg}`;
     } finally {
-      if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
-        try { GM_removeValueChangeListener(listenerId); } catch {}
-      }
-      try { tab?.close?.(); } catch {}
+      const closeTabSafe = () => {
+        try { tab?.close?.(); } catch {}
+      };
+      closeTabSafe();
+      await sleep(300);
+      closeTabSafe();
     }
   })();
 })();
