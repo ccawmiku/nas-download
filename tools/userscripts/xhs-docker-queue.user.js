@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.2.2
-// @description  点赞/收藏自动保存最近五作品，按顺序增量截止且点赞与收藏分目录独立归档，支持每日一次后台静默直推、NAS 推送回执及自动关闭标签
+// @version      3.3.0
+// @description  点赞和收藏按作品 ID 向 NAS 核对，支持每日后台同步与下载回执
 // @match        https://www.xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
 // @grant        GM_getValue
@@ -42,46 +42,9 @@
         )?.[1] || '';
     const accountId = path => String(path || '').match(/\/user\/profile\/([^/?#]+)/)?.[1] || '';
 
-    const range = (items, cutoff) => {
-        if (!cutoff) return items;
-        const index = items.findIndex(item => item.id === cutoff);
-        if (index < 0) throw new Error('未找到截止作品。请继续加载、重新选择或清除截止点，本次没有发送。');
-        return items.slice(0, index);
-    };
-
-    // Match the surviving saved IDs in their original order; missing/deleted IDs
-    // are allowed, but one survivor from a multi-note checkpoint is insufficient.
-    const checkpointMatch = (items, anchors) => {
-        const positions = new Map(items.map((item, index) => [item.id, index]));
-        const found = anchors.filter(item => positions.has(item.id)).map(item => positions.get(item.id));
-        const ordered = found.every((position, index) => index === 0 || position > found[index - 1]);
-        const matched = anchors.length > 0 && found.length >= Math.min(2, anchors.length) && ordered;
-        return {matched, index: matched ? found[0] : -1, count: found.length, ordered};
-    };
-
-    const batchRange = (items, cutoff, anchors = []) => {
-        const auto = checkpointMatch(items, anchors);
-        const manual = cutoff ? items.findIndex(item => item.id === cutoff) : -1;
-        const stops = [manual, auto.index].filter(index => index >= 0);
-        if (stops.length) return items.slice(0, Math.min(...stops));
-        if (anchors.length) {
-            throw new Error(
-                '自动截止尚未匹配：需至少两个已保存作品保持原顺序（初次仅保存一个时匹配一个）。请继续加载、设置手动截止或清除自动记录，本次没有发送。'
-            );
-        }
-        return range(items, cutoff);
-    };
-
-    // A short incremental batch carries forward older confirmed IDs to keep five
-    // anchors available when only one or two new notes have been added.
-    const nextCheckpoint = (sent, previous = []) => {
-        const unique = new Map();
-        for (const item of [...sent, ...previous]) {
-            if (!unique.has(item.id)) unique.set(item.id, {id: item.id, title: item.title || item.id});
-            if (unique.size === 5) break;
-        }
-        return [...unique.values()];
-    };
+    const selectMissing = (items, states) => items.filter(item =>
+        !item.id || states[item.id.toLowerCase()] === 'missing'
+    );
 
     const endpoint = (host, port, path) => {
         const url = new URL(/^https?:\/\//i.test(host) ? host : `http://${host}`);
@@ -149,11 +112,8 @@
             REPORT_PLATFORM,
             noteId,
             accountId,
-            range,
+            selectMissing,
             endpoint,
-            checkpointMatch,
-            batchRange,
-            nextCheckpoint,
             redactXhsUrl,
             parseBgRunHash,
             extractErrorMessage,
@@ -185,7 +145,7 @@
             path: String(saved.path ?? GM_getValue('dockerPath', '/api/xhs/links')),
             token: String(saved.token ?? GM_getValue('nasSubmitToken', '')),
             max: Number(saved.max ?? GM_getValue('nasMaxScrolls', 100)) || 100,
-            maxBgScrolls: Number(saved.maxBgScrolls ?? 25) || 25,
+            maxBgScrolls: saved.idSync ? Number(saved.maxBgScrolls) || 300 : Math.max(300, Number(saved.maxBgScrolls) || 0),
             dailyBgEnabled: saved.dailyBgEnabled !== false,
             bgModes: modesList.length ? modesList : ['liked', 'saved'],
             bgProfileUrl: String(saved.bgProfileUrl || ''),
@@ -344,14 +304,6 @@
         if (!tab) throw new Error(`未找到「${modes[activeMode]}」标签，请在账号主页打开该分类后重试。`);
         tab.click();
         await sleep(1000);
-    };
-
-    const cutoffKeyFor = (acc, activeMode) => `nas:cutoff:v1:${acc}:${activeMode}`;
-    const checkpointKeyFor = (acc, activeMode) => `nas:checkpoint:v1:${acc}:${activeMode}`;
-    const getCutoff = (acc, activeMode) => GM_getValue(cutoffKeyFor(acc, activeMode), null);
-    const getCheckpoint = (acc, activeMode) => {
-        const v = GM_getValue(checkpointKeyFor(acc, activeMode), []);
-        return Array.isArray(v) ? v : [];
     };
 
     const gmGetJson = (targetUrl, token) =>
@@ -564,6 +516,23 @@
         } catch {}
     };
 
+    const reconcileNotes = async (notes, cfg = config) => {
+        const ids = [...new Set(notes.map(item => item.id?.toLowerCase()).filter(Boolean))];
+        const states = {};
+        for (let offset = 0; offset < ids.length; offset += 500) {
+            const part = ids.slice(offset, offset + 500);
+            const data = await gmPostJson(endpoint(cfg.host, cfg.port, '/api/xhs/reconcile'), cfg.token, {ids: part});
+            for (const id of part) {
+                const state = data?.states?.[id];
+                if (!['archived', 'pending', 'deferred', 'missing'].includes(state)) {
+                    throw new Error('NAS 未完整返回作品 ID 的状态。');
+                }
+                states[id] = state;
+            }
+        }
+        return states;
+    };
+
     const pushNotes = async (
         notes,
         {
@@ -576,14 +545,12 @@
             onStatus = () => {},
         }
     ) => {
-        if (!notes.length) throw new Error('范围内没有作品，本次不发送。');
         const limited = activeMode === 'liked' || activeMode === 'saved';
-        const autoKey =
-            destination === 'batch' && limited && account ? checkpointKeyFor(account, activeMode) : '';
-        const previous = autoKey ? getCheckpoint(account, activeMode) : [];
+        const originalCount = notes.length;
+        notes = selectMissing(notes, await reconcileNotes(notes));
         let sent = 0;
         let accepted = 0;
-        let skipped = 0;
+        let skipped = originalCount - notes.length;
         let lastTaskId = '';
         const batchRoot = makeBatchId(`xhs_${activeMode}`);
         const chunkCount = Math.ceil(notes.length / 500);
@@ -597,7 +564,7 @@
                     urls: chunk.map(item => item.url),
                     destination,
                     ...(limited ? {category: activeMode} : {}),
-                    ...(runId ? {run_id: runId} : {}),
+                    ...(runId && part === chunkCount ? {run_id: runId} : {}),
                     batch_id: chunkBatchId,
                     source_mode: sourceMode,
                     account: account ? `${account}:${activeMode}` : activeMode,
@@ -612,12 +579,7 @@
             sent += chunk.length;
         }
 
-        let saved = false;
-        if (autoKey && sent === notes.length) {
-            GM_setValue(autoKey, nextCheckpoint(notes, previous));
-            saved = true;
-        }
-        return {sent, accepted, skipped, saved, taskId: lastTaskId, batchId: batchRoot};
+        return {sent, accepted, skipped, taskId: lastTaskId, batchId: batchRoot};
     };
 
     // ==================== 后台自动任务执行路径 (#nas_bg_run=...) ====================
@@ -625,7 +587,6 @@
     if (bgRun.runId) {
         (async () => {
             const targetMode = bgRun.mode === 'saved' ? 'saved' : 'liked';
-            let anchorUpdated = false;
             let discoveredCount = 0;
             const acc = accountId(location.pathname);
 
@@ -658,17 +619,12 @@
                 }
 
                 const collected = new Map(loaded.map(it => [it.id, it]));
-                const anchors = getCheckpoint(acc, targetMode);
-                const cutoffMark = getCutoff(acc, targetMode)?.id || '';
-                const maxBg = Math.max(1, Math.min(200, Number(config.maxBgScrolls || 25)));
+                const maxBg = Math.max(1, Math.min(1000, Number(config.maxBgScrolls || 300)));
                 let idle = 0;
 
                 for (let step = 0; step < maxBg; step += 1) {
                     anomaly = detectXhsAnomaly();
                     if (anomaly) throw new Error(anomaly);
-                    const snapshot = [...collected.values()];
-                    const matched = checkpointMatch(snapshot, anchors);
-                    if ((cutoffMark && collected.has(cutoffMark)) || matched.matched) break;
                     const before = collected.size;
                     scrollContainers();
                     await sleep(1400);
@@ -676,7 +632,7 @@
                         readNotesForMode(targetMode).forEach(it => collected.set(it.id, it));
                     } catch {}
                     idle = collected.size === before ? idle + 1 : 0;
-                    if (idle >= 4) break;
+                    if (idle >= 8) break;
                 }
 
                 const finalItems = [...collected.values()];
@@ -697,36 +653,12 @@
                         status: 'ok',
                         reason: 'empty_list',
                         itemCount: 0,
-                        anchorUpdated: false,
                         finishedAt: new Date().toISOString(),
                     });
                     return;
                 }
 
-                const selected = batchRange(finalItems, cutoffMark, anchors);
-                if (!selected.length) {
-                    await reportToNas(config, {
-                        source_mode: 'bg',
-                        run_id: bgRun.runId,
-                        account: `${acc}:${targetMode}`,
-                        status: 'empty',
-                        discovered: finalItems.length,
-                        message: `后台定时检查小红书(${modes[targetMode]}) ${finalItems.length} 条，命中断点无新增`,
-                    });
-                    await writeBgResult({
-                        runId: bgRun.runId,
-                        platform: 'xiaohongshu',
-                        mode: targetMode,
-                        status: 'ok',
-                        reason: 'no_new_items',
-                        itemCount: 0,
-                        anchorUpdated: false,
-                        finishedAt: new Date().toISOString(),
-                    });
-                    return;
-                }
-
-                const summary = await pushNotes(selected, {
+                const summary = await pushNotes(finalItems, {
                     destination: 'batch',
                     activeMode: targetMode,
                     account: acc,
@@ -734,18 +666,26 @@
                     sourceMode: 'bg',
                     runId: bgRun.runId,
                 });
-                anchorUpdated = summary.saved;
+                if (!summary.sent) {
+                    await reportToNas(config, {
+                        source_mode: 'bg',
+                        run_id: bgRun.runId,
+                        account: `${acc}:${targetMode}`,
+                        status: 'empty',
+                        discovered: finalItems.length,
+                        message: `已向 NAS 核对 ${finalItems.length} 个小红书作品 ID，没有待下载项`,
+                    }, {strict: true});
+                }
                 await writeBgResult({
                     runId: bgRun.runId,
                     platform: 'xiaohongshu',
                     mode: targetMode,
                     status: 'ok',
-                    reason: 'pushed',
+                    reason: summary.sent ? 'pushed' : 'no_new_items',
                     itemCount: summary.sent,
                     accepted: summary.accepted,
                     skipped: summary.skipped,
                     taskId: summary.taskId,
-                    anchorUpdated,
                     finishedAt: new Date().toISOString(),
                 });
             } catch (err) {
@@ -764,7 +704,6 @@
                     mode: targetMode,
                     status: 'failed',
                     reason: msg,
-                    anchorUpdated,
                     finishedAt: new Date().toISOString(),
                 });
             } finally {
@@ -783,22 +722,12 @@
     // ==================== 前台工作台 UI ====================
     let mode = 'liked';
     let items = [];
+    let states = {};
     let busy = false;
     let stopped = false;
     let context = '';
 
     const activeAccount = () => accountId(location.pathname);
-    const cutoffKey = () => cutoffKeyFor(activeAccount(), mode);
-    const cutoff = () => GM_getValue(cutoffKey(), null);
-    const checkpointKey = () => checkpointKeyFor(activeAccount(), mode);
-    const checkpoint = () => getCheckpoint(activeAccount(), mode);
-    const limitedMode = () => ['liked', 'saved'].includes(mode);
-    const currentRange = () => (limitedMode() ? batchRange(items, cutoff()?.id, checkpoint()) : items);
-    const remember = item => {
-        GM_setValue(cutoffKey(), item ? {id: item.id, title: item.title} : null);
-        render();
-    };
-
     const syncOwnProfileUrl = () => {
         const acc = activeAccount();
         if (!acc) return;
@@ -858,11 +787,9 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
 <div class="box">
   <div class="row spread"><h3>批量收录</h3><small id="account"></small></div>
   <div class="tabs">${Object.entries(modes).map(([value, label]) => `<button data-mode="${value}">${label}</button>`).join('')}</div>
-  <div class="cut"><div class="row spread"><strong style="font-size:12px">手动截止 · 不包含</strong><button id="clear" class="quiet">清除</button></div><div id="cutoff" class="muted"></div><div class="row"><input id="cutoff-input" class="grow" placeholder="也可粘贴作品链接或 ID" aria-label="截止作品"><button id="save-cutoff">保存</button></div></div>
-  <div id="auto-cut" class="cut"><div class="row spread"><strong style="font-size:12px">自动增量截止 · 最近 5 个作品</strong><button id="clear-auto" class="quiet">清除记录</button></div><div id="auto-summary" class="muted"></div><ol id="auto-notes" class="muted" style="margin:8px 0;padding-left:20px"></ol><small>发送成功后自动记住；至少两个作品顺序一致即可截止，允许作品被删除。</small></div>
   <div class="row"><button id="scan" class="grow">读取已加载</button><button id="load" class="grow">自动加载</button><button id="stop" class="hidden">停止</button></div>
-  <p class="muted">自动记录按账号和点赞/收藏分类分别保存。手动与自动截止同时存在时，在先遇到的位置停止，不包含截止作品。</p>
-  <div class="row spread"><small id="count">尚未读取作品</small><button id="send-batch" class="primary">发送范围内作品</button></div>
+  <p class="muted">按作品 ID 与 NAS 核对，已归档和正在处理的作品会自动跳过。</p>
+  <div class="row spread"><small id="count">尚未读取作品</small><button id="send-batch" class="primary">发送待下载作品</button></div>
   <div id="list" class="list"></div>
 </div>
 <div class="box">
@@ -877,7 +804,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
 <div id="status" role="status" aria-live="polite">准备就绪。先设置 Docker 地址与授权 Token，再选择作品。</div><progress class="hidden" id="progress"></progress>
 <details class="box"><summary>NAS 连接、授权与后台计划设置</summary>
   <label>Docker 主机<input id="host" placeholder="192.168.1.20 或 https://nas.example.com"></label>
-  <div class="row"><label class="grow">端口<input id="port"></label><label class="grow">手动滚动上限<input id="max" type="number" min="1" max="1000"></label><label class="grow">后台滚动上限<input id="max-bg" type="number" min="1" max="200"></label></div>
+  <div class="row"><label class="grow">端口<input id="port"></label><label class="grow">手动滚动上限<input id="max" type="number" min="1" max="1000"></label><label class="grow">后台滚动上限<input id="max-bg" type="number" min="1" max="1000"></label></div>
   <label>接收路径<input id="path"></label>
   <label>推送授权 (X-NAS-Submit-Token)<input id="token" type="password" autocomplete="off"></label>
   <label>每日后台个人主页 URL<input id="bg-url" placeholder="https://www.xiaohongshu.com/user/profile/..."></label>
@@ -916,36 +843,13 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         const acc = activeAccount();
         $('#account').textContent = acc ? `账号 …${acc.slice(-6)}` : '未在账号主页';
         shadow.querySelectorAll('[data-mode]').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
-        const limited = limitedMode();
-        $('.cut').classList.toggle('hidden', !limited);
-        $('#auto-cut').classList.toggle('hidden', !limited);
-
-        const mark = cutoff();
-        $('#cutoff').textContent = mark ? `${mark.title || mark.id} · ${mark.id}` : '未设置手动截止；自动截止记录仍然生效。';
-        $('#cutoff-input').placeholder = mark ? `已保存：${mark.id}` : '也可粘贴作品链接或 ID';
-
-        const anchors = checkpoint();
-        const match = checkpointMatch(items, anchors);
-        $('#auto-summary').textContent = !anchors.length
-            ? '首次发送后自动保存，无需手动设置。'
-            : match.matched
-            ? `已按顺序匹配 ${match.count}/${anchors.length} 个作品，将在第一个匹配作品前停止。`
-            : `已保存 ${anchors.length} 个，当前出现 ${match.count} 个${match.ordered ? '，等待足够作品' : '，顺序不一致'}。`;
-        $('#auto-notes').replaceChildren();
-        for (const anchor of anchors) {
-            const row = document.createElement('li');
-            row.textContent = anchor.title || anchor.id;
-            row.title = anchor.id;
-            $('#auto-notes').append(row);
-        }
-
-        let eligible = items;
-        try { eligible = currentRange(); } catch { eligible = []; }
-        $('#count').textContent = `已加载 ${items.length} · 范围内 ${eligible.length}`;
+        const checked = Object.keys(states).length;
+        const missing = selectMissing(items, states).length;
+        $('#count').textContent = checked
+            ? `已加载 ${items.length} · 待下载 ${missing}`
+            : `已加载 ${items.length} · 等待 NAS 核对`;
         $('#list').replaceChildren();
-        const selected = new Set(eligible.map(item => item.id));
-
-        for (const item of items) {
+        for (const item of items.slice(0, 120)) {
             const row = document.createElement('div');
             row.className = 'note';
             if (/^https?:\/\//.test(item.cover)) {
@@ -970,17 +874,6 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             desc.textContent = item.author;
             const actions = document.createElement('div');
             actions.className = 'actions';
-            if (limited) {
-                const set = document.createElement('button');
-                set.textContent = mark?.id === item.id ? '✓ 截止作品' : '设为截止';
-                set.disabled = busy;
-                set.onclick = () => execute(async () => {
-                    guard();
-                    remember(item);
-                    status('截止作品已保存，发送时不包含它。');
-                });
-                actions.append(set);
-            }
             const send = document.createElement('button');
             send.textContent = '单独发送';
             send.disabled = busy;
@@ -994,7 +887,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             actions.append(send);
             const tag = document.createElement('span');
             tag.className = 'tag';
-            tag.textContent = selected.has(item.id) ? '待发送' : '截止范围外';
+            tag.textContent = {missing: '待下载', archived: '已归档', pending: '处理中', deferred: '暂缓重试'}[states[item.id.toLowerCase()]] || '待核对';
             body.append(title, desc, actions);
             row.append(body, tag);
             $('#list').append(row);
@@ -1041,15 +934,13 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
     async function scan(auto) {
         await activateTabForMode(mode);
         items = read();
+        states = {};
         const snapshot = context;
         const collected = new Map(items.map(item => [item.id, item]));
         if (auto) {
             let idle = 0;
             for (let step = 0; step < config.max && !stopped; step++) {
                 guard();
-                const mark = limitedMode() ? cutoff()?.id : '';
-                const autoHit = limitedMode() ? checkpointMatch([...collected.values()], checkpoint()) : {matched: false};
-                if ((mark && collected.has(mark)) || autoHit.matched) break;
                 const count = collected.size;
                 scrollContainers();
                 await sleep(1200);
@@ -1064,8 +955,9 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             }
         }
         items = [...collected.values()];
-        currentRange();
-        status(`${stopped ? '已停止加载' : '读取完成'}：${items.length} 个作品，范围内 ${currentRange().length} 个。`);
+        states = await reconcileNotes(items);
+        guard();
+        status(`${stopped ? '已停止加载' : '读取完成'}：${items.length} 个作品，${selectMissing(items, states).length} 个待下载。`);
     }
 
     async function push(notes, destination) {
@@ -1077,15 +969,10 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             sourceMode: destination === 'single' ? 'single' : 'workbench',
             onStatus: msg => status(msg),
         });
-        status(
-            `Docker 已确认 ${res.sent}/${notes.length} 个作品（新入队 ${res.accepted}，重复跳过 ${res.skipped}）。${
-                destination === 'single'
-                    ? '保存到单个作品目录。'
-                    : res.saved
-                    ? '已更新最近 5 个作品的自动截止记录，手动截止保持不变。'
-                    : '自动截止记录保持不变。'
-            } 可在 NAS 控制台「浏览器推送 / 下载记录」查看进度。`
-        );
+        status(`NAS 新入队 ${res.accepted} 个，跳过 ${res.skipped} 个。可在下载记录查看进度。`);
+        if (items.length && context === `${activeAccount()}:${mode}:${location.pathname}`) {
+            states = await reconcileNotes(items);
+        }
     }
 
     function currentNote() {
@@ -1127,8 +1014,8 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
                 cfg: config,
                 storageKey: STORAGE_KEYS.BG_RESULT,
                 runId,
-                timeoutMs: 150000,
-                timeoutMessage: '后台标签页测试超时 (150s)',
+                timeoutMs: config.maxBgScrolls * 2200 + 120000,
+                timeoutMessage: '后台标签页扫描超时',
                 openTab: () => {
                     tab = GM_openInTab(tabUrl, {active: false, insert: true});
                     return tab;
@@ -1165,25 +1052,12 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
     $('.launch').onclick = () => { $('.panel').classList.toggle('hidden'); render(); };
     $('#close').onclick = () => $('.panel').classList.add('hidden');
     shadow.querySelectorAll('[data-mode]').forEach(button => {
-        button.onclick = () => { mode = button.dataset.mode; items = []; context = ''; render(); };
+        button.onclick = () => { mode = button.dataset.mode; items = []; states = {}; context = ''; render(); };
     });
     $('#scan').onclick = () => execute(() => scan(false));
     $('#load').onclick = () => execute(() => scan(true));
     $('#stop').onclick = () => { stopped = true; status('正在停止，等待当前操作完成…'); };
-    $('#clear').onclick = () => { remember(null); status('已清除当前账号此分类的截止作品。'); };
-    $('#clear-auto').onclick = () => {
-        GM_setValue(checkpointKey(), []);
-        render();
-        status('已清除当前账号此分类的自动截止记录。');
-    };
-    $('#save-cutoff').onclick = () => execute(async () => {
-        if (!activeAccount()) throw new Error('请先打开账号主页。');
-        const id = noteId($('#cutoff-input').value.trim());
-        if (!id) throw new Error('请输入有效的作品链接或 24 位作品 ID。');
-        remember(items.find(item => item.id === id) || {id, title: ''});
-        status('截止作品已长期保存。');
-    });
-    $('#send-batch').onclick = () => execute(async () => { guard(); await push(currentRange(), 'batch'); });
+    $('#send-batch').onclick = () => execute(async () => { guard(); await push(items, 'batch'); });
     $('#current').onclick = () => execute(async () => {
         $('#single').value = currentNote();
         status('已填入当前作品，点击发送即可单独归档。');
@@ -1213,8 +1087,8 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         if (!Number.isInteger(nextMax) || nextMax < 1 || nextMax > 1000) {
             throw new Error('手动滚动次数应为 1–1000 的整数。');
         }
-        if (!Number.isInteger(nextBgMax) || nextBgMax < 1 || nextBgMax > 200) {
-            throw new Error('后台滚动次数应为 1–200 的整数。');
+        if (!Number.isInteger(nextBgMax) || nextBgMax < 1 || nextBgMax > 1000) {
+            throw new Error('后台滚动次数应为 1–1000 的整数。');
         }
         const selectedModes = [];
         if ($('#bg-mode-liked').checked) selectedModes.push('liked');
@@ -1226,6 +1100,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             token: $('#token').value.trim(),
             max: nextMax,
             maxBgScrolls: nextBgMax,
+            idSync: true,
             bgProfileUrl: $('#bg-url').value.trim().split('#')[0],
             dailyBgEnabled: $('#daily-enabled').checked,
             bgModes: selectedModes.length ? selectedModes : ['liked'],
@@ -1261,6 +1136,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         lastUrl = location.href;
         stopped = true;
         items = [];
+        states = {};
         context = '';
         syncFormFields();
         render();

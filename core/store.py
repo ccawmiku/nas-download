@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import secrets
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 PLATFORMS = {
     "telegram": "Telegram",
@@ -14,6 +16,25 @@ PLATFORMS = {
     "pixiv": "Pixiv",
     "douyin": "抖音",
 }
+
+XHS_ID = re.compile(r"[a-fA-F0-9]{24}\Z")
+
+
+def xhs_link_id(url):
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.hostname not in {"xiaohongshu.com", "www.xiaohongshu.com"}:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if parts[:-1] not in [["explore"], ["discovery", "item"]] and not (
+        len(parts) == 4 and parts[:2] == ["user", "profile"]
+    ):
+        return None
+    return parts[-1].lower() if XHS_ID.fullmatch(parts[-1]) else None
 
 
 class Store:
@@ -43,6 +64,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS records(platform TEXT NOT NULL,source_id TEXT NOT NULL,
                   state TEXT NOT NULL,files TEXT NOT NULL DEFAULT '[]',metadata TEXT DEFAULT '{}',
                   updated REAL NOT NULL,PRIMARY KEY(platform,source_id));
+                CREATE TABLE IF NOT EXISTS xhs_download_baseline(source_id TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY,roles TEXT NOT NULL,
                   updated REAL NOT NULL,details TEXT NOT NULL DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS log_events(id TEXT PRIMARY KEY);
@@ -121,6 +143,78 @@ class Store:
                 (identifier, platform, kind, encoded, now, now),
             )
         return identifier, True
+
+    @staticmethod
+    def _xhs_states(db, ids):
+        if not ids:
+            return {}, {}
+        ids = list(dict.fromkeys(ids))
+        slots = ",".join("?" for _ in ids)
+        states = {
+            row[0]: "archived" for row in db.execute(
+                f"SELECT source_id FROM xhs_download_baseline WHERE source_id IN ({slots})", ids
+            )
+        }
+        previous = {}
+        now = time.time()
+        for row in db.execute(
+            f"SELECT source_id,state,metadata FROM records WHERE platform='xhs' AND source_id IN ({slots})", ids
+        ):
+            if row[0] in states:
+                continue
+            metadata = json.loads(row[2] or "{}")
+            previous[row[0]] = metadata
+            if row[1] == "complete":
+                states[row[0]] = "archived"
+            elif row[1] == "processing":
+                states[row[0]] = "pending"
+            elif metadata.get("retry_paused") or metadata.get("retry_exhausted") or float(metadata.get("cooldown_until") or 0) > now:
+                states[row[0]] = "deferred"
+        wanted = set(ids)
+        for row in db.execute("SELECT payload FROM tasks WHERE platform='xhs' AND state IN ('queued','running')"):
+            for url in json.loads(row[0]).get("urls") or []:
+                note = xhs_link_id(url)
+                if note in wanted and note not in states:
+                    states[note] = "pending"
+        return states, previous
+
+    def xhs_download_states(self, ids):
+        with self.connect() as db:
+            states, _ = self._xhs_states(db, ids)
+        return {note: states.get(note, "missing") for note in ids}
+
+    def enqueue_xhs_links(self, payload):
+        urls = list(dict.fromkeys(payload["urls"]))
+        candidates = [(url, xhs_link_id(url)) for url in urls]
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            states, previous = self._xhs_states(db, [note for _, note in candidates if note])
+            selected = []
+            accepted_ids = set()
+            for url, note in candidates:
+                meta = previous.get(note, {})
+                stale_token = meta.get("needs_fresh_token") and url == meta.get("url")
+                if note is not None and (note in states or note in accepted_ids or stale_token):
+                    continue
+                selected.append(url)
+                if note is not None:
+                    accepted_ids.add(note)
+            if not selected:
+                return "", 0
+            identifier = secrets.token_hex(12)
+            now = time.time()
+            encoded = json.dumps({**payload, "urls": selected}, ensure_ascii=False, sort_keys=True)
+            already = db.execute(
+                "SELECT id FROM tasks WHERE platform='xhs' AND kind='links' AND payload=? AND state IN ('queued','running')",
+                (encoded,),
+            ).fetchone()
+            if already:
+                return already[0], 0
+            db.execute(
+                "INSERT INTO tasks(id,platform,kind,payload,state,created,updated) VALUES(?,'xhs','links',?,'queued',?,?)",
+                (identifier, encoded, now, now),
+            )
+            return identifier, len(selected)
 
     def claim(self, table, owner, platforms=None):
         if table not in {"tasks", "assets"}:

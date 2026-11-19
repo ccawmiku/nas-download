@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from core.config import CONFIG_PATHS, read_json, sanitize
 from core.media import publish
+from core.store import xhs_link_id
 from .client import Client, prepare, record, submit
 
 
@@ -164,7 +165,17 @@ async def run(job):
     checkpoints = []
     if job["kind"] == "sync":
         job["payload"]["urls"], checkpoints = queue_urls(config)
+        urls = job["payload"]["urls"]
+        note_ids = list(dict.fromkeys(note for url in urls if (note := xhs_link_id(url))))
+        states = {}
+        client = Client()
+        for start in range(0, len(note_ids), 500):
+            result = client.request("/internal/xhs/reconcile", {"ids": note_ids[start:start+500]})
+            states.update(result["states"])
+        job["payload"]["urls"] = [url for url in urls if states.get(xhs_link_id(url), "missing") == "missing"]
         if not job["payload"]["urls"]:
+            for key, seen in checkpoints:
+                client.request("/internal/checkpoint/xhs/" + key, {"head": json.dumps(seen)})
             return {
                 "discovered": 0,
                 "downloaded": 0,

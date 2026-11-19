@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书 · 每日一次 NAS 后台自动采集
 // @namespace    xhs_downloader
-// @version      1.0.2
-// @description  每天自动完成一次小红书点赞/收藏分目录增量采集并提交至 NAS（采用原生 once 每日锁 + 手动运行一次必执行，支持 NAS 接口回执轮询与失败自动重试）
+// @version      1.1.0
+// @description  每日自动按作品 ID 与 NAS 核对小红书点赞和收藏，并查询入队回执
 // @crontab      * * once * *
 // @storageName  nas_prod_xhs_v1
 // @grant        GM.getValue
@@ -32,7 +32,11 @@
 
   const DEFAULT_MAX_DAILY_FAILS = 3;
   const RETRY_COOLDOWN_MS = 25 * 60 * 1000;
-  const TAB_TIMEOUT_MS = 150 * 1000;
+  const tabTimeout = config => {
+    const stored = Number(config.maxBgScrolls) || 300;
+    const scrolls = Math.min(1000, Math.max(config.idSync ? 1 : 300, stored));
+    return scrolls * 2200 + 120000;
+  };
 
   const localDateKey = (nowMs = Date.now()) => {
     const d = new Date(nowMs);
@@ -304,8 +308,8 @@
         config,
         storageKey: STORAGE_KEYS.BG_RESULT,
         runId,
-        timeoutMs: TAB_TIMEOUT_MS,
-        timeoutMessage: `小红书(${mode})后台采集超时 (150s)`,
+        timeoutMs: tabTimeout(config),
+        timeoutMessage: `小红书(${mode})后台采集超时`,
         openTab: () => {
           tab = GM_openInTab(tabUrl, { active: false, insert: true });
           return tab;

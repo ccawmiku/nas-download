@@ -27,7 +27,7 @@ from .config import (
     sanitize,
     write_json,
 )
-from .store import PLATFORMS, Store
+from .store import PLATFORMS, Store, XHS_ID
 from .updates import check_updates
 from .x_direct import normalize_direct_payload
 from .x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS
@@ -35,6 +35,7 @@ from .x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS
 DEFAULT_XHS_AUTO_RETRY_CAP = 5
 SCRIPT_PUSH_ORIGINS = {
     "/api/xhs/links": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
+    "/api/xhs/reconcile": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
     "/api/x/direct": {"https://x.com", "https://twitter.com"},
     "/api/browser-push/report": {
         "https://www.xiaohongshu.com",
@@ -703,6 +704,9 @@ def add_task(payload: dict):
             task_payload["category"] = clean_category
         else:
             task_payload.pop("category", None)
+    if platform == "xhs" and kind == "links":
+        identifier, accepted = store.enqueue_xhs_links(task_payload)
+        return {"id": identifier, "created": bool(accepted), "accepted": accepted}
     identifier, created = store.enqueue(
         platform, payload.get("kind", "sync"), task_payload
     )
@@ -977,6 +981,17 @@ def browser_x_direct(payload: dict, request: Request):
     return response
 
 
+@app.post("/api/xhs/reconcile")
+@app.post("/internal/xhs/reconcile")
+def browser_xhs_reconcile(payload: dict):
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 500 or any(
+        not isinstance(note, str) or not XHS_ID.fullmatch(note) for note in ids
+    ):
+        raise HTTPException(422, "每批需要 1 至 500 个作品 ID")
+    return {"states": store.xhs_download_states([note.lower() for note in ids])}
+
+
 @app.post("/api/xhs/links")
 def browser_links(payload: dict, request: Request):
     if not isinstance(payload, dict):
@@ -1029,8 +1044,8 @@ def browser_links(payload: dict, request: Request):
         "payload": task_payload,
     })
     unique_count = len(set(urls))
-    accepted = unique_count if result["created"] else 0
-    skipped = 0 if result["created"] else unique_count
+    accepted = result["accepted"]
+    skipped = unique_count - accepted
     response = {
         "ok": True,
         "submitted": len(urls),
@@ -1072,7 +1087,6 @@ def browser_links(payload: dict, request: Request):
                 "accepted": accepted,
                 "skipped": skipped,
                 "taskId": result["id"],
-                "anchorUpdated": True,
                 "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
         )

@@ -788,13 +788,22 @@ def test_xhs_browser_destination_is_durable_and_backward_compatible(client):
     assert client.post('/api/xhs/links', json={'urls': [url]}).status_code == 401
     token = client.get('/api/browser-push/token').json()['token']
     headers = {'X-NAS-Submit-Token': token, 'Origin': 'https://www.xiaohongshu.com'}
+    first = "1234567890abcdef12345678"
+    other = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    second = f"https://www.xiaohongshu.com/explore/{other}?xsec_token=test"
+    assert client.post('/api/xhs/reconcile', json={'ids': [first]}).status_code == 401
+    assert client.post('/api/xhs/reconcile', headers=headers, json={'ids': [first]}).json()['states'] == {first: 'missing'}
     batch = client.post('/api/xhs/links', headers=headers, json={'urls': [url]}).json()
-    single = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'destination': 'single'}).json()
+    again = client.post('/api/xhs/links', headers=headers, json={'urls': [url + '&changed=1'], 'category': 'saved'}).json()
+    assert again['accepted'] == 0 and again['skipped'] == 1
+    scope = client.post('/api/xhs/reconcile', headers=headers, json={'ids': [first, other]}).json()['states']
+    assert scope == {first: 'pending', other: 'missing'}
+    single = client.post('/api/xhs/links', headers=headers, json={'urls': [second], 'destination': 'single'}).json()
     assert batch['ok'] and single['ok'] and batch['task_id'] != single['task_id']
-    for reply, destination in [(batch, 'batch'), (single, 'single')]:
+    for reply, destination, expected_url in [(batch, 'batch', url), (single, 'single', second)]:
         detail = client.get('/api/detail/tasks/' + reply['task_id']).json()
         assert detail['payload']['destination'] == destination
-        assert detail['payload']['urls'] == [url]
+        assert detail['payload']['urls'] == [expected_url]
     duplicate = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'destination': 'single'}).json()
     assert duplicate['skipped'] == 1 and duplicate['accepted'] == 0
     for data in [
@@ -848,7 +857,10 @@ def test_xhs_single_and_category_directories_can_be_configured_and_routed(client
     headers = {'X-NAS-Submit-Token': token, 'Origin': 'https://www.xiaohongshu.com'}
     url = 'https://www.xiaohongshu.com/explore/abcdef0123456789abcdef01?xsec_token=t'
     liked_resp = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'category': 'liked', 'account': 'u1:liked'}).json()
-    saved_resp = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'account': 'u1:saved'}).json()
+    repeated = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'account': 'u1:saved'}).json()
+    assert repeated['accepted'] == 0 and repeated['skipped'] == 1
+    saved_url = url.replace('abcdef0123456789abcdef01', 'abcdef0123456789abcdef02')
+    saved_resp = client.post('/api/xhs/links', headers=headers, json={'urls': [saved_url], 'account': 'u1:saved'}).json()
     assert liked_resp['accepted'] == 1 and saved_resp['accepted'] == 1
     assert client.get('/api/detail/tasks/' + liked_resp['task_id']).json()['payload']['category'] == 'liked'
     assert client.get('/api/detail/tasks/' + saved_resp['task_id']).json()['payload']['category'] == 'saved'
