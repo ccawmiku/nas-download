@@ -48,7 +48,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "v4.0.11")
+VERSION = os.getenv("APP_VERSION", "v4.0.12")
 
 
 def settings():
@@ -1388,14 +1388,34 @@ def record_file(platform: str, identifier: str, index: int = Query(0, ge=0)):
     return FileResponse(path)
 
 
-def allowed_path(value):
-    path = Path(value).resolve()
+def allowed_roots():
     roots = [
         Path(p).resolve()
-        for p in os.getenv("NAS_MEDIA_ROOTS", "/media,/downloads,/xhs,/douyin").split(
-            ","
-        )
+        for p in os.getenv("NAS_MEDIA_ROOTS", "/media,/downloads,/xhs,/douyin").split(",")
+        if p.strip()
     ]
+    try:
+        from core.config import CONFIG_PATHS, read_json
+        xhs_path = CONFIG_PATHS.get("xhs")
+        if xhs_path and Path(xhs_path).exists():
+            xhs_cfg = read_json(xhs_path, {})
+            for key in ("work_path", "single_work_path", "liked_work_path", "saved_work_path"):
+                val = str(xhs_cfg.get(key) or "").strip()
+                if val:
+                    roots.append(Path(val).resolve())
+        xhs_settings_path = os.getenv("XHS_SETTINGS_PATH", "/app/Volume/settings.json")
+        if xhs_settings_path and Path(xhs_settings_path).exists():
+            xhs_settings = read_json(xhs_settings_path, {})
+            if xhs_settings.get("work_path"):
+                roots.append(Path(xhs_settings["work_path"]).resolve())
+    except Exception:
+        pass
+    return roots
+
+
+def allowed_path(value):
+    path = Path(value).resolve()
+    roots = allowed_roots()
     if not any(path.is_relative_to(root) for root in roots):
         raise HTTPException(422, "文件路径不在媒体目录中")
     return path

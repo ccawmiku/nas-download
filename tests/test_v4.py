@@ -917,3 +917,35 @@ def test_xhs_cross_category_download_routes_into_separate_folders(tmp_path, monk
     # Repeating 'saved' now sees 'saved' in categories -> check_record becomes True
     asyncio.run(xhs_job.run({'id': 'job-saved-2', 'kind': 'links', 'payload': {'urls': ['https://www.xiaohongshu.com/explore/note1'], 'destination': 'batch', 'category': 'saved'}}))
     assert check_flags[-1] is True
+
+
+def test_intake_allows_custom_platform_work_paths(client, monkeypatch, tmp_path):
+    from core.config import CONFIG_PATHS
+    custom_saved = tmp_path / "custom_star"
+    custom_saved.mkdir()
+    config_file = tmp_path / "xhs_config.json"
+    write_json(config_file, {"saved_work_path": str(custom_saved)})
+    monkeypatch.setitem(CONFIG_PATHS, "xhs", config_file)
+
+    workspace = tmp_path / "custom_workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("core.app.settings", lambda: {"workspace_root": str(workspace)})
+
+    source = workspace / "test_file.png"
+    source.write_bytes(b"image-data")
+    target = custom_saved / "folder" / "test_file.png"
+
+    headers = {"X-NAS-Download-Token": "private-test-key"}
+    response = client.post(
+        "/internal/intake",
+        headers=headers,
+        json={
+            "platform": "xhs",
+            "source": str(source),
+            "target": str(target),
+            "details": {"category": "saved"},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json().get("id")
+
