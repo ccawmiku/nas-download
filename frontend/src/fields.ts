@@ -108,6 +108,8 @@ export const definitions: Record<string, Record<string, Spec[]>> = {
     ],
     归档与命名: [
       { key: "upstream.work_path", label: "归档根目录", value: "/xhs" },
+      { key: "liked_work_path", label: "点赞保存目录", value: "", hint: "留空使用归档根目录下「点赞」；自定义目录需为已挂载的容器绝对路径" },
+      { key: "saved_work_path", label: "收藏保存目录", value: "", hint: "留空使用归档根目录下「收藏」；自定义目录需为已挂载的容器绝对路径" },
       { key: "single_work_path", label: "单个作品保存目录", value: "", hint: "留空使用归档根目录下 single；自定义目录需为已挂载的容器绝对路径" },
       { key: "upstream.folder_name", label: "归档子目录", value: "Download" },
       {

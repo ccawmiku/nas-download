@@ -108,19 +108,53 @@ def queue_urls(config):
     return urls, checkpoints
 
 
-def archive_root(settings, config, destination="batch"):
-    raw = str(settings.get("work_path") or "/xhs")
+XHS_CATEGORY_DIRS = {"liked": "点赞", "saved": "收藏"}
+
+
+def _require_abs_dir(raw: str, label: str) -> Path:
     root = Path(raw)
+    if not (
+        root.is_absolute()
+        or PurePosixPath(str(raw).replace("\\", "/")).is_absolute()
+    ):
+        raise ValueError(f"{label}必须是容器绝对路径")
+    return root
+
+
+def archive_root(settings, config, destination="batch", category=""):
+    raw = str(settings.get("work_path") or "/xhs")
+    base_clean = raw.rstrip("/\\")
     if destination == "single":
         custom = str(config.get("single_work_path") or "").strip()
-        raw = custom if custom else f"{raw.rstrip('/\\')}/single"
-        root = Path(raw)
-        if not (
-            root.is_absolute()
-            or PurePosixPath(str(raw).replace("\\", "/")).is_absolute()
-        ):
-            raise ValueError("单个作品保存目录必须是容器绝对路径")
-    return root
+        target_raw = custom if custom else f"{base_clean}/single"
+        return _require_abs_dir(target_raw, "单个作品保存目录")
+    cat = str(category or "").strip().lower()
+    if cat in XHS_CATEGORY_DIRS:
+        custom = str(config.get(f"{cat}_work_path") or "").strip()
+        target_raw = custom if custom else f"{base_clean}/{XHS_CATEGORY_DIRS[cat]}"
+        return _require_abs_dir(target_raw, f"{XHS_CATEGORY_DIRS[cat]}保存目录")
+    return Path(raw)
+
+
+def resolve_archive_target(
+    staging: Path,
+    source: Path,
+    final_root: Path,
+    folder_name: str = "Download",
+    category: str = "",
+) -> Path:
+    rel = source.relative_to(staging)
+    cat = str(category or "").strip().lower()
+    clean_folder = str(folder_name or "").strip()
+    # 分类目录本身即对应点赞/收藏文件夹，剥离上游默认 Download/ 前缀以免多一层目录嵌套
+    if (
+        cat in XHS_CATEGORY_DIRS
+        and clean_folder
+        and len(rel.parts) > 1
+        and rel.parts[0] == clean_folder
+    ):
+        rel = Path(*rel.parts[1:])
+    return final_root / rel
 
 
 async def run(job):
@@ -141,6 +175,7 @@ async def run(job):
             }
     settings = read_json(os.getenv("XHS_SETTINGS_PATH", "/app/Volume/settings.json"))
     settings_original = dict(settings)
+    folder_name = str(settings_original.get("folder_name", "Download") or "").strip()
     final = archive_root(settings, config)
     destination, enabled = prepare("xhs", final / "incoming", job["id"])
     # Temporary downloads are scoped to this task even when processing is bypassed.
@@ -173,9 +208,21 @@ async def run(job):
                 and p not in current["owned"]
                 and p.stat().st_size
                 and not p.name.startswith(".")
+                and p.name != "ExploreData.db"
             ]
+            handoff_meta = {"url": current["url"], "destination": current["destination"]}
+            if current.get("category"):
+                handoff_meta["category"] = current["category"]
+            if current.get("categories"):
+                handoff_meta["categories"] = current["categories"]
             for source in files:
-                target = current["final"] / source.relative_to(staging)
+                target = resolve_archive_target(
+                    staging,
+                    source,
+                    current["final"],
+                    folder_name,
+                    current.get("category", ""),
+                )
                 if enabled:
                     submit(
                         "xhs",
@@ -183,7 +230,7 @@ async def run(job):
                         target,
                         {
                             "source_id": identifier,
-                            "metadata": {"url": current["url"], "destination": current["destination"]},
+                            "metadata": dict(handoff_meta),
                         },
                     )
                     current["delivered"].append(str(source))
@@ -198,7 +245,7 @@ async def run(job):
                 identifier,
                 "processing" if current["processing"] else "complete",
                 current["delivered"],
-                {"url": current["url"], "destination": current["destination"]},
+                dict(handoff_meta),
             )
             if not enabled:
                 for source in files:
@@ -240,15 +287,34 @@ async def run(job):
             destination_kind = job["payload"].get("destination", "batch")
             if job["kind"] == "retry":
                 destination_kind = prev_meta.get("destination", destination_kind)
+            raw_category = str(job["payload"].get("category") or "").strip().lower()
+            if job["kind"] == "retry":
+                raw_category = str(prev_meta.get("category") or raw_category).strip().lower()
+            category = raw_category if raw_category in XHS_CATEGORY_DIRS else ""
+            raw_prev_cats = prev_meta.get("categories") or (
+                [prev_meta["category"]] if prev_meta.get("category") in XHS_CATEGORY_DIRS else []
+            )
+            existing_cats = {
+                str(c).strip().lower()
+                for c in raw_prev_cats
+                if str(c).strip().lower() in XHS_CATEGORY_DIRS
+            }
+            merged_cats = sorted(existing_cats | ({category} if category else set()))
             current["destination"] = destination_kind
-            current["final"] = archive_root(settings_original, config, destination_kind)
+            current["category"] = category
+            current["categories"] = merged_cats
+            current["final"] = archive_root(settings_original, config, destination_kind, category)
             extracted_error = ""
             values = []
             try:
                 values = await app.extract(
                     url,
                     download=True,
-                    check_record=job["kind"] != "retry" and destination_kind != "single",
+                    check_record=(
+                        job["kind"] != "retry"
+                        and destination_kind != "single"
+                        and (not category or category in existing_cats)
+                    ),
                     task_id=job["id"],
                     result_callback=lambda value: count.update(value),
                 )
@@ -276,6 +342,8 @@ async def run(job):
             metadata = {
                 "url": url,
                 "destination": destination_kind,
+                **({"category": category} if category else {}),
+                **({"categories": merged_cats} if merged_cats else {}),
                 "attempts": attempts,
                 "replaces_source_id": input_id if input_id != identifier else "",
                 "title": next(

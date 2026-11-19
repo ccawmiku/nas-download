@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.2.1
-// @description  点赞/收藏自动保存最近五作品，按顺序增量截止，单个作品独立归档，支持每日一次后台静默直推与 NAS 推送回执
+// @version      3.2.2
+// @description  点赞/收藏自动保存最近五作品，按顺序增量截止且点赞与收藏分目录独立归档，支持每日一次后台静默直推、NAS 推送回执及自动关闭标签
 // @match        https://www.xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
 // @grant        GM_getValue
@@ -12,10 +12,13 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_closeInTab
+// @grant        GM.closeInTab
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
 // @grant        unsafeWindow
+// @grant        window.close
 // @connect      *
 // @license      GPL-3.0
 // @run-at       document-end
@@ -351,6 +354,131 @@
         return Array.isArray(v) ? v : [];
     };
 
+    const gmGetJson = (targetUrl, token) =>
+        new Promise((resolve, reject) =>
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: targetUrl,
+                headers: {
+                    'X-NAS-Submit-Token': token || '',
+                },
+                timeout: 15000,
+                onload(response) {
+                    if (response.status === 401) {
+                        reject(new Error('NAS 授权失败 (401)'));
+                        return;
+                    }
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`HTTP ${response.status}`));
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(response.responseText || '{}'));
+                    } catch {
+                        reject(new Error('JSON parse error'));
+                    }
+                },
+                onerror: () => reject(new Error('network error')),
+                ontimeout: () => reject(new Error('timeout')),
+            })
+        );
+
+    const fetchNasBgRun = async (cfg, runId) => {
+        if (!cfg?.token || !runId) return null;
+        try {
+            const url = endpoint(cfg.host, cfg.port, `/api/browser-push/runs/${encodeURIComponent(runId)}`);
+            const data = await gmGetJson(url, cfg.token);
+            if (data?.found && data.run) return {...data.run, runId};
+        } catch {}
+        return null;
+    };
+
+    const writeBgResult = async payload => {
+        try {
+            if (typeof GM_setValue === 'function') GM_setValue(STORAGE_KEYS.BG_RESULT, payload);
+        } catch {}
+        await gmSetAll({[STORAGE_KEYS.BG_RESULT]: payload});
+    };
+
+    const awaitBgResult = ({cfg, storageKey, runId, openTab, timeoutMs, timeoutMessage}) =>
+        new Promise((resolve, reject) => {
+            let settled = false;
+            let timer = null;
+            let localPoll = null;
+            let nasPoll = null;
+            let closeTimer = null;
+            let listenerId = null;
+
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                if (localPoll) clearInterval(localPoll);
+                if (nasPoll) clearInterval(nasPoll);
+                if (closeTimer) clearTimeout(closeTimer);
+                if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+                    try { GM_removeValueChangeListener(listenerId); } catch {}
+                }
+            };
+
+            const finish = (err, val) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                if (err) reject(err);
+                else resolve(val);
+            };
+
+            const checkOnce = async () => {
+                try {
+                    const cur =
+                        typeof GM !== 'undefined' && typeof GM.getValue === 'function'
+                            ? await GM.getValue(storageKey, null)
+                            : GM_getValue(storageKey, null);
+                    if (cur && cur.runId === runId) {
+                        finish(null, cur);
+                        return true;
+                    }
+                } catch {}
+                const nasRun = await fetchNasBgRun(cfg, runId);
+                if (nasRun) {
+                    finish(null, nasRun);
+                    return true;
+                }
+                return false;
+            };
+
+            timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
+            listenerId = GM_addValueChangeListener(storageKey, (_n, _o, val) => {
+                if (val && val.runId === runId) finish(null, val);
+            });
+            localPoll = setInterval(async () => {
+                try {
+                    const cur =
+                        typeof GM !== 'undefined' && typeof GM.getValue === 'function'
+                            ? await GM.getValue(storageKey, null)
+                            : GM_getValue(storageKey, null);
+                    if (cur && cur.runId === runId) finish(null, cur);
+                } catch {}
+            }, 800);
+            nasPoll = setInterval(async () => {
+                const nasRun = await fetchNasBgRun(cfg, runId);
+                if (nasRun) finish(null, nasRun);
+            }, 2000);
+
+            const tab = openTab();
+            if (tab && typeof tab === 'object') {
+                tab.onclose = () => {
+                    if (settled || closeTimer) return;
+                    closeTimer = setTimeout(async () => {
+                        if (await checkOnce()) return;
+                        setTimeout(async () => {
+                            if (await checkOnce()) return;
+                            finish(new Error('后台标签页已提前关闭，未收到 NAS 或本地回执'));
+                        }, 1500);
+                    }, 800);
+                };
+            }
+        });
+
     const gmPostJson = (targetUrl, token, payload) =>
         new Promise((resolve, reject) =>
             GM_xmlhttpRequest({
@@ -403,6 +531,7 @@
                 {
                     platform: REPORT_PLATFORM,
                     source_mode: report.source_mode || 'workbench',
+                    run_id: report.run_id || '',
                     batch_id: report.batch_id || '',
                     account: report.account || '',
                     status: report.status || 'ok',
@@ -443,6 +572,7 @@
             account,
             discovered = notes.length,
             sourceMode = 'workbench',
+            runId = '',
             onStatus = () => {},
         }
     ) => {
@@ -466,6 +596,8 @@
                 const body = await requestSubmit(config, {
                     urls: chunk.map(item => item.url),
                     destination,
+                    ...(limited ? {category: activeMode} : {}),
+                    ...(runId ? {run_id: runId} : {}),
                     batch_id: chunkBatchId,
                     source_mode: sourceMode,
                     account: account ? `${account}:${activeMode}` : activeMode,
@@ -552,22 +684,21 @@
                 if (!finalItems.length) {
                     await reportToNas(config, {
                         source_mode: 'bg',
+                        run_id: bgRun.runId,
                         account: `${acc}:${targetMode}`,
                         status: 'empty',
                         discovered: 0,
                         message: `后台定时扫描小红书(${modes[targetMode]})为空，无新增作品`,
                     });
-                    await gmSetAll({
-                        [STORAGE_KEYS.BG_RESULT]: {
-                            runId: bgRun.runId,
-                            platform: 'xiaohongshu',
-                            mode: targetMode,
-                            status: 'ok',
-                            reason: 'empty_list',
-                            itemCount: 0,
-                            anchorUpdated: false,
-                            finishedAt: new Date().toISOString(),
-                        },
+                    await writeBgResult({
+                        runId: bgRun.runId,
+                        platform: 'xiaohongshu',
+                        mode: targetMode,
+                        status: 'ok',
+                        reason: 'empty_list',
+                        itemCount: 0,
+                        anchorUpdated: false,
+                        finishedAt: new Date().toISOString(),
                     });
                     return;
                 }
@@ -576,22 +707,21 @@
                 if (!selected.length) {
                     await reportToNas(config, {
                         source_mode: 'bg',
+                        run_id: bgRun.runId,
                         account: `${acc}:${targetMode}`,
                         status: 'empty',
                         discovered: finalItems.length,
                         message: `后台定时检查小红书(${modes[targetMode]}) ${finalItems.length} 条，命中断点无新增`,
                     });
-                    await gmSetAll({
-                        [STORAGE_KEYS.BG_RESULT]: {
-                            runId: bgRun.runId,
-                            platform: 'xiaohongshu',
-                            mode: targetMode,
-                            status: 'ok',
-                            reason: 'no_new_items',
-                            itemCount: 0,
-                            anchorUpdated: false,
-                            finishedAt: new Date().toISOString(),
-                        },
+                    await writeBgResult({
+                        runId: bgRun.runId,
+                        platform: 'xiaohongshu',
+                        mode: targetMode,
+                        status: 'ok',
+                        reason: 'no_new_items',
+                        itemCount: 0,
+                        anchorUpdated: false,
+                        finishedAt: new Date().toISOString(),
                     });
                     return;
                 }
@@ -602,43 +732,49 @@
                     account: acc,
                     discovered: finalItems.length,
                     sourceMode: 'bg',
+                    runId: bgRun.runId,
                 });
                 anchorUpdated = summary.saved;
-                await gmSetAll({
-                    [STORAGE_KEYS.BG_RESULT]: {
-                        runId: bgRun.runId,
-                        platform: 'xiaohongshu',
-                        mode: targetMode,
-                        status: 'ok',
-                        reason: 'pushed',
-                        itemCount: summary.sent,
-                        accepted: summary.accepted,
-                        skipped: summary.skipped,
-                        taskId: summary.taskId,
-                        anchorUpdated,
-                        finishedAt: new Date().toISOString(),
-                    },
+                await writeBgResult({
+                    runId: bgRun.runId,
+                    platform: 'xiaohongshu',
+                    mode: targetMode,
+                    status: 'ok',
+                    reason: 'pushed',
+                    itemCount: summary.sent,
+                    accepted: summary.accepted,
+                    skipped: summary.skipped,
+                    taskId: summary.taskId,
+                    anchorUpdated,
+                    finishedAt: new Date().toISOString(),
                 });
             } catch (err) {
                 const msg = err?.message || String(err);
                 await reportToNas(config, {
                     source_mode: 'bg',
+                    run_id: bgRun.runId,
                     account: `${acc || 'unknown'}:${targetMode}`,
                     status: 'error',
                     discovered: discoveredCount,
                     message: `小红书(${modes[targetMode]})后台同步失败：${msg}`,
                 });
-                await gmSetAll({
-                    [STORAGE_KEYS.BG_RESULT]: {
-                        runId: bgRun.runId,
-                        platform: 'xiaohongshu',
-                        mode: targetMode,
-                        status: 'failed',
-                        reason: msg,
-                        anchorUpdated,
-                        finishedAt: new Date().toISOString(),
-                    },
+                await writeBgResult({
+                    runId: bgRun.runId,
+                    platform: 'xiaohongshu',
+                    mode: targetMode,
+                    status: 'failed',
+                    reason: msg,
+                    anchorUpdated,
+                    finishedAt: new Date().toISOString(),
                 });
+            } finally {
+                // 等待存储与 NAS 回执落盘后主动自关标签页，解决后台运行完成后不自动关闭的问题
+                await sleep(1200);
+                try { window.onbeforeunload = null; } catch {}
+                try { pageWin.onbeforeunload = null; } catch {}
+                try {
+                    if (typeof window.close === 'function') window.close();
+                } catch {}
             }
         })();
         return;
@@ -985,18 +1121,18 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         const runId = `xhs_manual_${targetMode}_${Date.now()}`;
         const tabUrl = `${profile.split('#')[0]}#nas_bg_run=${encodeURIComponent(runId)}&nas_bg_mode=${targetMode}`;
         status(`正在打开静默后台标签页测试（${modes[targetMode]}）…`);
-        let listenerId = null;
         let tab = null;
         try {
-            const res = await new Promise((resolve, reject) => {
-                const timer = setTimeout(() => reject(new Error('后台标签页测试超时 (150s)')), 150000);
-                listenerId = GM_addValueChangeListener(STORAGE_KEYS.BG_RESULT, (_n, _o, val) => {
-                    if (val && val.runId === runId) {
-                        clearTimeout(timer);
-                        resolve(val);
-                    }
-                });
-                tab = GM_openInTab(tabUrl, {active: false, insert: true});
+            const res = await awaitBgResult({
+                cfg: config,
+                storageKey: STORAGE_KEYS.BG_RESULT,
+                runId,
+                timeoutMs: 150000,
+                timeoutMessage: '后台标签页测试超时 (150s)',
+                openTab: () => {
+                    tab = GM_openInTab(tabUrl, {active: false, insert: true});
+                    return tab;
+                },
             });
             if (res.status === 'ok') {
                 status(`后台试跑(${modes[targetMode]})成功：reason=${res.reason}，提交 ${res.itemCount || 0} 条。`);
@@ -1004,10 +1140,11 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
                 status(`后台试跑(${modes[targetMode]})失败：${res.reason || '未知错误'}`, true);
             }
         } finally {
-            if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
-                try { GM_removeValueChangeListener(listenerId); } catch {}
-            }
-            try { tab?.close?.(); } catch {}
+            const closeTabSafe = () => {
+                try { tab?.close?.(); } catch {}
+            };
+            closeTabSafe();
+            setTimeout(closeTabSafe, 400);
         }
     };
 

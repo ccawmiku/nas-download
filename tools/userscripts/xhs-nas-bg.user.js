@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         小红书 · 每日一次 NAS 后台自动采集
 // @namespace    xhs_downloader
-// @version      1.0.1
-// @description  每天自动完成一次小红书点赞/收藏增量采集并提交至 NAS（当天全部完成即锁定跳过，分段完成持久化，失败限次退避）
-// @crontab      */30 * * * *
+// @version      1.0.2
+// @description  每天自动完成一次小红书点赞/收藏分目录增量采集并提交至 NAS（采用原生 once 每日锁 + 手动运行一次必执行，支持 NAS 接口回执轮询与失败自动重试）
+// @crontab      * * once * *
 // @storageName  nas_prod_xhs_v1
 // @grant        GM.getValue
 // @grant        GM.setValues
@@ -14,7 +14,10 @@
 // @grant        GM_openInTab
 // @grant        GM_closeInTab
 // @grant        GM.closeInTab
+// @grant        GM_xmlhttpRequest
 // @grant        GM_notification
+// @grant        GM_log
+// @connect      *
 // @noframes
 // ==/UserScript==
 
@@ -39,6 +42,17 @@
     return `${yyyy}-${mm}-${dd}`;
   };
 
+  const endpoint = (host, port, path) => {
+    const rawHost = String(host || '192.168.1.20').trim();
+    const rawPort = String(port || '14001').trim();
+    const url = new URL(/^https?:\/\//i.test(rawHost) ? rawHost : `http://${rawHost}`);
+    if (rawPort && !url.port) url.port = rawPort;
+    url.pathname = String(path || '').startsWith('/') ? path : `/${path || ''}`;
+    url.search = '';
+    url.hash = '';
+    return url.href;
+  };
+
   const normalizeModes = (rawModes) => {
     const list = Array.isArray(rawModes)
       ? rawModes.filter((m) => m === 'liked' || m === 'saved')
@@ -56,11 +70,14 @@
     return modes.filter((m) => !doneToday.has(m));
   };
 
+  const canScheduleRetry = (dailyState, nowMs = Date.now()) => {
+    const today = localDateKey(nowMs);
+    const prev = dailyState && typeof dailyState === 'object' ? dailyState : {};
+    const count = prev.failDate === today ? Number(prev.failCount || 0) : 0;
+    return count < DEFAULT_MAX_DAILY_FAILS;
+  };
+
   const shouldRunDailyBg = ({ config, dailyState, nowMs = Date.now(), ignoreLock = false }) => {
-    const enabled = config?.dailyBgEnabled !== false;
-    if (!enabled && !ignoreLock) {
-      return { run: false, reason: 'disabled' };
-    }
     const targetUrl = String(config?.bgProfileUrl || '').split('#')[0];
     if (!targetUrl || !/xiaohongshu\.com\/user\/profile\//i.test(targetUrl)) {
       return { run: false, reason: 'missing_profile_url' };
@@ -68,21 +85,13 @@
     const today = localDateKey(nowMs);
     const state = dailyState && typeof dailyState === 'object' ? dailyState : {};
     const configuredModes = normalizeModes(config?.bgModes);
-    const pendingModes = ignoreLock
-      ? configuredModes
-      : pendingModesForToday(configuredModes, state, today);
-
-    if (!ignoreLock) {
-      if (state.lastSuccessDate === today || pendingModes.length === 0) {
-        return { run: false, reason: 'already_succeeded_today', today };
-      }
-      if (state.failDate === today && Number(state.failCount || 0) >= DEFAULT_MAX_DAILY_FAILS) {
-        return { run: false, reason: 'daily_fail_limit_reached', today };
-      }
-      if (state.cooldownUntil && Number(state.cooldownUntil) > nowMs) {
-        return { run: false, reason: 'cooldown_active', today };
-      }
-    }
+    const pendingToday = pendingModesForToday(configuredModes, state, today);
+    // 若当天部分分类完成、仍有未完成分类（如 liked 成功后 saved 失败重试），则续跑剩余分类；
+    // 若当天全部分类都已完成（用户手动点“运行一次”），则重跑全部已启用分类。
+    const modesToRun =
+      !ignoreLock && pendingToday.length > 0 && pendingToday.length < configuredModes.length
+        ? pendingToday
+        : configuredModes;
 
     return {
       run: true,
@@ -90,7 +99,7 @@
       today,
       targetUrl,
       configuredModes,
-      pendingModes,
+      pendingModes: modesToRun,
     };
   };
 
@@ -144,8 +153,10 @@
       DEFAULT_MAX_DAILY_FAILS,
       RETRY_COOLDOWN_MS,
       localDateKey,
+      endpoint,
       normalizeModes,
       pendingModesForToday,
+      canScheduleRetry,
       shouldRunDailyBg,
       markModeSuccess,
       markDailyFailure,
@@ -155,6 +166,11 @@
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const log = (msg) => {
+    if (typeof GM_log === 'function') {
+      try { GM_log(String(msg)); } catch {}
+    }
+  };
   const notify = (title, text) => {
     if (typeof GM_notification === 'function') {
       try {
@@ -172,16 +188,53 @@
     if (typeof GM !== 'undefined' && typeof GM.setValues === 'function') return GM.setValues(obj);
     for (const [k, v] of Object.entries(obj)) GM_setValue(k, v);
   };
-  const awaitBgResult = ({ storageKey, runId, timeoutMs, timeoutMessage }) =>
+  const gmGetJson = (url, token) =>
+    new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: { 'X-NAS-Submit-Token': token || '' },
+        timeout: 15000,
+        onload(resp) {
+          if (resp.status < 200 || resp.status >= 300) {
+            reject(new Error(`HTTP ${resp.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(resp.responseText || '{}'));
+          } catch (err) {
+            reject(err);
+          }
+        },
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout')),
+      });
+    });
+
+  const fetchNasBgRun = async (config, runId) => {
+    if (!config?.token || !runId) return null;
+    try {
+      const url = endpoint(config.host, config.port, `/api/browser-push/runs/${encodeURIComponent(runId)}`);
+      const data = await gmGetJson(url, config.token);
+      if (data?.found && data.run) return { ...data.run, runId };
+    } catch {}
+    return null;
+  };
+
+  const awaitBgResult = ({ config, storageKey, runId, openTab, timeoutMs, timeoutMessage }) =>
     new Promise((resolve, reject) => {
       let settled = false;
       let timer = null;
       let pollTimer = null;
+      let nasTimer = null;
+      let closeTimer = null;
       let listenerId = null;
 
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         if (pollTimer) clearInterval(pollTimer);
+        if (nasTimer) clearInterval(nasTimer);
+        if (closeTimer) clearTimeout(closeTimer);
         if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
           try { GM_removeValueChangeListener(listenerId); } catch {}
         }
@@ -195,6 +248,22 @@
         else resolve(val);
       };
 
+      const checkOnce = async () => {
+        try {
+          const cur = await getValue(storageKey, null);
+          if (cur && cur.runId === runId) {
+            finish(null, cur);
+            return true;
+          }
+        } catch {}
+        const nasRun = await fetchNasBgRun(config, runId);
+        if (nasRun) {
+          finish(null, nasRun);
+          return true;
+        }
+        return false;
+      };
+
       timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
       listenerId = GM_addValueChangeListener(storageKey, (_n, _o, val) => {
         if (val && val.runId === runId) finish(null, val);
@@ -204,23 +273,44 @@
           const cur = await getValue(storageKey, null);
           if (cur && cur.runId === runId) finish(null, cur);
         } catch {}
-      }, 800);
+      }, 900);
+      nasTimer = setInterval(async () => {
+        const nasRun = await fetchNasBgRun(config, runId);
+        if (nasRun) finish(null, nasRun);
+      }, 2000);
+
+      const tab = openTab();
+      if (tab && typeof tab === 'object') {
+        tab.onclose = () => {
+          if (settled || closeTimer) return;
+          closeTimer = setTimeout(async () => {
+            if (await checkOnce()) return;
+            setTimeout(async () => {
+              if (await checkOnce()) return;
+              finish(new Error('小红书后台标签页已关闭，未收到 NAS 或本地回执'));
+            }, 1500);
+          }, 800);
+        };
+      }
     });
 
-  const runSingleMode = async (targetUrl, mode) => {
+  const runSingleMode = async (config, targetUrl, mode) => {
     const runId = `xhs_daily_${mode}_${Date.now()}`;
     const tabUrl = buildRunTabUrl(targetUrl, runId, mode);
     let tab = null;
 
     try {
-      const resultPromise = awaitBgResult({
+      const result = await awaitBgResult({
+        config,
         storageKey: STORAGE_KEYS.BG_RESULT,
         runId,
         timeoutMs: TAB_TIMEOUT_MS,
         timeoutMessage: `小红书(${mode})后台采集超时 (150s)`,
+        openTab: () => {
+          tab = GM_openInTab(tabUrl, { active: false, insert: true });
+          return tab;
+        },
       });
-      tab = GM_openInTab(tabUrl, { active: false, insert: true });
-      const result = await resultPromise;
 
       if (result.status !== 'ok') {
         throw new Error(result.reason || `小红书(${mode})后台采集返回失败`);
@@ -243,20 +333,23 @@
     let dailyState = await getValue(STORAGE_KEYS.DAILY_STATE, {});
 
     if (!config?.token) {
+      log('[XHS-NAS-BG] skipped:no_nas_token');
       return 'skipped:no_nas_token';
     }
     const decision = shouldRunDailyBg({ config, dailyState, nowMs: Date.now() });
     if (!decision.run) {
+      log(`[XHS-NAS-BG] skipped:${decision.reason}`);
       return `skipped:${decision.reason}`;
     }
 
-    // 与 X 后台错开 18-38 秒启动，避免同一分钟唤醒并发抢占桌面标签资源
-    await sleep(18000 + Math.floor(Math.random() * 20000));
+    log(`[XHS-NAS-BG] starting modes=${decision.pendingModes.join(',')}`);
+    // 与 X 后台错开 5-9 秒启动，兼顾手动运行响应速度与并发隔离
+    await sleep(5000 + Math.floor(Math.random() * 4000));
 
     let totalSubmitted = 0;
     try {
       for (const mode of decision.pendingModes) {
-        const res = await runSingleMode(decision.targetUrl, mode);
+        const res = await runSingleMode(config, decision.targetUrl, mode);
         totalSubmitted += Number(res.itemCount || 0);
         const summary = `${mode}:${res.reason || 'ok'} (+${res.itemCount || 0})`;
         dailyState = markModeSuccess(
@@ -267,7 +360,8 @@
           summary
         );
         await setValues({ [STORAGE_KEYS.DAILY_STATE]: dailyState });
-        await sleep(2500);
+        log(`[XHS-NAS-BG] ${summary}`);
+        await sleep(2000);
       }
       if (totalSubmitted > 0) {
         notify('小红书今日自动同步完成', `已向 NAS 提交 ${totalSubmitted} 个新作品。`);
@@ -275,10 +369,15 @@
       return `ok:${totalSubmitted}`;
     } catch (error) {
       const msg = error?.message || String(error);
+      const allowRetry = canScheduleRetry(dailyState, Date.now());
       await setValues({
         [STORAGE_KEYS.DAILY_STATE]: markDailyFailure(dailyState, Date.now(), msg),
       });
+      log(`[XHS-NAS-BG] failed:${msg}`);
       notify('小红书自动同步异常（未推进断点）', msg);
+      if (allowRetry && typeof CATRetryError === 'function') {
+        throw new CATRetryError(msg, RETRY_COOLDOWN_MS / 1000);
+      }
       return `failed:${msg}`;
     }
   })();

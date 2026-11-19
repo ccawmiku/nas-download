@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.0.1
-// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持 5 锚点增量同步、NAS Token 直推与每日后台配合
+// @version      1.0.2
+// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持触底自动翻页、5 锚点增量同步、NAS Token 直推与每日后台回执
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @run-at       document-start
@@ -597,6 +597,24 @@
     return true;
   };
 
+  const computeScrollDelta = ({ scrollTop = 0, clientHeight = 900, scrollHeight = 0 }) => {
+    const view = Math.max(400, Number(clientHeight) || 900);
+    const top = Math.max(0, Number(scrollTop) || 0);
+    const total = Math.max(top + view, Number(scrollHeight) || 0);
+    const remaining = Math.max(0, total - (top + view));
+    const step =
+      remaining <= 0
+        ? 0
+        : remaining <= 220
+          ? remaining
+          : Math.max(Math.round(view * 0.9), Math.min(2600, remaining));
+    return {
+      step,
+      remaining,
+      nearBottom: remaining <= 220,
+    };
+  };
+
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       STORAGE_KEYS,
@@ -608,6 +626,7 @@
       extractInitialStateHandle,
       parseBgHash,
       installBgVisibilityBypass,
+      computeScrollDelta,
       tweetIdFromUrl,
       toOrigImageUrl,
       extractMediaList,
@@ -700,7 +719,7 @@
     path: '/api/x/direct',
     token: '',
     maxScrolls: 60,
-    maxBgScrolls: 25,
+    maxBgScrolls: 60,
     dailyBgEnabled: true,
     bgTargetUrl: 'https://x.com/i/history/likes',
   });
@@ -768,6 +787,45 @@
       });
     });
 
+  const gmGetJson = (url, token) =>
+    new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers: {
+          'X-NAS-Submit-Token': token || '',
+        },
+        timeout: 15000,
+        onload(resp) {
+          if (resp.status === 401) {
+            reject(new Error('NAS 授权失败 (401)'));
+            return;
+          }
+          if (resp.status < 200 || resp.status >= 300) {
+            reject(new Error(`NAS HTTP ${resp.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(resp.responseText || '{}'));
+          } catch (err) {
+            reject(err);
+          }
+        },
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout')),
+      });
+    });
+
+  const fetchNasBgRun = async (cfg, runId) => {
+    if (!cfg?.token || !runId) return null;
+    try {
+      const url = endpoint(cfg.host, cfg.port, `/api/browser-push/runs/${encodeURIComponent(runId)}`);
+      const data = await gmGetJson(url, cfg.token);
+      if (data?.found && data.run) return { ...data.run, runId };
+    } catch {}
+    return null;
+  };
+
   const reportToNas = async (cfg, payload) => {
     if (!cfg.token) return;
     try {
@@ -822,14 +880,19 @@
 
   const getCutoff = (acct) => GM_getValue(STORAGE_KEYS.CUTOFF_PREFIX + acct, '');
 
-  const pushTweetsBatch = async (tweets, { sourceMode, updateAnchors, account, cfg, onProgress }) => {
+  const pushTweetsBatch = async (
+    tweets,
+    { sourceMode, updateAnchors, account, cfg, discovered, runId = '', onProgress }
+  ) => {
+    const discoveredTotal = Number(discovered || tweets.length);
     const { manifests, textOnlySkipped } = flattenDirectManifestItems(tweets);
     if (!manifests.length) {
       await reportToNas(cfg, {
         source_mode: sourceMode,
+        ...(runId ? { run_id: runId } : {}),
         account,
         status: 'empty',
-        discovered: tweets.length,
+        discovered: discoveredTotal,
         message: `检查 ${tweets.length} 条点赞推文（其中纯文字 ${textOnlySkipped} 条），无新增媒体直链`,
       });
       if (updateAnchors && tweets.length) {
@@ -858,8 +921,9 @@
       const reply = await postToNas(url, cfg.token, {
         batch_id: chunkBatchId,
         source_mode: sourceMode,
+        ...(runId ? { run_id: runId } : {}),
         account,
-        discovered: tweets.length,
+        discovered: discoveredTotal,
         items: chunk,
       });
       const handledCount =
@@ -890,19 +954,46 @@
     };
   };
 
-  const scrollPageStep = () => {
-    const stepPx = Math.max(480, Math.round((window.innerHeight || 900) * 0.9));
-    try {
-      window.scrollBy(0, stepPx);
-    } catch {}
-    try {
-      const scroller = document.scrollingElement || document.documentElement || document.body;
-      if (scroller) scroller.scrollTop += stepPx;
-    } catch {}
+  const scrollPageStep = async () => {
+    const scroller = document.scrollingElement || document.documentElement || document.body;
+    const beforeTop = Number(window.scrollY ?? scroller?.scrollTop ?? 0);
+    const view = Math.max(400, Number(window.innerHeight || scroller?.clientHeight || 900));
+    const scrollHeight = Number(scroller?.scrollHeight || document.body?.scrollHeight || 0);
+    const calc = computeScrollDelta({ scrollTop: beforeTop, clientHeight: view, scrollHeight });
+
+    if (calc.nearBottom) {
+      // 贴近底部哨兵区时先轻微上提再回底，重新触发 X 的下一页 /Likes IntersectionObserver
+      const bounceTop = Math.max(0, beforeTop - 240);
+      try { window.scrollTo(0, bounceTop); } catch {}
+      if (scroller && Number(scroller.scrollTop || 0) === beforeTop && bounceTop < beforeTop) {
+        try { scroller.scrollTop = bounceTop; } catch {}
+      }
+      await sleep(80);
+      const targetBottom = Number(scroller?.scrollHeight || scrollHeight);
+      try { window.scrollTo(0, targetBottom); } catch {}
+      if (scroller) {
+        try { scroller.scrollTop = targetBottom; } catch {}
+      }
+    } else {
+      try { window.scrollBy(0, calc.step); } catch {}
+      const checkTop = Number(window.scrollY ?? scroller?.scrollTop ?? 0);
+      if (scroller && checkTop <= beforeTop + 2) {
+        try { scroller.scrollTop = beforeTop + calc.step; } catch {}
+      }
+    }
+
     try {
       window.dispatchEvent(new Event('scroll'));
       document.dispatchEvent(new Event('scroll'));
     } catch {}
+
+    const afterTop = Number(window.scrollY ?? scroller?.scrollTop ?? 0);
+    const afterHeight = Number(scroller?.scrollHeight || scrollHeight);
+    return {
+      moved: afterTop > beforeTop + 2,
+      atBottom: afterTop + view >= afterHeight - 220,
+      calc,
+    };
   };
 
   const waitForBgInitialState = async (maxWaitMs = 8000) => {
@@ -921,16 +1012,20 @@
     }
   };
 
-  const awaitBgResult = ({ storageKey, runId, timeoutMs, timeoutMessage }) =>
+  const awaitBgResult = ({ cfg, storageKey, runId, openTab, timeoutMs, timeoutMessage }) =>
     new Promise((resolve, reject) => {
       let settled = false;
       let timer = null;
       let pollTimer = null;
+      let nasPollTimer = null;
+      let closeTimer = null;
       let listenerId = null;
 
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         if (pollTimer) clearInterval(pollTimer);
+        if (nasPollTimer) clearInterval(nasPollTimer);
+        if (closeTimer) clearTimeout(closeTimer);
         if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
           try { GM_removeValueChangeListener(listenerId); } catch {}
         }
@@ -942,6 +1037,25 @@
         cleanup();
         if (err) reject(err);
         else resolve(val);
+      };
+
+      const checkOnce = async () => {
+        try {
+          const cur =
+            typeof GM.getValue === 'function'
+              ? await GM.getValue(storageKey, null)
+              : GM_getValue(storageKey, null);
+          if (cur && cur.runId === runId) {
+            finish(null, cur);
+            return true;
+          }
+        } catch {}
+        const nasRun = await fetchNasBgRun(cfg, runId);
+        if (nasRun) {
+          finish(null, nasRun);
+          return true;
+        }
+        return false;
       };
 
       timer = setTimeout(() => finish(new Error(timeoutMessage)), timeoutMs);
@@ -957,6 +1071,24 @@
           if (cur && cur.runId === runId) finish(null, cur);
         } catch {}
       }, 800);
+      nasPollTimer = setInterval(async () => {
+        const nasRun = await fetchNasBgRun(cfg, runId);
+        if (nasRun) finish(null, nasRun);
+      }, 2000);
+
+      const tab = openTab();
+      if (tab && typeof tab === 'object') {
+        tab.onclose = () => {
+          if (settled || closeTimer) return;
+          closeTimer = setTimeout(async () => {
+            if (await checkOnce()) return;
+            setTimeout(async () => {
+              if (await checkOnce()) return;
+              finish(new Error('后台标签页已提前关闭，未收到 NAS 或本地回执'));
+            }, 1500);
+          }, 800);
+        };
+      }
     });
 
   // 等待 DOM Ready
@@ -979,7 +1111,7 @@
         acct = accountScopeKey();
         const anchors = getAnchors(acct);
         const cutoff = getCutoff(acct);
-        const maxScrolls = Math.max(1, Math.min(200, Number(cfg.maxBgScrolls || 25)));
+        const maxScrolls = Math.max(1, Math.min(200, Number(cfg.maxBgScrolls || 60)));
         let stableTicks = 0;
 
         for (let step = 0; step < maxScrolls; step += 1) {
@@ -991,9 +1123,16 @@
           const hitStop = ordered.some((t) => anchorSet.has(t.id) || (cutoff && t.id === cutoff));
           if (hitStop && ordered.length > 0) break;
           const prevCount = ordered.length;
-          scrollPageStep();
-          await sleep(1600);
-          stableTicks = getOrderedTweets().length === prevCount ? stableTicks + 1 : 0;
+          const prevReqCount = likesGraphqlCount;
+          const { moved, atBottom } = await scrollPageStep();
+          await sleep(atBottom ? 1800 : 700);
+          const curCount = getOrderedTweets().length;
+          const curReqCount = likesGraphqlCount;
+          // 未滑到底部时处于单页内容区内部，不得累加静止次数以免提前中断翻页
+          stableTicks =
+            curCount === prevCount && curReqCount === prevReqCount && (atBottom || !moved)
+              ? stableTicks + 1
+              : 0;
           if (stableTicks >= 4) break;
         }
 
@@ -1005,6 +1144,7 @@
         if (!sliced.items.length) {
           await reportToNas(cfg, {
             source_mode: 'bg',
+            run_id: bgRun.runId,
             account: acct,
             status: 'empty',
             discovered: ordered.length,
@@ -1027,6 +1167,8 @@
           updateAnchors: true,
           account: acct,
           cfg,
+          discovered: ordered.length,
+          runId: bgRun.runId,
         });
         anchorUpdated = true;
         await writeBgResult({
@@ -1044,6 +1186,7 @@
         const msg = err?.message || String(err);
         await reportToNas(cfg, {
           source_mode: 'bg',
+          run_id: bgRun.runId,
           account: acct || accountScopeKey(),
           status: 'error',
           discovered: getOrderedTweets().length,
@@ -1281,10 +1424,11 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
             break;
           }
           const before = ordered.length;
-          window.scrollBy(0, Math.round(window.innerHeight * 0.9));
-          await sleep(1400);
+          const prevReq = likesGraphqlCount;
+          const { moved, atBottom } = await scrollPageStep();
+          await sleep(atBottom ? 1600 : 700);
           const after = getOrderedTweets().length;
-          idle = after === before ? idle + 1 : 0;
+          idle = after === before && likesGraphqlCount === prevReq && (atBottom || !moved) ? idle + 1 : 0;
           setStatus(`正在加载点赞列表…第 ${step + 1} 次滚动，已捕获 ${after} 条推文`);
           refreshView();
           if (idle >= 5) {
@@ -1323,6 +1467,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
           updateAnchors: true,
           account: acct,
           cfg,
+          discovered: ordered.length,
           onProgress: (m) => setStatus(m),
         });
         setStatus(
@@ -1347,14 +1492,17 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       setStatus(`正在打开后台静默标签页执行一次采集 (${runId})…`);
       let tab = null;
       try {
-        const resultPromise = awaitBgResult({
+        const result = await awaitBgResult({
+          cfg,
           storageKey: STORAGE_KEYS.BG_RESULT,
           runId,
           timeoutMs: 120000,
           timeoutMessage: '后台标签页超时（120 秒）未返回回执',
+          openTab: () => {
+            tab = GM_openInTab(tabUrl, { active: false, insert: true, setParent: true });
+            return tab;
+          },
         });
-        tab = GM_openInTab(tabUrl, { active: false, insert: true, setParent: true });
-        const result = await resultPromise;
         setStatus(
           `后台运行结束：${result.status} (${result.reason || ''}) · 新增 ${result.itemCount || 0} · 锚点更新=${Boolean(result.anchorUpdated)}`,
           result.status !== 'ok'
@@ -1379,7 +1527,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         path: $('#cfg-path').value.trim() || '/api/x/direct',
         token: $('#cfg-token').value.trim(),
         maxScrolls: Math.max(1, Math.min(300, Number($('#cfg-max-scroll').value || 60))),
-        maxBgScrolls: Math.max(1, Math.min(200, Number($('#cfg-bg-scroll').value || 25))),
+        maxBgScrolls: Math.max(1, Math.min(200, Number($('#cfg-bg-scroll').value || 60))),
         bgTargetUrl: $('#cfg-bg-url').value.trim() || 'https://x.com/i/history/likes',
         dailyBgEnabled: $('#cfg-bg-enabled').checked,
       };

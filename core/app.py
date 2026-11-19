@@ -48,7 +48,7 @@ DATA = Path(os.getenv("NAS_CORE_DATA", ".runtime/core"))
 store = Store(DATA / "state.sqlite3")
 TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
 STATIC = Path(os.getenv("NAS_FRONTEND_DIST", "frontend/dist"))
-VERSION = os.getenv("APP_VERSION", "4.0.9")
+VERSION = os.getenv("APP_VERSION", "v4.0.11")
 
 
 def settings():
@@ -245,6 +245,13 @@ async def guard(request: Request, call_next):
                     client_ip=request.client.host if request.client else "",
                 )
             return Response(status_code=401)
+    elif path.startswith("/api/browser-push/runs/") and request.method == "GET":
+        submit_token = store.get("browser_submit_token", "")
+        provided = request.headers.get("X-NAS-Submit-Token", "")
+        token_ok = bool(submit_token and provided and hmac.compare_digest(provided, submit_token))
+        admin_ok = bool(settings()["auth_enabled"] and valid_session(request.cookies.get("nas_session")))
+        if not token_ok and not admin_ok:
+            return Response(status_code=401)
     elif path.startswith(("/api/", "/media/")) and path not in {
         "/api/auth/status",
         "/api/auth/login",
@@ -404,13 +411,16 @@ def overview():
     with store.connect() as db:
         workers = [store.decode(row) for row in db.execute("SELECT * FROM workers")]
         counts = {
-            table: dict(
-                db.execute(
-                    f"SELECT state,count(*) FROM {table} WHERE platform IN (" + ",".join("?" for _ in PLATFORMS) + ") GROUP BY state",
-                    list(PLATFORMS),
-                ).fetchall()
-            )
-            for table in ("tasks", "assets")
+            **{
+                table: dict(
+                    db.execute(
+                        f"SELECT state,count(*) FROM {table} WHERE platform IN (" + ",".join("?" for _ in PLATFORMS) + ") GROUP BY state",
+                        list(PLATFORMS),
+                    ).fetchall()
+                )
+                for table in ("tasks", "assets")
+            },
+            "errors": store.active_error_count(),
         }
         latest = {
             key: store.decode(row)
@@ -495,17 +505,23 @@ async def save_platform_config(platform: str, payload: dict):
                 raise HTTPException(503, "Telegram 服务不可用，设置未保存")
         return public_config(platform)
     if platform == "xhs":
-        single_path = fields.get("single_work_path", "")
-        if not isinstance(single_path, str) or (
-            single_path.strip()
-            and not (
-                Path(single_path.strip()).is_absolute()
-                or PurePosixPath(single_path.strip()).is_absolute()
-            )
+        for path_key, path_label in (
+            ("single_work_path", "单个作品保存目录"),
+            ("liked_work_path", "点赞保存目录"),
+            ("saved_work_path", "收藏保存目录"),
         ):
-            raise HTTPException(422, "单个作品保存目录必须是容器绝对路径")
-        if "single_work_path" in fields:
-            fields["single_work_path"] = single_path.strip()
+            if path_key not in fields:
+                continue
+            raw_path = fields.get(path_key, "")
+            if not isinstance(raw_path, str) or (
+                raw_path.strip()
+                and not (
+                    Path(raw_path.strip()).is_absolute()
+                    or PurePosixPath(raw_path.strip()).is_absolute()
+                )
+            ):
+                raise HTTPException(422, f"{path_label}必须是容器绝对路径")
+            fields[path_key] = raw_path.strip()
         upstream_path = Path(
             os.getenv("XHS_SETTINGS_PATH", "/xhs-volume/settings.json")
         )
@@ -677,6 +693,16 @@ def add_task(payload: dict):
         if destination == "single" and len(task_payload["urls"]) != 1:
             raise HTTPException(422, "单个作品发送只能包含一条链接")
         task_payload["destination"] = destination
+        category = task_payload.get("category", "")
+        if category is None:
+            category = ""
+        if not isinstance(category, str) or category.strip().lower() not in {"", "liked", "saved"}:
+            raise HTTPException(422, "保存分类无效")
+        clean_category = category.strip().lower()
+        if clean_category:
+            task_payload["category"] = clean_category
+        else:
+            task_payload.pop("category", None)
     identifier, created = store.enqueue(
         platform, payload.get("kind", "sync"), task_payload
     )
@@ -698,6 +724,26 @@ def rotate_browser_push_token():
     store.set("browser_submit_token", value)
     store.log("system", "浏览器推送授权 Token 已重新生成")
     return {"token": value}
+
+
+def _normalize_xhs_category(raw_category="", account="") -> str:
+    val = str(raw_category or "").strip().lower()
+    if val in {"liked", "saved"}:
+        return val
+    acct = str(account or "").strip().lower()
+    if acct.endswith(":liked") or acct == "liked":
+        return "liked"
+    if acct.endswith(":saved") or acct == "saved":
+        return "saved"
+    return ""
+
+
+@app.get("/api/browser-push/runs/{run_id}")
+def browser_push_run_status(run_id: str):
+    data = store.get_bg_run(run_id)
+    if not data:
+        return {"found": False, "run": None}
+    return {"found": True, "run": data}
 
 
 @app.get("/api/browser-push/status")
@@ -731,6 +777,7 @@ def browser_push_report(payload: dict, request: Request):
     message = sanitize(str(payload.get("message") or ""))[:500]
     discovered = max(0, int(payload.get("discovered") or 0))
     batch_id = str(payload.get("batch_id") or "").strip()[:80]
+    run_id = str(payload.get("run_id") or "").strip()[:100]
     store.record_browser_push(
         platform,
         source_mode,
@@ -741,6 +788,28 @@ def browser_push_report(payload: dict, request: Request):
         message=message,
         client_ip=request.client.host if request.client else "",
     )
+    if run_id:
+        bg_status = "failed" if status == "error" else "ok"
+        bg_reason = (
+            "no_new_items"
+            if status == "empty"
+            else (message or "报告失败")
+            if status == "error"
+            else "ok"
+        )
+        store.save_bg_run(
+            run_id,
+            platform,
+            bg_status,
+            {
+                "reason": bg_reason,
+                "itemCount": 0,
+                "discovered": discovered,
+                "anchorUpdated": False,
+                "message": message,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
     if status == "error":
         store.log(platform, f"浏览器脚本报告异常：{message or '未知原因'}", "warning")
     return {"ok": True}
@@ -780,6 +849,7 @@ def browser_x_direct(payload: dict, request: Request):
         raise HTTPException(422, str(error)) from None
 
     batch_id = str(payload.get("batch_id") or "").strip()[:80]
+    run_id = str(payload.get("run_id") or "").strip()[:100]
     source_mode = str(payload.get("source_mode") or "workbench").strip().lower()
     if source_mode not in {"bg", "workbench", "single"}:
         source_mode = "workbench"
@@ -888,6 +958,22 @@ def browser_x_direct(payload: dict, request: Request):
     )
     if batch_id:
         store.save_push_batch("x", batch_id, payload_hash, response)
+    if run_id:
+        store.save_bg_run(
+            run_id,
+            "x",
+            "ok",
+            {
+                "reason": "pushed",
+                "itemCount": accepted,
+                "submitted": len(normalized),
+                "skipped": skipped_count,
+                "unresolvable": len(unresolvable),
+                "taskId": task_id,
+                "anchorUpdated": True,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
     return response
 
 
@@ -898,6 +984,7 @@ def browser_links(payload: dict, request: Request):
     urls = payload.get("urls", [])
     destination = payload.get("destination", "batch")
     batch_id = str(payload.get("batch_id") or "").strip()[:80]
+    run_id = str(payload.get("run_id") or "").strip()[:100]
     source_mode = str(
         payload.get("source_mode")
         or ("single" if destination == "single" else "workbench")
@@ -905,6 +992,12 @@ def browser_links(payload: dict, request: Request):
     if source_mode not in {"bg", "workbench", "single"}:
         source_mode = "workbench"
     account = sanitize(str(payload.get("account") or ""))[:100]
+    raw_category = payload.get("category", "")
+    if raw_category is not None and str(raw_category).strip():
+        val_cat = str(raw_category).strip().lower()
+        if val_cat not in {"liked", "saved"}:
+            raise HTTPException(422, "保存分类无效")
+    category = _normalize_xhs_category(raw_category, account)
     discovered = (
         max(len(urls), int(payload.get("discovered") or 0))
         if isinstance(urls, list)
@@ -913,8 +1006,11 @@ def browser_links(payload: dict, request: Request):
 
     if batch_id and isinstance(urls, list) and all(isinstance(u, str) for u in urls):
         canonical_urls = list(dict.fromkeys(urls))
+        hash_obj = {"urls": canonical_urls, "destination": destination}
+        if category:
+            hash_obj["category"] = category
         payload_hash = hashlib.sha256(
-            json.dumps({"urls": canonical_urls, "destination": destination}, sort_keys=True, ensure_ascii=False).encode()
+            json.dumps(hash_obj, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
         cached = store.get_push_batch("xhs", batch_id)
         if cached:
@@ -924,10 +1020,13 @@ def browser_links(payload: dict, request: Request):
     else:
         payload_hash = ""
 
+    task_payload = {"urls": urls, "destination": destination}
+    if category:
+        task_payload["category"] = category
     result = add_task({
         "platform": "xhs",
         "kind": "links",
-        "payload": {"urls": urls, "destination": destination},
+        "payload": task_payload,
     })
     unique_count = len(set(urls))
     accepted = unique_count if result["created"] else 0
@@ -960,6 +1059,23 @@ def browser_links(payload: dict, request: Request):
     )
     if batch_id and payload_hash:
         store.save_push_batch("xhs", batch_id, payload_hash, response)
+    if run_id:
+        store.save_bg_run(
+            run_id,
+            "xhs",
+            "ok",
+            {
+                "reason": "pushed",
+                "mode": category or "liked",
+                "category": category,
+                "itemCount": len(urls),
+                "accepted": accepted,
+                "skipped": skipped,
+                "taskId": result["id"],
+                "anchorUpdated": True,
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
     return response
 
 

@@ -57,6 +57,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS push_batches(platform TEXT NOT NULL,
                   batch_id TEXT NOT NULL,payload_hash TEXT NOT NULL,response TEXT NOT NULL,
                   created REAL NOT NULL,PRIMARY KEY(platform,batch_id));
+                CREATE TABLE IF NOT EXISTS bg_runs(run_id TEXT PRIMARY KEY,
+                  platform TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,
+                  created REAL NOT NULL);
             """)
 
     @contextlib.contextmanager
@@ -227,6 +230,23 @@ class Store:
             )
             return cur.rowcount == 1
 
+    @staticmethod
+    def _error_where_clauses():
+        return [
+            "state IN ('failed','interrupted')",
+            "(platform!='x' OR COALESCE(json_extract(metadata,'$.retry_exhausted'),0)=1)",
+            "COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
+        ]
+
+    def active_error_count(self):
+        conditions = [
+            "platform IN (" + ",".join("?" for _ in PLATFORMS) + ")",
+            *self._error_where_clauses(),
+        ]
+        where = " WHERE " + " AND ".join(conditions)
+        with self.connect() as db:
+            return int(db.execute(f"SELECT count(*) FROM records{where}", list(PLATFORMS)).fetchone()[0] or 0)
+
     def page(self, table, page=1, limit=30, platform="", state="", query="", errors=False):
         if table not in {"tasks", "assets", "logs", "records"}:
             raise ValueError("invalid table")
@@ -235,11 +255,7 @@ class Store:
             conditions.append("platform IN (" + ",".join("?" for _ in PLATFORMS) + ")")
             args.extend(PLATFORMS)
         if errors:
-            conditions.extend([
-                "state IN ('failed','interrupted')",
-                "(platform!='x' OR COALESCE(json_extract(metadata,'$.retry_exhausted'),0)=1)",
-                "COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
-            ])
+            conditions.extend(self._error_where_clauses())
         for key, value in (("platform", platform), ("state", state)):
             if value and not (key == "state" and table == "logs"):
                 conditions.append(f"{key}=?")
@@ -423,3 +439,42 @@ class Store:
                     "today_error_count": int(stats[3] or 0),
                 }
         return summary
+
+    def save_bg_run(self, run_id, platform, status, payload):
+        clean_id = str(run_id or "").strip()[:100]
+        if not clean_id:
+            return
+        now = time.time()
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO bg_runs(run_id,platform,status,payload,created) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET platform=excluded.platform,status=excluded.status,payload=excluded.payload,created=excluded.created",
+                (
+                    clean_id,
+                    str(platform or "")[:16],
+                    str(status or "ok")[:32],
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            db.execute("DELETE FROM bg_runs WHERE created < ?", (now - 2 * 86400,))
+
+    def get_bg_run(self, run_id):
+        clean_id = str(run_id or "").strip()[:100]
+        if not clean_id:
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT run_id,platform,status,payload,created FROM bg_runs WHERE run_id=?",
+                (clean_id,),
+            ).fetchone()
+        if not row:
+            return None
+        data = json.loads(row["payload"] or "{}")
+        return {
+            **data,
+            "runId": row["run_id"],
+            "platform": row["platform"],
+            "status": row["status"],
+            "created": row["created"],
+        }

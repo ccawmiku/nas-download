@@ -416,12 +416,7 @@ function Home({
       (assets.queued || 0) +
       (assets.processing || 0) +
       (assets.publishing || 0),
-    attention =
-      (task.failed || 0) +
-      (task.interrupted || 0) +
-      (task.limited || 0) +
-      (assets.failed || 0) +
-      (assets.interrupted || 0);
+    activeErrors = Number(data.counts?.errors || 0);
   const bp = data.browser_push || {};
   return (
     <>
@@ -460,7 +455,7 @@ function Home({
           [Download, "下载队列", pending, "待运行与正在运行", () => go("downloads")],
           [Layers3, "工作区", working, "等待转换与正在入库", () => go("workspace")],
           [Check, "已入库", assets.complete || 0, "工作区处理完成", () => go("records")],
-          [TriangleAlert, "需要处理", attention, "失败、中断或超时", () => go("errors")],
+          [TriangleAlert, "需要处理", activeErrors, "待处理的下载错误", () => go("errors")],
         ].map(([Icon, title, n, sub, onClick]: any) => (
           <button className="metric metric-btn" key={title} onClick={onClick}>
             <span className="metric-label">
@@ -2670,9 +2665,7 @@ function App() {
   const pushErrorCount =
     Number(overviewBadge.value?.browser_push?.x?.today_error_count || 0) +
     Number(overviewBadge.value?.browser_push?.xhs?.today_error_count || 0);
-  const taskAlertCount =
-    Number(overviewBadge.value?.counts?.tasks?.failed || 0) +
-    Number(overviewBadge.value?.counts?.assets?.failed || 0);
+  const taskAlertCount = Number(overviewBadge.value?.counts?.errors || 0);
   function go(next: string) {
     location.hash = next;
     setMenu(false);

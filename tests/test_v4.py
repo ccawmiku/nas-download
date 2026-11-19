@@ -806,20 +806,114 @@ def test_xhs_browser_destination_is_durable_and_backward_compatible(client):
 
 
 def test_xhs_archive_paths():
-    from workers.xhs_job import archive_root
+    from workers.xhs_job import archive_root, resolve_archive_target
     assert archive_root({'work_path': '/xhs'}, {}) == Path('/xhs')
     assert archive_root({'work_path': '/xhs'}, {}, 'single') == Path('/xhs/single')
     assert archive_root({'work_path': '/xhs'}, {'single_work_path': '/mounted/singles'}, 'single') == Path('/mounted/singles')
+    assert archive_root({'work_path': '/xhs'}, {}, 'batch', 'liked') == Path('/xhs/点赞')
+    assert archive_root({'work_path': '/xhs'}, {}, 'batch', 'saved') == Path('/xhs/收藏')
+    assert archive_root({'work_path': '/xhs'}, {'liked_work_path': '/mounted/liked'}, 'batch', 'liked') == Path('/mounted/liked')
+    assert archive_root({'work_path': '/xhs'}, {'saved_work_path': '/mounted/saved'}, 'batch', 'saved') == Path('/mounted/saved')
+    staging = Path('/xhs/.incoming/job1')
+    src = staging / 'Download' / '2026_note' / '1.jpg'
+    assert resolve_archive_target(staging, src, Path('/xhs/点赞'), 'Download', 'liked') == Path('/xhs/点赞/2026_note/1.jpg')
+    assert resolve_archive_target(staging, src, Path('/xhs/收藏'), 'Download', 'saved') == Path('/xhs/收藏/2026_note/1.jpg')
+    assert resolve_archive_target(staging, src, Path('/xhs'), 'Download', '') == Path('/xhs/Download/2026_note/1.jpg')
     with pytest.raises(ValueError):
         archive_root({}, {'single_work_path': '../relative'}, 'single')
+    with pytest.raises(ValueError):
+        archive_root({}, {'liked_work_path': '../relative'}, 'batch', 'liked')
+    with pytest.raises(ValueError):
+        archive_root({}, {'saved_work_path': '../relative'}, 'batch', 'saved')
 
 
-def test_xhs_single_directory_can_be_configured(client, monkeypatch, tmp_path):
+def test_xhs_single_and_category_directories_can_be_configured_and_routed(client, monkeypatch, tmp_path):
     from core.config import CONFIG_PATHS
     monkeypatch.setitem(CONFIG_PATHS, 'xhs', tmp_path / 'xhs.json')
     monkeypatch.setenv('XHS_SETTINGS_PATH', str(tmp_path / 'settings.json'))
-    for value in ['../relative', 3]:
-        assert client.patch('/api/platforms/xhs/settings', json={'fields': {'single_work_path': value}}).status_code == 422
-    response = client.patch('/api/platforms/xhs/settings', json={'fields': {'single_work_path': '/xhs/manual'}})
+    for key in ('single_work_path', 'liked_work_path', 'saved_work_path'):
+        for value in ['../relative', 3]:
+            assert client.patch('/api/platforms/xhs/settings', json={'fields': {key: value}}).status_code == 422
+    response = client.patch('/api/platforms/xhs/settings', json={'fields': {
+        'single_work_path': '/xhs/manual',
+        'liked_work_path': '/xhs/custom-liked',
+        'saved_work_path': '/xhs/custom-saved',
+    }})
     assert response.status_code == 200
     assert response.json()['fields']['single_work_path'] == '/xhs/manual'
+    assert response.json()['fields']['liked_work_path'] == '/xhs/custom-liked'
+    assert response.json()['fields']['saved_work_path'] == '/xhs/custom-saved'
+
+    token = client.get('/api/browser-push/token').json()['token']
+    headers = {'X-NAS-Submit-Token': token, 'Origin': 'https://www.xiaohongshu.com'}
+    url = 'https://www.xiaohongshu.com/explore/abcdef0123456789abcdef01?xsec_token=t'
+    liked_resp = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'category': 'liked', 'account': 'u1:liked'}).json()
+    saved_resp = client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'account': 'u1:saved'}).json()
+    assert liked_resp['accepted'] == 1 and saved_resp['accepted'] == 1
+    assert client.get('/api/detail/tasks/' + liked_resp['task_id']).json()['payload']['category'] == 'liked'
+    assert client.get('/api/detail/tasks/' + saved_resp['task_id']).json()['payload']['category'] == 'saved'
+    assert client.post('/api/xhs/links', headers=headers, json={'urls': [url], 'category': 'invalid'}).status_code == 422
+
+
+def test_xhs_cross_category_download_routes_into_separate_folders(tmp_path, monkeypatch):
+    import asyncio, sys, types
+    from workers import xhs_job
+
+    root = tmp_path / 'workspace'
+    root.mkdir()
+    config = tmp_path / 'config.json'
+    write_json(config, {'request_delay_seconds': 0})
+    monkeypatch.setitem(xhs_job.CONFIG_PATHS, 'xhs', config)
+    settings = tmp_path / 'settings.json'
+    write_json(settings, {'work_path': str(tmp_path / 'xhs'), 'folder_name': 'Download'})
+    monkeypatch.setenv('XHS_SETTINGS_PATH', str(settings))
+    monkeypatch.setattr(xhs_job, 'prepare', lambda _p, _d, jid: (root / jid / 'incoming', True))
+
+    check_flags = []
+    submitted_targets = []
+    recorded = {}
+
+    async def add(identifier, *a, **kw):
+        return None
+
+    class XHS:
+        def __init__(self, **kw):
+            self.work_path = Path(kw['work_path'])
+            self.id_recorder = types.SimpleNamespace(add=add)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def extract(self, url, **kw):
+            check_flags.append(kw['check_record'])
+            dl_dir = self.work_path / 'Download' / '2026_test'
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            (dl_dir / 'photo.jpg').write_bytes(b'img')
+            (dl_dir / 'ExploreData.db').write_bytes(b'sqlite')
+            await self.id_recorder.add('note1')
+            kw['result_callback']({'success': 1})
+            return [{'作品ID': 'note1', '作品标题': 'test'}]
+
+    for name in ['source', 'source.application', 'source.application.app']:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules['source.application.app'].XHS = XHS
+    monkeypatch.setattr(xhs_job, 'submit', lambda _p, _s, tgt, meta: submitted_targets.append((str(tgt), meta['metadata'])) or 'a1')
+    monkeypatch.setattr(xhs_job, 'record', lambda _p, sid, _st, _f, meta: recorded.update({sid: meta}))
+    monkeypatch.setattr(xhs_job.Client, 'request', lambda _self, path: {'metadata': recorded.get('note1', {})} if '/record/' in path else {})
+
+    asyncio.run(xhs_job.run({'id': 'job-liked', 'kind': 'links', 'payload': {'urls': ['https://www.xiaohongshu.com/explore/note1'], 'destination': 'batch', 'category': 'liked'}}))
+    assert check_flags[-1] is False
+    assert Path(submitted_targets[-1][0]) == tmp_path / 'xhs' / '点赞' / '2026_test' / 'photo.jpg'
+
+    # Second run for the same note under 'saved' must not skip because 'saved' was not archived yet!
+    asyncio.run(xhs_job.run({'id': 'job-saved', 'kind': 'links', 'payload': {'urls': ['https://www.xiaohongshu.com/explore/note1'], 'destination': 'batch', 'category': 'saved'}}))
+    assert check_flags[-1] is False
+    assert Path(submitted_targets[-1][0]) == tmp_path / 'xhs' / '收藏' / '2026_test' / 'photo.jpg'
+    assert recorded['note1']['categories'] == ['liked', 'saved']
+
+    # Repeating 'saved' now sees 'saved' in categories -> check_record becomes True
+    asyncio.run(xhs_job.run({'id': 'job-saved-2', 'kind': 'links', 'payload': {'urls': ['https://www.xiaohongshu.com/explore/note1'], 'destination': 'batch', 'category': 'saved'}}))
+    assert check_flags[-1] is True

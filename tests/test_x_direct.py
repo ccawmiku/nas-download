@@ -417,3 +417,38 @@ def test_browser_push_report_accepts_xhs_and_aliases(client):
         assert resp.status_code == 200 and resp.json()["ok"] is True
     pushes = client.get("/api/browser-push/status?platform=xhs").json()["history"]["items"]
     assert len(pushes) == 2 and {p["message"] for p in pushes} == {"test-xhs", "test-xiaohongshu"}
+
+
+def test_bg_run_receipt_endpoint_requires_token_and_returns_reported_status(client):
+    token = client.get("/api/browser-push/token").json()["token"]
+    assert client.get("/api/browser-push/runs/x_run_1").status_code == 401
+    assert client.get("/api/browser-push/runs/x_run_1", headers={"X-NAS-Submit-Token": "wrong"}).status_code == 401
+
+    auth = {"X-NAS-Submit-Token": token}
+    assert client.get("/api/browser-push/runs/x_run_1", headers=auth).json() == {"found": False, "run": None}
+
+    client.post(
+        "/api/browser-push/report",
+        headers={**auth, "Origin": "https://x.com"},
+        json={
+            "platform": "x",
+            "source_mode": "bg",
+            "run_id": "x_run_1",
+            "account": "CCCW",
+            "status": "empty",
+            "discovered": 20,
+            "message": "命中锚点",
+        },
+    )
+    res = client.get("/api/browser-push/runs/x_run_1", headers=auth).json()
+    assert res["found"] is True
+    assert res["run"]["status"] == "ok" and res["run"]["reason"] == "no_new_items"
+
+    url = "https://www.xiaohongshu.com/explore/abcdefabcdefabcdefabcdef?xsec_token=tok2"
+    client.post(
+        "/api/xhs/links",
+        headers={**auth, "Origin": "https://www.xiaohongshu.com"},
+        json={"urls": [url], "category": "saved", "run_id": "xhs_run_2", "source_mode": "bg"},
+    )
+    res_xhs = client.get("/api/browser-push/runs/xhs_run_2", headers=auth).json()
+    assert res_xhs["found"] is True and res_xhs["run"]["category"] == "saved" and res_xhs["run"]["status"] == "ok"

@@ -223,3 +223,17 @@ def test_telegram_failure_projection_recovery_and_old_receipt(client):
     assert client.get('/api/errors?platform=telegram').json()['total'] == 0
     assert server.store.get('telegram_last_success') == now + 3
     assert client.post('/internal/telegram/history', json={'items': []}).status_code == 401
+
+
+def test_overview_error_count_matches_active_errors_list(client):
+    with server.store.connect() as db:
+        db.execute("INSERT INTO tasks(id,platform,kind,payload,state,created,updated) VALUES('t-fail','douyin','sync','{}','failed',1,1)")
+        db.execute("INSERT INTO records VALUES('xhs','n1','failed','[]',?,1)", (json.dumps({'error': 'boom'}),))
+        db.execute("INSERT INTO records VALUES('x','t1','failed','[]',?,1)", (json.dumps({'error': 'skip-not-exhausted', 'retry_exhausted': False}),))
+    ov1 = client.get('/api/overview').json()
+    assert ov1['counts']['tasks']['failed'] == 1
+    assert ov1['counts']['errors'] == client.get('/api/errors').json()['total'] == 1
+    assert client.delete('/api/errors/xhs/n1').status_code == 200
+    ov2 = client.get('/api/overview').json()
+    assert ov2['counts']['tasks']['failed'] == 1
+    assert ov2['counts']['errors'] == client.get('/api/errors').json()['total'] == 0

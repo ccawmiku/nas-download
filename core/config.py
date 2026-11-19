@@ -181,6 +181,8 @@ def initialize_configs():
             "database": "/state/xhs/xhs_queue.sqlite3",
             "queue_files": ["/queue/xhs/links.txt"],
             "single_work_path": "",
+            "liked_work_path": "",
+            "saved_work_path": "",
             "request_delay_seconds": 1,
         },
     }

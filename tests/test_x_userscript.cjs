@@ -152,18 +152,25 @@ test('incremental slicing stops at anchor or manual cutoff and fails closed when
   assert.deepEqual(xQueue.nextAnchors([{id: '7'}, {id: '6'}], ['5', '4', '3', '2']), ['7', '6', '5', '4', '3']);
 });
 
-test('x daily scheduler runs once per day and resets on next day', () => {
+test('x daily scheduler delegates daily lock to native @crontab once and allows manual retries', () => {
   const day1 = new Date(2026, 10, 15, 8, 30, 0).getTime();
-  const day2 = new Date(2026, 10, 16, 8, 30, 0).getTime();
   const cfg = {dailyBgEnabled: true, bgTargetUrl: 'https://x.com/i/history/likes'};
 
-  let d = xBg.shouldRunDailyBg({config: cfg, dailyState: {}, nowMs: day1});
+  const d = xBg.shouldRunDailyBg({config: cfg, nowMs: day1});
   assert.equal(d.run, true);
+  assert.equal(d.targetUrl, 'https://x.com/i/history/likes');
 
-  const succeeded = xBg.markDailySuccess({}, day1 + 5000, 'pushed (+3)');
-  assert.equal(xBg.shouldRunDailyBg({config: cfg, dailyState: succeeded, nowMs: day1 + 3600000}).reason, 'already_succeeded_today');
-  assert.equal(xBg.shouldRunDailyBg({config: cfg, dailyState: succeeded, nowMs: day2}).run, true);
-  assert.equal(xBg.shouldRunDailyBg({config: cfg, dailyState: succeeded, nowMs: day1 + 3600000, ignoreLock: true}).run, true);
+  assert.equal(xBg.canScheduleRetry({}, day1), true);
+  let failState = {};
+  failState = xBg.markDailyFailure(failState, day1, 'e1');
+  failState = xBg.markDailyFailure(failState, day1 + 1000, 'e2');
+  assert.equal(xBg.canScheduleRetry(failState, day1 + 2000), true);
+  failState = xBg.markDailyFailure(failState, day1 + 3000, 'e3');
+  assert.equal(xBg.canScheduleRetry(failState, day1 + 4000), false);
+  // Empty bgTargetUrl falls back safely to default /i/history/likes URL
+  const fallback = xBg.shouldRunDailyBg({config: {bgTargetUrl: ''}, nowMs: day1});
+  assert.equal(fallback.run, true);
+  assert.equal(fallback.targetUrl, 'https://x.com/i/history/likes');
 });
 
 test('resolves cached handle, parses bg hash/state, and installs background visibility/rAF bypass', async () => {
@@ -231,4 +238,12 @@ test('resolves cached handle, parses bg hash/state, and installs background visi
   });
   assert.equal(frozenRafCalled, true);
   assert.equal(rafFired, true);
+
+  const mid = xQueue.computeScrollDelta({scrollTop: 0, clientHeight: 900, scrollHeight: 9500});
+  assert.equal(mid.nearBottom, false);
+  assert.equal(mid.step, 2600);
+
+  const bottom = xQueue.computeScrollDelta({scrollTop: 8500, clientHeight: 900, scrollHeight: 9520});
+  assert.equal(bottom.nearBottom, true);
+  assert.equal(bottom.step, 120);
 });

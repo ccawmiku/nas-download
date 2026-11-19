@@ -63,7 +63,7 @@ test('noteId supports /user/profile/<uid>/<id> and redaction hides xsec_token', 
   assert.deepEqual(parseBgRunHash('#nas_bg_run=r_123&nas_bg_mode=saved'), {runId: 'r_123', mode: 'saved'});
 });
 
-test('xhs daily background lock tracks liked and saved sequentially per calendar day', () => {
+test('xhs daily background scheduler finishes partial modes and reruns all modes on manual click', () => {
   const day1 = new Date(2026, 10, 15, 9, 0, 0).getTime();
   const day2 = new Date(2026, 10, 16, 9, 0, 0).getTime();
   const cfg = {dailyBgEnabled: true, bgProfileUrl: 'https://www.xiaohongshu.com/user/profile/u1', bgModes: ['liked', 'saved']};
@@ -81,22 +81,23 @@ test('xhs daily background lock tracks liked and saved sequentially per calendar
 
   state = xhsBg.markModeSuccess(state, 'saved', d.configuredModes, day1 + 3000, 'saved:ok');
   assert.equal(state.lastSuccessDate, xhsBg.localDateKey(day1));
+  // Manual "run once" when today's modes are already complete executes all configured modes again
   d = xhsBg.shouldRunDailyBg({config: cfg, dailyState: state, nowMs: day1 + 4000});
-  assert.equal(d.run, false);
-  assert.equal(d.reason, 'already_succeeded_today');
+  assert.equal(d.run, true);
+  assert.deepEqual(d.pendingModes, ['liked', 'saved']);
 
-  // Next calendar day unlocks automatically!
   const nextDay = xhsBg.shouldRunDailyBg({config: cfg, dailyState: state, nowMs: day2});
   assert.equal(nextDay.run, true);
   assert.deepEqual(nextDay.pendingModes, ['liked', 'saved']);
 
-  // 3 failures pause for today with cooldown
+  // 3 failures stop scheduling automatic CATRetryError retries for today
   let failState = {};
+  assert.equal(xhsBg.canScheduleRetry(failState, day1), true);
   failState = xhsBg.markDailyFailure(failState, day1, 'err1');
-  assert.equal(xhsBg.shouldRunDailyBg({config: cfg, dailyState: failState, nowMs: day1 + 1000}).reason, 'cooldown_active');
   failState = xhsBg.markDailyFailure(failState, day1 + 30 * 60000, 'err2');
+  assert.equal(xhsBg.canScheduleRetry(failState, day1 + 45 * 60000), true);
   failState = xhsBg.markDailyFailure(failState, day1 + 60 * 60000, 'err3');
-  assert.equal(xhsBg.shouldRunDailyBg({config: cfg, dailyState: failState, nowMs: day1 + 120 * 60000}).reason, 'daily_fail_limit_reached');
+  assert.equal(xhsBg.canScheduleRetry(failState, day1 + 120 * 60000), false);
 });
 
 const {REPORT_PLATFORM, extractErrorMessage} = require('../tools/userscripts/xhs-docker-queue.user.js');
