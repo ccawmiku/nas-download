@@ -27,6 +27,7 @@ x-common: &common
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/x/downloads-metadata:/downloads/x/downloads-metadata
     - /volume1/se-p/pixiv:/downloads/pixiv
     - /volume1/se-p/小红书:/xhs
+    - /volume1/normal/小红书star:/volume1/normal/小红书star
     - /volume1/douyin:/douyin
     - /volume1/se-p/tele-p:/downloads/images
     - /volume1/se-v/tele-v:/downloads/videos
@@ -67,6 +68,7 @@ services:
       - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/execution:/state/execution
       - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/platforms/xhs/auto/queue:/queue/xhs
       - /volume1/se-p/小红书:/xhs
+      - /volume1/normal/小红书star:/volume1/normal/小红书star
       - ${NAS_WORKSPACE_HOST:-/volume1/NDtempwork}:/media/.nas-workspace
     init: true
     depends_on: [console]
