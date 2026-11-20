@@ -53,17 +53,17 @@ jobs:
             context: .
             file: containers/engines.Dockerfile
             executable: python
-            smoke: "import workers.platform_job, gallery_dl, yt_dlp, f2, pillow_heif; from gallery_dl import version; from yt_dlp.version import __version__; assert version.__version__ == '1.32.19'; assert __version__ == '2026.10.26'"
+            smoke: "import workers.platform_job, gallery_dl, yt_dlp, f2, pillow_heif; from gallery_dl import version; from yt_dlp.version import __version__; assert version.__version__ == '1.32.19'; assert __version__ == '2026.10.26'; from PIL import __version__ as pillow_version; assert pillow_version == '13.0.0'"
           - image: telegram
             context: .
             file: containers/telegram.Dockerfile
             executable: python
-            smoke: "import app.bot, app.previews, telethon, cryptg, workers.telegram_delivery"
+            smoke: "import app.bot, app.previews, telethon, cryptg, workers.telegram_delivery; from PIL import __version__ as pillow_version; assert pillow_version == '13.0.0'"
           - image: xhs
             context: .
             file: containers/xhs.Dockerfile
             executable: python
-            smoke: "import source.application.app, workers.xhs_job"
+            smoke: "import source.application.app, workers.xhs_job; from PIL import __version__ as pillow_version; assert pillow_version == '13.0.0'"
           - image: media
             context: .
             file: containers/media.Dockerfile
