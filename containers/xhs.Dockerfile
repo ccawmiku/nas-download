@@ -1,6 +1,6 @@
 FROM ghcr.io/ccawmiku/xhs-downloader:2.8-nas.2
 USER root
-RUN pip install --no-cache-dir Pillow==12.3.0
+RUN pip install --no-cache-dir Pillow==13.0.0
 WORKDIR /app
 COPY core/ ./core/
 COPY workers/ ./workers/
