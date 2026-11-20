@@ -5,7 +5,7 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM python:3.12-slim
+FROM python:3.15-slim
 ARG APP_VERSION=4.0.9
 ENV APP_VERSION=${APP_VERSION}
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 NAS_CORE_DATA=/state/core NAS_FRONTEND_DIST=/app/frontend/dist
