@@ -5,7 +5,7 @@ x-common: &common
     INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:?Set a private internal token}
     NAS_CORE_URL: http://console:14001
     TZ: Asia/Shanghai
-    APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    APP_VERSION: ${NAS_DOWNLOAD_VERSION:-v4.0.14}
     NAS_MEDIA_ROOTS: ${NAS_MEDIA_ROOTS:-/media,/downloads,/xhs,/douyin,/volume1/normal/小红书star}
   volumes: &volumes
     - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/core:/state/core
@@ -37,7 +37,7 @@ x-common: &common
 services:
   console:
     <<: *common
-    image: ghcr.io/ccawmiku/nas-download-console:${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    image: ghcr.io/ccawmiku/nas-download-console:${NAS_DOWNLOAD_VERSION:-v4.0.14}
     build: {context: ., dockerfile: containers/console.Dockerfile}
     environment:
       <<: *env
@@ -49,7 +49,7 @@ services:
     ports: ["${NAS_DOWNLOAD_PORT:-14001}:14001"]
   engines:
     <<: *common
-    image: ghcr.io/ccawmiku/nas-download-engines:${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    image: ghcr.io/ccawmiku/nas-download-engines:${NAS_DOWNLOAD_VERSION:-v4.0.14}
     build: {context: ., dockerfile: containers/engines.Dockerfile}
     shm_size: 256m
     init: true
@@ -57,7 +57,7 @@ services:
     depends_on: [console]
   xhs:
     <<: *common
-    image: ghcr.io/ccawmiku/nas-download-xhs:${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    image: ghcr.io/ccawmiku/nas-download-xhs:${NAS_DOWNLOAD_VERSION:-v4.0.14}
     build: {context: ., dockerfile: containers/xhs.Dockerfile}
     environment:
       <<: *env
@@ -75,7 +75,7 @@ services:
     depends_on: [console]
   telegram-worker:
     <<: *common
-    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    image: ghcr.io/ccawmiku/nas-download-telegram:${NAS_DOWNLOAD_VERSION:-v4.0.14}
     build: {context: ., dockerfile: containers/telegram.Dockerfile}
     volumes:
       - ${NAS_DOWNLOAD_ROOT:-/volume2/docker/nas-download}/v4/execution:/state/execution
@@ -95,7 +95,7 @@ services:
     depends_on: [console]
   media:
     <<: *common
-    image: ghcr.io/ccawmiku/nas-download-media:${NAS_DOWNLOAD_VERSION:-v4.0.12}
+    image: ghcr.io/ccawmiku/nas-download-media:${NAS_DOWNLOAD_VERSION:-v4.0.14}
     build: {context: ., dockerfile: containers/media.Dockerfile}
     devices: ["/dev/dri/renderD128:/dev/dri/renderD128"]
     # DSM kernel has no CPU CFS quota. The worker binds one CPU and uses nice/ionice.
