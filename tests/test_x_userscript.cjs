@@ -331,7 +331,12 @@ test('safeSliceText avoids lone UTF-16 surrogates on Emoji truncation and xBg sc
     path.join(__dirname, '../tools/userscripts/x-nas-queue.user.js'),
     'utf8'
   );
+  assert.match(xSrc, /@version\s+1\.3\.1/);
   assert.match(xSrc, /sync-x-errors/);
   assert.match(xSrc, /autoRetryErrorDetail/);
   assert.match(xSrc, /sourceMode:\s*'error_retry'/);
+
+  const errUrl = xQueue.endpoint('192.168.1.20', '14001', '/api/browser-push/errors?platform=x&limit=200');
+  assert.equal(errUrl, 'http://192.168.1.20:14001/api/browser-push/errors?platform=x&limit=200');
+  assert.equal(errUrl.includes('%3F'), false);
 });

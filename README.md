@@ -62,9 +62,9 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
 
 | 脚本文件 | 当前版本 | 用途与主要能力 |
 |---|---|---|
-| [x-nas-queue.user.js](tools/userscripts/x-nas-queue.user.js) | `1.3.0` | X 浏览器直推工作台：GraphQL 直链拦截、Quote 方案 A 归档、实时 `tweet_id` 对账与早停、基线导入、NAS 失败列表同步与详情自动重推 |
+| [x-nas-queue.user.js](tools/userscripts/x-nas-queue.user.js) | `1.3.1` | X 浏览器直推工作台：GraphQL 直链拦截、Quote 方案 A 归档、实时 `tweet_id` 对账与早停、基线导入、NAS 失败列表同步与详情自动重推 |
 | [x-nas-bg.user.js](tools/userscripts/x-nas-bg.user.js) | `1.1.0` | X 每日一次后台自动采集调度脚本（`@crontab * * once * *`）：自动打开点赞页增量推流、轮询 NAS 入队与错误回执 |
-| [xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) | `3.7.0` | 小红书 NAS 下载工作台：点赞/收藏增量对账、滚动实时追捕失败项（`12/18`→`18/18`）并与增量/后台共用早停与重推、单条 `single` 发送、详情抓图直推（方式 A）与 NAS 失败列表联动 |
+| [xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) | `3.7.1` | 小红书 NAS 下载工作台：点赞/收藏增量对账、滚动实时追捕失败项（`12/18`→`18/18`）并与增量/后台共用早停与重推、单条 `single` 发送、详情抓图直推（方式 A）与 NAS 失败列表联动 |
 | [xhs-nas-bg.user.js](tools/userscripts/xhs-nas-bg.user.js) | `1.1.0` | 小红书每日一次后台自动采集调度脚本（`@crontab * * once * *`）：按配置分类依次巡检点赞与收藏并上报结果 |
 
 详细使用说明另见 [小红书浏览器工作台文档](docs/XHS_BROWSER_WORKBENCH.md)。

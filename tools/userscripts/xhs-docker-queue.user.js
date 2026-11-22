@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.7.0
+// @version      3.7.1
 // @description  点赞和收藏按作品 ID 向 NAS 增量对账、实时追捕失败作品新鲜链接（如 12/18→18/18）、连续已归档早停与流式推送，支持失败作品自动重推、详情抓图直推与每日后台回执
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
@@ -51,8 +51,12 @@
     const endpoint = (host, port, path) => {
         const url = new URL(/^https?:\/\//i.test(host) ? host : `http://${host}`);
         if (port && !url.port) url.port = String(port);
-        url.pathname = String(path || '').startsWith('/') ? path : `/${path || ''}`;
-        url.search = '';
+        const rawPath = String(path || '').split('#')[0];
+        const qIndex = rawPath.indexOf('?');
+        const pathPart = qIndex >= 0 ? rawPath.slice(0, qIndex) : rawPath;
+        const searchPart = qIndex >= 0 ? rawPath.slice(qIndex) : '';
+        url.pathname = pathPart.startsWith('/') ? pathPart : `/${pathPart}`;
+        url.search = searchPart;
         url.hash = '';
         return url.href;
     };

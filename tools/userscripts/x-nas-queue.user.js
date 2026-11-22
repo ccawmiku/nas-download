@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.3.0
+// @version      1.3.1
 // @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持服务端 tweet_id 状态对账、连续已归档早停、流式推送、失败列表同步/自动重推与每日后台回执
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -587,8 +587,12 @@
   const endpoint = (host, port, path) => {
     const url = new URL(/^https?:\/\//i.test(host) ? host : `http://${host}`);
     if (port && !url.port) url.port = String(port);
-    url.pathname = String(path || '').startsWith('/') ? path : `/${path || ''}`;
-    url.search = '';
+    const rawPath = String(path || '').split('#')[0];
+    const qIndex = rawPath.indexOf('?');
+    const pathPart = qIndex >= 0 ? rawPath.slice(0, qIndex) : rawPath;
+    const searchPart = qIndex >= 0 ? rawPath.slice(qIndex) : '';
+    url.pathname = pathPart.startsWith('/') ? pathPart : `/${pathPart}`;
+    url.search = searchPart;
     url.hash = '';
     return url.href;
   };

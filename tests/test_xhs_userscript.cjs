@@ -291,18 +291,22 @@ test('selectPushCandidates merges missing and failed refresh works and evaluateX
   assert.equal(released.shouldStop, true);
 });
 
-test('xhs userscript v3.7.0 exposes unified error-hunting UI, Pinia lookup, and DOM fallback', () => {
+test('xhs userscript v3.7.1 exposes unified error-hunting UI, Pinia lookup, DOM fallback, and preserves query strings', () => {
   const fs = require('node:fs');
   const path = require('node:path');
   const src = fs.readFileSync(
     path.join(__dirname, '../tools/userscripts/xhs-docker-queue.user.js'),
     'utf8'
   );
-  assert.match(src, /@version\s+3\.7\.0/);
+  assert.match(src, /@version\s+3\.7\.1/);
   assert.match(src, /findVueNoteDetail/);
   assert.match(src, /extractXhsDomDetailMedia/);
   assert.match(src, /hunt-errors/);
   assert.match(src, /failed-progress/);
   assert.match(src, /push-captured-errors/);
+
+  const errUrl = endpoint('192.168.1.20', '14001', '/api/browser-push/errors?platform=xhs&limit=200');
+  assert.equal(errUrl, 'http://192.168.1.20:14001/api/browser-push/errors?platform=xhs&limit=200');
+  assert.equal(errUrl.includes('%3F'), false);
 });
 
