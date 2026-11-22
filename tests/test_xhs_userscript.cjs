@@ -124,3 +124,16 @@ test('extracts XHS API page notes and evaluates consecutive archived early-stop'
   assert.equal(batchCheck.consecutiveSettled, 0);
 });
 
+test('xhs userscript metadata uses document-start and matches both www and apex xiaohongshu domains', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '../tools/userscripts/xhs-docker-queue.user.js'),
+    'utf8'
+  );
+  assert.match(src, /@run-at\s+document-start/);
+  assert.match(src, /@match\s+https:\/\/www\.xiaohongshu\.com\/\*/);
+  assert.match(src, /@match\s+https:\/\/xiaohongshu\.com\/\*/);
+  assert.match(src, /ensureMounted/);
+});
+

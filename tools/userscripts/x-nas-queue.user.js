@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.1.0
+// @version      1.2.0
 // @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持服务端 tweet_id 状态对账、连续已归档早停、流式推送、仅导入基线与每日后台回执
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -207,6 +207,18 @@
       ? `https://x.com/${author}/status/${tweetId}`
       : `https://x.com/i/web/status/${tweetId}`;
 
+  const safeSliceText = (text, maxChars = 120) => {
+    const limit = Math.max(0, Number(maxChars) || 0);
+    const chars = [];
+    for (const ch of String(text || '').replace(/\s+/g, ' ')) {
+      const code = ch.charCodeAt(0);
+      if (ch.length === 1 && code >= 0xd800 && code <= 0xdfff) continue;
+      chars.push(ch);
+      if (chars.length >= limit) break;
+    }
+    return chars.join('');
+  };
+
   const normalizeTweetResult = (rawResult, sortIndex = '') => {
     const outer = unwrapTweetResult(rawResult);
     if (!outer) return null;
@@ -287,7 +299,7 @@
       directUrls,
       mediaDetails: allMedia,
       anomalies,
-      textPreview: fullText.replace(/\s+/g, ' ').slice(0, 120),
+      textPreview: safeSliceText(fullText, 120),
     };
   };
 
@@ -712,6 +724,7 @@
       tweetIdFromUrl,
       toOrigImageUrl,
       extractMediaList,
+      safeSliceText,
       normalizeTweetResult,
       flattenDirectManifestItems,
       parseLikesPayload,
@@ -1302,7 +1315,7 @@
         }
         acct = accountScopeKey();
         const cutoff = getCutoff(acct);
-        const maxScrolls = Math.max(1, Math.min(200, Number(cfg.maxBgScrolls || 60)));
+        const maxScrolls = Math.max(1, Math.min(1000, Number(cfg.maxBgScrolls || 60)));
         const stopThreshold = Math.max(0, Number(cfg.stopConsecutive ?? 15));
         const flushBatchSize = Math.max(5, Math.min(200, Number(cfg.flushBatchSize || 30)));
         const settledSet = new Set(['archived', 'pending', 'deferred']);
@@ -1529,6 +1542,7 @@
     }
 
     // 前台工作台 UI
+    document.querySelectorAll('#nas-x-workbench').forEach((n) => n.remove());
     const host = document.createElement('div');
     host.id = 'nas-x-workbench';
     const shadow = host.attachShadow({ mode: 'open' });
@@ -1597,8 +1611,8 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     <label class="field">NAS 主机<input id="cfg-host" placeholder="192.168.1.20 或 https://..."></label>
     <div class="row">
       <label class="field grow">端口<input id="cfg-port"></label>
-      <label class="field grow">最大手动滚动<input id="cfg-max-scroll" type="number" min="1" max="300"></label>
-      <label class="field grow">后台最大滚动<input id="cfg-bg-scroll" type="number" min="1" max="200"></label>
+      <label class="field grow">最大手动滚动<input id="cfg-max-scroll" type="number" min="1" max="1000"></label>
+      <label class="field grow">后台最大滚动<input id="cfg-bg-scroll" type="number" min="1" max="1000"></label>
     </div>
     <div class="row">
       <label class="field grow">连续已归档早停数（0=全量）<input id="cfg-stop-consecutive" type="number" min="0" max="500"></label>
@@ -1628,9 +1642,9 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     const refreshView = () => {
       const acct = accountScopeKey();
       const ordered = getOrderedTweets();
-      const anchors = getAnchors(acct);
       const cutoff = getCutoff(acct);
       const daily = GM_getValue(STORAGE_KEYS.DAILY_STATE, {});
+      const stopThresholdView = Math.max(0, Number(cfg.stopConsecutive ?? 15));
       $('#pill').textContent = String(ordered.length);
       $('#acct-label').textContent = `账号区：${acct}`;
       $('#page-hint').textContent = isLikesPagePath(location.pathname)
@@ -1638,17 +1652,12 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         : `当前页面 ${ordered.length} 条已缓存 · 无需 Cookie`;
       $('#cutoff-label').textContent = cutoff ? `已设置截止 ID：${cutoff}` : '未设置手动截止';
       $('#anchor-box').innerHTML = `
-        <div class="row spread"><strong>5 锚点断点（发送确认后推进）</strong><button class="quiet" id="clear-anchors">清空锚点</button></div>
-        <div class="muted" style="margin-top:4px">${
-          anchors.length ? `已保存 ${anchors.length} 个：${anchors.join(', ')}` : '尚未建立锚点（首次发送后自动保存最近 5 条）'
-        }</div>
+        <div class="row spread"><strong>服务端 ID 实时对账</strong><span class="badge ok">${
+          stopThresholdView > 0 ? `连续 ${stopThresholdView} 条已归档早停` : '全量不早停'
+        }</span></div>
+        <div class="muted" style="margin-top:4px">无需本地锚点断点，自动对照 NAS 已归档与基线库去重</div>
         <div class="muted" style="margin-top:4px">今日自动定时锁：${daily.lastSuccessDate || '今日尚未完成'}</div>
       `;
-      $('#clear-anchors').onclick = async () => {
-        await gmSetAll({ [STORAGE_KEYS.ANCHORS_PREFIX + acct]: [] });
-        refreshView();
-        setStatus('已清空当前账号区 5 锚点记录。');
-      };
 
       const manifests = flattenDirectManifestItems(ordered);
       $('#list-summary').textContent = `推文 ${ordered.length} · 可下直链组 ${manifests.manifests.length} · 纯文 ${manifests.textOnlySkipped}`;
@@ -1736,14 +1745,15 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       if (scrolling || busy) return;
       scrolling = true;
       $('#stop-scroll').classList.remove('hidden');
+      cfg = loadConfig();
       const acct = accountScopeKey();
-      const anchors = new Set(getAnchors(acct));
       const cutoff = getCutoff(acct);
       const stopThreshold = Math.max(0, Number(cfg.stopConsecutive ?? 15));
+      const maxManualScrolls = Math.max(1, Math.min(1000, Number(cfg.maxScrolls || 60)));
       const statesCache = {};
       let idle = 0;
       try {
-        for (let step = 0; step < Number(cfg.maxScrolls || 60) && scrolling; step += 1) {
+        for (let step = 0; step < maxManualScrolls && scrolling; step += 1) {
           const ordered = getLikesTweets();
           if (cutoff && ordered.some((t) => t.id === cutoff)) {
             setStatus(`已滚动命中手动截止位置，共缓存 ${ordered.length} 条。`);
@@ -1766,9 +1776,6 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
               setStatus(`已命中连续 ${stopThreshold} 条 NAS 已归档记录，停止加载（共 ${ordered.length} 条）。`);
               break;
             }
-          } else if (ordered.some((t) => anchors.has(t.id))) {
-            setStatus(`已滚动命中本地锚点，共缓存 ${ordered.length} 条。`);
-            break;
           }
           const before = ordered.length;
           const prevReq = likesGraphqlCount;
@@ -1964,19 +1971,21 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       setStatus(`正在打开后台静默标签页执行一次采集 (${runId})…`);
       let tab = null;
       try {
+        const bgLimit = Math.max(1, Math.min(1000, Number(cfg.maxBgScrolls || 60)));
+        const timeoutMs = Math.max(180000, bgLimit * 2500 + 120000);
         const result = await awaitBgResult({
           cfg,
           storageKey: STORAGE_KEYS.BG_RESULT,
           runId,
-          timeoutMs: 120000,
-          timeoutMessage: '后台标签页超时（120 秒）未返回回执',
+          timeoutMs,
+          timeoutMessage: `后台标签页超时（${Math.round(timeoutMs / 1000)} 秒）未返回回执`,
           openTab: () => {
             tab = GM_openInTab(tabUrl, { active: false, insert: true, setParent: true });
             return tab;
           },
         });
         setStatus(
-          `后台运行结束：${result.status} (${result.reason || ''}) · 新增 ${result.itemCount || 0} · 锚点更新=${Boolean(result.anchorUpdated)}`,
+          `后台运行结束：${result.status} (${result.reason || ''}) · 已接收 ${result.itemCount || 0}`,
           result.status !== 'ok'
         );
       } catch (e) {
@@ -1998,8 +2007,8 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         port: $('#cfg-port').value.trim() || '14001',
         path: $('#cfg-path').value.trim() || '/api/x/direct',
         token: $('#cfg-token').value.trim(),
-        maxScrolls: Math.max(1, Math.min(300, Number($('#cfg-max-scroll').value || 60))),
-        maxBgScrolls: Math.max(1, Math.min(200, Number($('#cfg-bg-scroll').value || 60))),
+        maxScrolls: Math.max(1, Math.min(1000, Number($('#cfg-max-scroll').value || 60))),
+        maxBgScrolls: Math.max(1, Math.min(1000, Number($('#cfg-bg-scroll').value || 60))),
         stopConsecutive: Math.max(0, Math.min(500, Number($('#cfg-stop-consecutive').value ?? 15))),
         flushBatchSize: cfg.flushBatchSize || 30,
         bgTargetUrl: $('#cfg-bg-url').value.trim() || 'https://x.com/i/history/likes',
@@ -2044,6 +2053,9 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     hydrateSettingsForm();
     refreshView();
     setInterval(() => {
+      if (!host.isConnected && document.body) {
+        document.body.append(host);
+      }
       if (isLikesPagePath(location.pathname) && location.pathname !== activeLikesPath) {
         resetLikesCache(location.pathname);
       }

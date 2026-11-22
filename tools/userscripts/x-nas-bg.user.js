@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X · 每日一次 NAS 后台自动采集
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.0.2
-// @description  每天自动执行一次 X 点赞增量直推 NAS（采用原生 once 每日锁 + 手动运行一次必执行，支持 NAS 接口回执轮询与失败自动重试）
+// @version      1.1.0
+// @description  每天自动执行一次 X 点赞增量直推 NAS（采用原生 once 每日锁 + 手动运行一次必执行，支持按滚动上限动态调整超时、NAS 接口回执轮询与失败自动重试）
 // @crontab      * * once * *
 // @storageName  nas_prod_x_v1
 // @grant        GM.getValue
@@ -32,7 +32,10 @@
 
   const DEFAULT_MAX_DAILY_FAILS = 3;
   const RETRY_COOLDOWN_MS = 25 * 60 * 1000;
-  const TAB_TIMEOUT_MS = 150 * 1000;
+  const computeTabTimeout = (config) => {
+    const scrolls = Math.max(1, Math.min(1000, Number(config?.maxBgScrolls) || 60));
+    return Math.max(150000, scrolls * 2500 + 120000);
+  };
 
   const localDateKey = (nowMs = Date.now()) => {
     const d = new Date(nowMs);
@@ -99,6 +102,7 @@
       RETRY_COOLDOWN_MS,
       localDateKey,
       endpoint,
+      computeTabTimeout,
       canScheduleRetry,
       shouldRunDailyBg,
       markDailySuccess,
@@ -259,12 +263,13 @@
     let tab = null;
 
     try {
+      const timeoutMs = computeTabTimeout(config);
       const result = await awaitBgResult({
         config,
         storageKey: STORAGE_KEYS.BG_RESULT,
         runId,
-        timeoutMs: TAB_TIMEOUT_MS,
-        timeoutMessage: 'X 后台采集超时 (150s)',
+        timeoutMs,
+        timeoutMessage: `X 后台采集超时 (${Math.round(timeoutMs / 1000)}s)`,
         openTab: () => {
           tab = GM_openInTab(tabUrl, { active: false, insert: true });
           return tab;
@@ -292,7 +297,7 @@
         [STORAGE_KEYS.DAILY_STATE]: markDailyFailure(latestState, Date.now(), msg),
       });
       log(`[X-NAS-BG] failed:${msg}`);
-      notify('X 自动同步异常（未推进断点）', msg);
+      notify('X 自动同步异常', msg);
       if (allowRetry && typeof CATRetryError === 'function') {
         throw new CATRetryError(msg, RETRY_COOLDOWN_MS / 1000);
       }

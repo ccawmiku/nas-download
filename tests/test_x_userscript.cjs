@@ -310,3 +310,18 @@ test('evaluates server reconcile early-stop with text-only skip, Quote Option A 
   assert.equal(streamMap.has('151'), true);
   assert.equal(mixedOrder.includes('151'), true);
 });
+
+test('safeSliceText avoids lone UTF-16 surrogates on Emoji truncation and xBg scales timeout dynamically', () => {
+  const atBoundary = `${'a'.repeat(119)}\u{1FA77}tail`;
+  const sliced = xQueue.safeSliceText(atBoundary, 120);
+  assert.equal(sliced, `${'a'.repeat(119)}\u{1FA77}`);
+  assert.doesNotThrow(() => encodeURIComponent(sliced));
+
+  const withBrokenSurrogate = 'prefix \ud83e suffix';
+  const cleaned = xQueue.safeSliceText(withBrokenSurrogate, 120);
+  assert.equal(cleaned, 'prefix  suffix');
+  assert.doesNotThrow(() => encodeURIComponent(cleaned));
+
+  assert.equal(xBg.computeTabTimeout({maxBgScrolls: 60}), 270000);
+  assert.equal(xBg.computeTabTimeout({maxBgScrolls: 1000}), 2620000);
+});

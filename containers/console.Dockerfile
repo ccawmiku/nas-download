@@ -13,6 +13,7 @@ WORKDIR /app
 COPY core/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY core/ ./core/
+COPY tools/import_x_baseline.py ./tools/import_x_baseline.py
 COPY --from=frontend /build/frontend/dist ./frontend/dist/
 EXPOSE 14001
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:14001/healthz',timeout=3)"

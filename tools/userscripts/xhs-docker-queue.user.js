@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.4.0
+// @version      3.5.0
 // @description  点赞和收藏按作品 ID 向 NAS 增量对账、连续已归档早停与流式推送，支持 API 响应拦截防 DOM 回收与每日后台回执
 // @match        https://www.xiaohongshu.com/*
+// @match        https://xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -21,7 +22,7 @@
 // @grant        window.close
 // @connect      *
 // @license      GPL-3.0
-// @run-at       document-end
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
@@ -732,7 +733,28 @@
     };
 
     // ==================== 后台自动任务执行路径 (#nas_bg_run=...) ====================
-    const bgRun = parseBgRunHash(location.hash);
+    const initialBgRun = parseBgRunHash(location.hash);
+    const onDomReady = fn => {
+        if (document.readyState !== 'loading' && document.body) {
+            fn();
+            return;
+        }
+        let ran = false;
+        let timer = null;
+        const trigger = () => {
+            if (ran || !document.body) return;
+            ran = true;
+            if (timer) clearInterval(timer);
+            fn();
+        };
+        document.addEventListener('DOMContentLoaded', trigger, {once: true});
+        timer = setInterval(() => {
+            if (document.body && document.readyState !== 'loading') trigger();
+        }, 150);
+    };
+
+    onDomReady(() => {
+    const bgRun = initialBgRun.runId ? initialBgRun : parseBgRunHash(location.hash);
     if (bgRun.runId) {
         (async () => {
             const targetMode = bgRun.mode === 'saved' ? 'saved' : 'liked';
@@ -1010,6 +1032,7 @@
         }
     };
 
+    document.querySelectorAll('#nas-xhs-workbench').forEach(node => node.remove());
     const host = document.createElement('div');
     host.id = 'nas-xhs-workbench';
     const shadow = host.attachShadow({mode: 'open'});
@@ -1092,7 +1115,14 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
   <p class="muted">授权从 NAS 控制台「浏览器直推 / 设置」复制；测试结果也会同步显示在 NAS 控制台。</p>
 </details>
 </div></section>`;
-    document.body.append(host);
+    const ensureMounted = () => {
+        if (!document.body || bgRun.runId) return;
+        if (!host.isConnected) document.body.append(host);
+    };
+    ensureMounted();
+    setTimeout(ensureMounted, 500);
+    setTimeout(ensureMounted, 1500);
+    setTimeout(ensureMounted, 3000);
     const $ = selector => shadow.querySelector(selector);
     const status = (message, error = false) => {
         $('#status').textContent = message;
@@ -1447,6 +1477,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
     let lastUrl = location.href;
     let lastPath = location.pathname;
     setInterval(() => {
+        ensureMounted();
         if (lastUrl === location.href) return;
         lastUrl = location.href;
         if (lastPath !== location.pathname) {
@@ -1464,8 +1495,10 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         status('页面已切换，请重新读取作品。');
     }, 700);
     GM_registerMenuCommand('打开小红书 NAS 下载工作台', () => {
+        ensureMounted();
         $('.panel').classList.remove('hidden');
         render();
     });
     render();
+    });
 })();
