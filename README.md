@@ -69,6 +69,11 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
 
 详细使用说明另见 [小红书浏览器工作台文档](docs/XHS_BROWSER_WORKBENCH.md)。
 
+### 安装与授权步骤
+1. 在桌面版浏览器的 Tampermonkey 中，从本仓库 `main` 分支的 [tools/userscripts/](tools/userscripts) 导入对应平台的 `queue`（工作台）与 `bg`（每日后台定时）脚本。
+2. 登录 NAS 控制台进入 **「浏览器推送」** 页面复制授权密钥 `X-NAS-Submit-Token`。
+3. 打开 X 或小红书页面点击右下/左下悬浮按钮打开工作台设置，填入 NAS 主机地址、端口（默认 `14001`）与 `X-NAS-Submit-Token`，保存后测试连通性即可。
+
 ---
 
 ## 部署、构建与升级
@@ -79,16 +84,20 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
 3. 全新切换 v4 时以 root 执行一次 [scripts/prepare-v4.sh](scripts/prepare-v4.sh) 初始化 `v4/core`、`v4/execution` 与工作区目录。
 
 ### 启动与源码重建
-- **拉取发布镜像运行**：
+- **拉取已发布 GHCR 镜像运行**：
+  `compose.v4.yml` 默认拉取 `NAS_DOWNLOAD_VERSION=v4.0.14` 对应的五个 GHCR 镜像（推送 `v*` 标签会触发 [.github/workflows/ci.yml](.github/workflows/ci.yml) 构建并发布新标签镜像）：
   ```sh
   docker compose -f compose.v4.yml pull
   docker compose -f compose.v4.yml up -d --no-build
   ```
-- **基于当前源码重建测试（开发分支必做）**：
+- **直接从 `main` 源码重建运行（包含最新功能与修复）**：
+  `main` 源码包含控制台 `Pillow==13.0.0` WEBP 缩略图缓存与媒体记录瀑布流视图、小红书 `run_direct` 直推、X Quote 方案 A 直推及多项增量对账/失败重下修复。若不等待新发布标签而直接使用最新源码，可本地构建运行；升级已有容器时建议先停并清除旧容器再重建 `console`、`xhs` 与 `engines`：
   ```sh
-  docker compose -f compose.v4.yml up -d --build
+  docker compose -f compose.v4.yml stop console xhs engines
+  docker compose -f compose.v4.yml rm -f console xhs engines
+  docker compose -f compose.v4.yml up -d --build console xhs engines
   ```
-  > 提示：本次更新在控制台新增了 `Pillow==13.0.0` 缩略图依赖与前端瀑布流视图，在小红书服务新增了 `run_direct` 直推执行逻辑；从源码测试务必重新构建 `console` 与 `xhs` 镜像（建议连同 `engines` 一起重建）。
+  首次全量从源码构建启动全部服务可执行 `docker compose -f compose.v4.yml up -d --build`。
 
 ### 核心固定依赖与兼容说明
 - 核心与下载引擎固定版本：`Pillow 13.0.0`、`pillow-heif 1.8.1`、`yt-dlp 2026.10.26`、`gallery-dl 1.32.19`，以及固定版本 F2 与 XHS-Downloader（来源信息见 [PROVENANCE.md](PROVENANCE.md)）。
