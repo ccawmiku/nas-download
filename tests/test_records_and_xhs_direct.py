@@ -370,3 +370,113 @@ def test_xhs_run_direct_worker_clears_failure_metadata(client, tmp_path, monkeyp
     assert "needs_fresh_token" not in updated["metadata"]
     assert len(updated["files"]) == 1
     assert Path(updated["files"][0]).is_file()
+
+
+def test_reconcile_returns_pending_when_deferred_xhs_note_requeued_and_force_retry_skips_check_record(
+    client, tmp_path, monkeypatch
+):
+    token = client.get("/api/browser-push/token").json()["token"]
+    headers = {"Origin": "https://www.xiaohongshu.com", "X-NAS-Submit-Token": token}
+    old_url = f"https://www.xiaohongshu.com/explore/{NOTE_C}?xsec_token=old_t"
+    fresh_url = f"https://www.xiaohongshu.com/explore/{NOTE_C}?xsec_token=new_t"
+    server.record(
+        {
+            "platform": "xhs",
+            "source_id": NOTE_C,
+            "state": "failed",
+            "files": [],
+            "metadata": {
+                "url": old_url,
+                "retry_paused": True,
+                "retry_exhausted": True,
+                "error": "xsec_token expired",
+            },
+        }
+    )
+
+    r1 = client.post("/api/xhs/reconcile", headers=headers, json={"ids": [NOTE_C]})
+    assert r1.status_code == 200
+    assert r1.json()["states"][NOTE_C] == "deferred"
+
+    submit = client.post(
+        "/api/xhs/links",
+        headers=headers,
+        json={
+            "urls": [fresh_url],
+            "destination": "batch",
+            "category": "liked",
+            "force_retry": True,
+            "source_mode": "error_retry",
+        },
+    )
+    assert submit.status_code == 200
+    assert submit.json()["accepted"] == 1
+
+    r2 = client.post("/api/xhs/reconcile", headers=headers, json={"ids": [NOTE_C]})
+    assert r2.status_code == 200
+    assert r2.json()["states"][NOTE_C] == "pending"
+
+    # Verify workers/xhs_job.py disables ExploreData.db check_record when force_retry=True
+    import sys
+    import types
+
+    captured_check_record = []
+    archive_dir = tmp_path / "xhs_archive"
+    archive_dir.mkdir(parents=True)
+    monkeypatch.setitem(xhs_job.CONFIG_PATHS, "xhs", tmp_path / "xhs-cfg.json")
+    write_json(tmp_path / "xhs-cfg.json", {"request_delay_seconds": 0})
+    settings_path = tmp_path / "xhs-settings.json"
+    write_json(settings_path, {"work_path": str(archive_dir), "folder_name": "Download"})
+    monkeypatch.setenv("XHS_SETTINGS_PATH", str(settings_path))
+
+    class _FakeRecorder:
+        async def add(self, identifier, *args, **kwargs):
+            pass
+
+    class _FakeXHS:
+        def __init__(self, **_kwargs):
+            self.id_recorder = _FakeRecorder()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def extract(self, url, **kwargs):
+            captured_check_record.append(kwargs.get("check_record"))
+            return [{"作品ID": NOTE_C, "作品标题": "recovered"}]
+
+    fake_pkg = types.ModuleType("source")
+    fake_app_mod = types.ModuleType("source.application")
+    fake_app_inner = types.ModuleType("source.application.app")
+    fake_app_inner.XHS = _FakeXHS
+    fake_pkg.application = fake_app_mod
+    fake_app_mod.app = fake_app_inner
+    monkeypatch.setitem(sys.modules, "source", fake_pkg)
+    monkeypatch.setitem(sys.modules, "source.application", fake_app_mod)
+    monkeypatch.setitem(sys.modules, "source.application.app", fake_app_inner)
+
+    class _FakeClient:
+        def request(self, path, payload=None):
+            if path.startswith("/internal/record/xhs/"):
+                return server.get_record("xhs", path.rsplit("/", 1)[-1])
+            return {}
+
+    monkeypatch.setattr(xhs_job, "Client", _FakeClient)
+    monkeypatch.setattr(xhs_job, "prepare", lambda _p, _i, _j: (archive_dir / "incoming", False))
+    monkeypatch.setattr(xhs_job, "record", lambda *_args, **_kw: None)
+
+    job = {
+        "id": "job_force_retry_test",
+        "platform": "xhs",
+        "kind": "links",
+        "payload": {
+            "urls": [fresh_url],
+            "destination": "batch",
+            "category": "liked",
+            "force_retry": True,
+        },
+    }
+    asyncio.run(xhs_job.run(job))
+    assert captured_check_record == [False]

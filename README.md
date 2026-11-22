@@ -45,10 +45,10 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
   - 服务器端可通过离线脚本 [tools/import_x_baseline.py](tools/import_x_baseline.py) 扫描本地已归档媒体目录及旧版历史库（默认仅依据实际媒体文件名/元数据按需导入，零 Cookie、零外网请求）。
 - **旧版 Cookie 入口隔离与防误触**：控制台发起 X 重试或全量操作时会弹出二次确认，默认推荐使用「仅重试直推记录（免 Cookie）」（`direct_only`），防止误触发旧版 Cookie 无头浏览器链路。
 
-### 2. 小红书（作品 ID 对账 · 详情抓图直推 · 过期链接自动刷新）
-- **增量对账与保鲜入队**：[tools/userscripts/xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) 读取点赞与收藏列表，通过 `POST /api/xhs/reconcile` 按 24 位作品 ID 核对状态（`archived` / `pending` / `deferred` / `failed` / `missing`），流式提交缺失作品携带完整 `xsec_token` 的链接至 `POST /api/xhs/links`，支持分类保存与单个作品独立保存（`destination: "single"`）。
-- **详情抓图直推（方式 A）**：当服务端解析遇到 `xsec_token` 过期或网页限制时，可在小红书作品详情页通过 API Hook / 页面数据直接提取官方 CDN 媒体直链（`xhscdn.com` / `xhscdn.net` / `xiaohongshu.com`，后端 [core/xhs_direct.py](core/xhs_direct.py) 执行严格域名白名单、HTTPS 443 端口校验与防 SSRF 重定向检查）并提交至 `POST /api/xhs/direct` 下载归档。
-- **后台自动刷新过期 `xsec_token`**：每日后台脚本启动扫描前会自动查询 `GET /api/browser-push/errors?platform=xhs`；在列表流中重新遇到处于 `failed` / `deferred` / 暂缓状态的作品时，自动携带新鲜 `xsec_token` 与 `force_retry: true` 重新提交 NAS 入队解锁。
+### 2. 小红书（作品 ID 对账 · 滚动追捕失败项 · 详情抓图直推）
+- **增量对账与保鲜入队**：[tools/userscripts/xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) 读取点赞与收藏列表，通过 `POST /api/xhs/reconcile` 按 24 位作品 ID 核对状态（`archived` / `pending` / `deferred` / `missing`），流式提交缺失作品携带完整 `xsec_token` 的链接至 `POST /api/xhs/links`，支持分类保存与单个作品独立保存（`destination: "single"`）。
+- **滚动追捕失败项（`12/18` → `18/18`）与增量/后台共用**：工作台在页面打开及滚动点赞/收藏列表时，实时对比 NAS 错误列表并显示最新 `xsec_token` 的捕获进度（如 `12/18`、`18/18`）。前台点击「自动加载」或每日后台任务运行期间，开启追捕开关后在未捕获齐当前分类失败项之前不触发连续早停，并把捕获到的失败作品新链接与增量新作品一并携带 `force_retry: true` 推回 NAS 重下，也支持在面板一键推送已捕获的失败项。
+- **详情抓图直推（方式 A）**：当服务端解析遇到页面限制时，可在小红书作品详情页通过 `/feed` API Hook、Vue/Pinia 状态或 DOM 媒体兜底直接提取官方 CDN 媒体直链（`xhscdn.com` / `xhscdn.net` / `xiaohongshu.com`，后端 [core/xhs_direct.py](core/xhs_direct.py) 执行严格域名白名单、HTTPS 443 端口校验与防 SSRF 重定向检查）并提交至 `POST /api/xhs/direct` 下载归档。
 
 ### 3. 统一失败列表联动与重下闭环
 - X 与小红书油猴工作台均内置「NAS 失败重试」区块，通过 `GET /api/browser-push/errors` 拉取当前未解决失败记录。
@@ -64,7 +64,7 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
 |---|---|---|
 | [x-nas-queue.user.js](tools/userscripts/x-nas-queue.user.js) | `1.3.0` | X 浏览器直推工作台：GraphQL 直链拦截、Quote 方案 A 归档、实时 `tweet_id` 对账与早停、基线导入、NAS 失败列表同步与详情自动重推 |
 | [x-nas-bg.user.js](tools/userscripts/x-nas-bg.user.js) | `1.1.0` | X 每日一次后台自动采集调度脚本（`@crontab * * once * *`）：自动打开点赞页增量推流、轮询 NAS 入队与错误回执 |
-| [xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) | `3.6.0` | 小红书 NAS 下载工作台：点赞/收藏增量对账、单条 `single` 发送、过期链接自动刷新、详情抓图直推（方式 A）与 NAS 失败重试联动 |
+| [xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) | `3.7.0` | 小红书 NAS 下载工作台：点赞/收藏增量对账、滚动实时追捕失败项（`12/18`→`18/18`）并与增量/后台共用早停与重推、单条 `single` 发送、详情抓图直推（方式 A）与 NAS 失败列表联动 |
 | [xhs-nas-bg.user.js](tools/userscripts/xhs-nas-bg.user.js) | `1.1.0` | 小红书每日一次后台自动采集调度脚本（`@crontab * * once * *`）：按配置分类依次巡检点赞与收藏并上报结果 |
 
 详细使用说明另见 [小红书浏览器工作台文档](docs/XHS_BROWSER_WORKBENCH.md)。

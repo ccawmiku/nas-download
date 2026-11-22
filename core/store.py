@@ -177,11 +177,11 @@ class Store:
             payload_obj = json.loads(row[0] or "{}")
             for url in payload_obj.get("urls") or []:
                 note = xhs_link_id(url)
-                if note in wanted and note not in states:
+                if note in wanted and states.get(note) != "archived":
                     states[note] = "pending"
             for entry in payload_obj.get("items") or []:
                 note = str(entry.get("note_id") or "").strip().lower()
-                if note in wanted and note not in states:
+                if note in wanted and states.get(note) != "archived":
                     states[note] = "pending"
         return states, previous
 

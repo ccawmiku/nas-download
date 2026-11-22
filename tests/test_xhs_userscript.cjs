@@ -199,3 +199,110 @@ test('extractXhsNoteMedia parses images/videos and pickFailedRefreshIds detects 
   assert.deepEqual(picked, [id]);
 });
 
+const {
+  toHttpsUrl,
+  computeFailedCaptureProgress,
+  selectPushCandidates,
+} = require('../tools/userscripts/xhs-docker-queue.user.js');
+
+test('toHttpsUrl normalizes protocol-relative CDN URLs and extracts them in extractXhsNoteMedia', () => {
+  assert.equal(toHttpsUrl('//sns-webpic-qc.xhscdn.com/a.webp'), 'https://sns-webpic-qc.xhscdn.com/a.webp');
+  assert.equal(toHttpsUrl('http://sns-video-bd.xhscdn.com/v.mp4'), 'https://sns-video-bd.xhscdn.com/v.mp4');
+  const note = extractXhsNoteMedia({
+    noteId: id,
+    imageList: [{urlDefault: '//sns-webpic-qc.xhscdn.com/proto_rel.jpg'}],
+  });
+  assert.equal(note.media[0].url, 'https://sns-webpic-qc.xhscdn.com/proto_rel.jpg');
+});
+
+test('computeFailedCaptureProgress tracks 12/18 -> 18/18 progress by category and prefers tokenized URLs', () => {
+  const errIds = Array.from({length: 18}, (_, i) => (i + 1).toString(16).padStart(24, 'a'));
+  const errorRows = errIds.map((sid, idx) => ({
+    source_id: sid,
+    category: idx < 12 ? 'liked' : idx < 16 ? 'saved' : '',
+    url: `https://www.xiaohongshu.com/explore/${sid}?xsec_token=stale`,
+  }));
+
+  const first12 = errIds.slice(0, 12).map(sid => ({
+    id: sid,
+    category: 'liked',
+    url: `https://www.xiaohongshu.com/explore/${sid}?xsec_token=fresh_${sid}`,
+  }));
+  const prog12 = computeFailedCaptureProgress(errorRows, first12, 'liked');
+  assert.equal(prog12.total, 18);
+  assert.equal(prog12.capturedTotal, 12);
+  assert.equal(prog12.relevantTotal, 14); // 12 liked + 2 uncategorized
+  assert.equal(prog12.capturedRelevant, 12);
+  assert.equal(prog12.remainingRelevant, 2);
+  assert.equal(prog12.allRelevantCaptured, false);
+  assert.equal(prog12.allTotalCaptured, false);
+
+  const all18 = errIds.map(sid => ({
+    id: sid,
+    url: `https://www.xiaohongshu.com/explore/${sid}?xsec_token=fresh_${sid}`,
+  }));
+  // Include a stale no-token duplicate that must not overwrite the tokenized URL
+  all18.push({id: errIds[0], url: `https://www.xiaohongshu.com/explore/${errIds[0]}`});
+  const prog18 = computeFailedCaptureProgress(errorRows, all18, 'liked');
+  assert.equal(prog18.capturedTotal, 18);
+  assert.equal(prog18.remainingRelevant, 0);
+  assert.equal(prog18.allRelevantCaptured, true);
+  assert.equal(prog18.allTotalCaptured, true);
+  assert.match(prog18.capturedMap[errIds[0]].url, /xsec_token=fresh_/);
+});
+
+test('selectPushCandidates merges missing and failed refresh works and evaluateXhsEarlyStop waits until errors are caught', () => {
+  const missingId = '111111111111111111111111';
+  const deferredErrId = '222222222222222222222222';
+  const archivedId = '333333333333333333333333';
+  const pendingId = '444444444444444444444444';
+  const items = [
+    {id: archivedId, url: `https://www.xiaohongshu.com/explore/${archivedId}?xsec_token=a`},
+    {id: missingId, url: `https://www.xiaohongshu.com/explore/${missingId}?xsec_token=m`},
+    {id: pendingId, url: `https://www.xiaohongshu.com/explore/${pendingId}?xsec_token=p`},
+    {id: deferredErrId, url: `https://www.xiaohongshu.com/explore/${deferredErrId}?xsec_token=fresh_tok`},
+  ];
+  const states = {
+    [archivedId]: 'archived',
+    [missingId]: 'missing',
+    [pendingId]: 'pending',
+    [deferredErrId]: 'deferred',
+  };
+  const errMap = {
+    [deferredErrId]: {
+      source_id: deferredErrId,
+      retry_exhausted: true,
+      url: `https://www.xiaohongshu.com/explore/${deferredErrId}?xsec_token=old_tok`,
+    },
+  };
+  const picked = selectPushCandidates(items, states, errMap, {requireFreshDiff: true});
+  assert.deepEqual(picked.missingItems.map(x => x.id), [missingId]);
+  assert.deepEqual(picked.failedRefreshItems.map(x => x.id), [deferredErrId]);
+  assert.deepEqual(picked.allItems.map(x => x.id), [missingId, deferredErrId]);
+
+  const ordered = ['a', 'b', 'c', 'd'];
+  const stateSeq = {a: 'missing', b: 'archived', c: 'archived', d: 'archived'};
+  const held = evaluateXhsEarlyStop(ordered, stateSeq, 3, {pendingFailedTargetCount: 2});
+  assert.equal(held.reachedThreshold, true);
+  assert.equal(held.shouldStop, false);
+
+  const released = evaluateXhsEarlyStop(ordered, stateSeq, 3, {pendingFailedTargetCount: 0});
+  assert.equal(released.reachedThreshold, true);
+  assert.equal(released.shouldStop, true);
+});
+
+test('xhs userscript v3.7.0 exposes unified error-hunting UI, Pinia lookup, and DOM fallback', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '../tools/userscripts/xhs-docker-queue.user.js'),
+    'utf8'
+  );
+  assert.match(src, /@version\s+3\.7\.0/);
+  assert.match(src, /findVueNoteDetail/);
+  assert.match(src, /extractXhsDomDetailMedia/);
+  assert.match(src, /hunt-errors/);
+  assert.match(src, /failed-progress/);
+  assert.match(src, /push-captured-errors/);
+});
+

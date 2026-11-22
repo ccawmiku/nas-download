@@ -458,6 +458,7 @@ async def run(job):
                     download=True,
                     check_record=(
                         job["kind"] != "retry"
+                        and not bool(job["payload"].get("force_retry"))
                         and destination_kind != "single"
                         and (not category or category in existing_cats)
                     ),
