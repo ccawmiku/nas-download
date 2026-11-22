@@ -18,6 +18,7 @@ PLATFORMS = {
 }
 
 XHS_ID = re.compile(r"[a-fA-F0-9]{24}\Z")
+X_TWEET_ID = re.compile(r"\d{1,30}\Z")
 
 
 def xhs_link_id(url):
@@ -65,6 +66,7 @@ class Store:
                   state TEXT NOT NULL,files TEXT NOT NULL DEFAULT '[]',metadata TEXT DEFAULT '{}',
                   updated REAL NOT NULL,PRIMARY KEY(platform,source_id));
                 CREATE TABLE IF NOT EXISTS xhs_download_baseline(source_id TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS x_download_baseline(source_id TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY,roles TEXT NOT NULL,
                   updated REAL NOT NULL,details TEXT NOT NULL DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS log_events(id TEXT PRIMARY KEY);
@@ -182,6 +184,76 @@ class Store:
         with self.connect() as db:
             states, _ = self._xhs_states(db, ids)
         return {note: states.get(note, "missing") for note in ids}
+
+    @staticmethod
+    def _x_states(db, ids, redownload_missing=False):
+        if not ids:
+            return {}
+        ids = list(dict.fromkeys(str(i) for i in ids if i))
+        if not ids:
+            return {}
+        slots = ",".join("?" for _ in ids)
+        states = {
+            row[0]: "archived"
+            for row in db.execute(
+                f"SELECT source_id FROM x_download_baseline WHERE source_id IN ({slots})",
+                ids,
+            )
+        }
+        for row in db.execute(
+            f"SELECT source_id,state,files,metadata FROM records WHERE platform='x' AND source_id IN ({slots})",
+            ids,
+        ):
+            source_id = str(row[0])
+            if source_id in states:
+                continue
+            state = row[1]
+            if state == "complete":
+                if not redownload_missing:
+                    states[source_id] = "archived"
+                else:
+                    files = json.loads(row[2] or "[]")
+                    if files and all(Path(p).is_file() for p in files):
+                        states[source_id] = "archived"
+            elif state == "processing":
+                states[source_id] = "pending"
+            elif state == "failed":
+                metadata = json.loads(row[3] or "{}")
+                if metadata.get("retry_exhausted") or metadata.get("direct_unresolvable"):
+                    states[source_id] = "deferred"
+        wanted = set(ids)
+        for row in db.execute(
+            "SELECT payload FROM tasks WHERE platform='x' AND kind='direct' AND state IN ('queued','running')"
+        ):
+            for entry in json.loads(row[0] or "{}").get("items") or []:
+                tid = str(entry.get("tweet_id") or "")
+                if tid in wanted and tid not in states:
+                    states[tid] = "pending"
+        return states
+
+    def x_download_states(self, ids, redownload_missing=False):
+        with self.connect() as db:
+            states = self._x_states(db, ids, redownload_missing=redownload_missing)
+        return {str(tid): states.get(str(tid), "missing") for tid in ids}
+
+    def add_x_baseline(self, ids):
+        clean = list(dict.fromkeys(str(i).strip() for i in ids if X_TWEET_ID.fullmatch(str(i).strip())))
+        if not clean:
+            return 0, 0
+        added = 0
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for tid in clean:
+                added += db.execute(
+                    "INSERT OR IGNORE INTO x_download_baseline(source_id) VALUES (?)",
+                    (tid,),
+                ).rowcount
+        return added, len(clean)
+
+    def x_baseline_count(self):
+        with self.connect() as db:
+            row = db.execute("SELECT count(*) FROM x_download_baseline").fetchone()
+        return int(row[0] or 0) if row else 0
 
     def enqueue_xhs_links(self, payload):
         urls = list(dict.fromkeys(payload["urls"]))

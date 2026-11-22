@@ -247,3 +247,66 @@ test('resolves cached handle, parses bg hash/state, and installs background visi
   assert.equal(bottom.nearBottom, true);
   assert.equal(bottom.step, 120);
 });
+
+test('evaluates server reconcile early-stop with text-only skip, Quote Option A multi-IDs, and cache trimming', () => {
+  const {entries} = xQueue.parseLikesPayload(buildMockLikesResponse());
+  assert.deepEqual(xQueue.extractTweetManifestIds(entries[0]), ['1001', '2002']);
+  assert.deepEqual(xQueue.extractTweetManifestIds(entries[1]), []);
+
+  const t1 = entries[0]; // media IDs: 1001, 2002
+  const tText = entries[1]; // text only
+  const t2 = {
+    id: '1003',
+    outerTweetId: '1003',
+    outerAuthor: 'd',
+    mediaDetails: [{owner: 'outer', ownerTweetId: '1003', ownerAuthor: 'd', type: 'photo', directUrl: 'https://pbs.twimg.com/media/x?format=jpg&name=orig'}],
+  };
+  const t3 = {
+    id: '1004',
+    outerTweetId: '1004',
+    outerAuthor: 'e',
+    mediaDetails: [{owner: 'outer', ownerTweetId: '1004', ownerAuthor: 'e', type: 'photo', directUrl: 'https://pbs.twimg.com/media/y?format=jpg&name=orig'}],
+  };
+
+  // Quote missing -> t1 not settled even if outer 1001 is archived; tText does not reset consecutiveSettled
+  const res1 = xQueue.evaluateReconcileStop(
+    [t1, t2, tText, t3],
+    {'1001': 'archived', '2002': 'missing', '1003': 'archived', '1004': 'pending'},
+    2
+  );
+  assert.equal(res1.toPush.map((t) => t.id).join(','), '1001');
+  assert.equal(res1.shouldStop, true);
+  assert.equal(res1.consecutiveSettled, 2);
+  assert.equal(res1.stopAtTweetId, '1004');
+  assert.equal(res1.textOnly, 1);
+
+  // stopThreshold=0 disables early stop
+  const resFull = xQueue.evaluateReconcileStop(
+    [t2, t3],
+    {'1003': 'archived', '1004': 'archived'},
+    0
+  );
+  assert.equal(resFull.shouldStop, false);
+  assert.equal(resFull.toPush.length, 0);
+
+  // Cache trimming keeps recent window, protected IDs, and never evicts unevaluated arrivals
+  const order = ['1', '2', '3', '4', '5'];
+  const map = new Map(order.map((id) => [id, {id}]));
+  const trimmed = xQueue.trimProcessedCache(order, map, 2, new Set(['2']));
+  assert.equal(trimmed.removedCount, 2);
+  assert.deepEqual(order, ['2', '4', '5']);
+  assert.equal(map.has('1'), false);
+  assert.equal(map.has('2'), true);
+  assert.equal(map.has('3'), false);
+  assert.equal(map.has('5'), true);
+
+  const streamOrder = Array.from({length: 151}, (_, i) => String(i + 1));
+  const streamMap = new Map(streamOrder.map((id) => [id, {id}]));
+  const evaluated = new Set(streamOrder.slice(0, 150));
+  // Move #151 earlier in order or test full 151 where only 1..150 are eligible (simulate #151 arriving anywhere in window)
+  const mixedOrder = ['151', ...streamOrder.slice(0, 150)];
+  const streamRes = xQueue.trimProcessedCache(mixedOrder, streamMap, 120, new Set(), evaluated);
+  assert.equal(streamRes.removedCount, 30);
+  assert.equal(streamMap.has('151'), true);
+  assert.equal(mixedOrder.includes('151'), true);
+});

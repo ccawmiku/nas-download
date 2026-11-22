@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.3.0
-// @description  点赞和收藏按作品 ID 向 NAS 核对，支持每日后台同步与下载回执
+// @version      3.4.0
+// @description  点赞和收藏按作品 ID 向 NAS 增量对账、连续已归档早停与流式推送，支持 API 响应拦截防 DOM 回收与每日后台回执
 // @match        https://www.xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
 // @grant        GM_getValue
@@ -105,6 +105,63 @@
             : `Docker HTTP ${statusCode}，请检查地址、授权和服务版本。`;
     };
 
+    const extractXhsApiNotes = payload => {
+        const rawList = payload?.data?.notes;
+        if (!Array.isArray(rawList)) return [];
+        const baseOrigin =
+            typeof location !== 'undefined' && location?.origin
+                ? location.origin
+                : 'https://www.xiaohongshu.com';
+        const out = [];
+        for (const raw of rawList) {
+            if (!raw || typeof raw !== 'object') continue;
+            const card = raw.note_card || raw.noteCard || raw;
+            const id = noteId(
+                raw.note_id || raw.id || raw.noteId || card.note_id || card.noteId || card.id || ''
+            );
+            if (!id) continue;
+            const token = String(
+                raw.xsec_token || raw.xsecToken || card.xsec_token || card.xsecToken || ''
+            );
+            const url = new URL(`/explore/${id}`, baseOrigin);
+            if (token) url.searchParams.set('xsec_token', token);
+            url.searchParams.set('xsec_source', 'pc_user');
+            out.push({
+                id,
+                url: url.href,
+                title: String(
+                    card.display_title || card.displayTitle || card.title || raw.display_title || raw.title || id
+                ),
+                author: String(
+                    card.user?.nick_name || card.user?.nickName || card.user?.nickname || raw.user?.nickname || ''
+                ),
+                cover: String(
+                    card.cover?.url_default || card.cover?.urlDefault || card.cover?.url || ''
+                ),
+            });
+        }
+        return out;
+    };
+
+    const evaluateXhsEarlyStop = (orderedIds, statesMap = {}, stopThreshold = 30) => {
+        const threshold = Math.max(0, Number(stopThreshold || 0));
+        const settledSet = new Set(['archived', 'pending', 'deferred']);
+        let consecutiveSettled = 0;
+        for (const rawId of Array.isArray(orderedIds) ? orderedIds : []) {
+            const id = String(rawId || '').toLowerCase();
+            if (!id) continue;
+            if (settledSet.has(statesMap[id])) {
+                consecutiveSettled += 1;
+            } else {
+                consecutiveSettled = 0;
+            }
+            if (threshold > 0 && consecutiveSettled >= threshold) {
+                return {shouldStop: true, consecutiveSettled, stopAtId: id};
+            }
+        }
+        return {shouldStop: false, consecutiveSettled, stopAtId: ''};
+    };
+
     // Pure helpers are also exercised by the Node regression tests.
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
@@ -117,6 +174,8 @@
             redactXhsUrl,
             parseBgRunHash,
             extractErrorMessage,
+            extractXhsApiNotes,
+            evaluateXhsEarlyStop,
         };
         return;
     }
@@ -146,6 +205,8 @@
             token: String(saved.token ?? GM_getValue('nasSubmitToken', '')),
             max: Number(saved.max ?? GM_getValue('nasMaxScrolls', 100)) || 100,
             maxBgScrolls: saved.idSync ? Number(saved.maxBgScrolls) || 300 : Math.max(300, Number(saved.maxBgScrolls) || 0),
+            stopConsecutive: saved.stopConsecutive !== undefined ? Math.max(0, Number(saved.stopConsecutive) || 0) : 30,
+            streamBatchSize: Math.max(10, Math.min(500, Number(saved.streamBatchSize || 50))),
             dailyBgEnabled: saved.dailyBgEnabled !== false,
             bgModes: modesList.length ? modesList : ['liked', 'saved'],
             bgProfileUrl: String(saved.bgProfileUrl || ''),
@@ -167,6 +228,75 @@
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const pageWin = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    const apiCaptured = {
+        liked: new Map(),
+        saved: new Map(),
+        published: new Map(),
+    };
+
+    const detectXhsApiMode = reqUrl => {
+        const u = String(reqUrl || '');
+        if (/\/api\/sns\/web\/v\d+\/note\/like\/page(?:[/?#]|$)/.test(u)) return 'liked';
+        if (/\/api\/sns\/web\/v\d+\/note\/collect\/page(?:[/?#]|$)/.test(u)) return 'saved';
+        if (/\/api\/sns\/web\/v\d+\/user_posted(?:[/?#]|$)/.test(u)) return 'published';
+        return '';
+    };
+
+    const ingestXhsApiPayload = (reqUrl, json) => {
+        const apiMode = detectXhsApiMode(reqUrl);
+        if (!apiMode) return;
+        const parsed = extractXhsApiNotes(json);
+        if (!parsed.length) return;
+        const bucket = apiCaptured[apiMode];
+        for (const item of parsed) {
+            const key = item.id.toLowerCase();
+            if (!bucket.has(key)) bucket.set(key, item);
+            else {
+                const prev = bucket.get(key);
+                bucket.set(key, {
+                    ...prev,
+                    ...item,
+                    url: item.url.includes('xsec_token=') ? item.url : prev.url,
+                });
+            }
+        }
+    };
+
+    try {
+        const rawFetch = pageWin.fetch;
+        if (typeof rawFetch === 'function') {
+            pageWin.fetch = async function (...args) {
+                const response = await rawFetch.apply(this, args);
+                try {
+                    const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url || response?.url || '';
+                    if (detectXhsApiMode(reqUrl)) {
+                        response.clone().json().then(json => ingestXhsApiPayload(reqUrl, json)).catch(() => {});
+                    }
+                } catch {}
+                return response;
+            };
+        }
+        const RawXhrOpen = pageWin.XMLHttpRequest?.prototype?.open;
+        const RawXhrSend = pageWin.XMLHttpRequest?.prototype?.send;
+        if (RawXhrOpen && RawXhrSend) {
+            pageWin.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+                this.__nasXhsUrl = String(url || '');
+                return RawXhrOpen.call(this, method, url, ...rest);
+            };
+            pageWin.XMLHttpRequest.prototype.send = function (...args) {
+                this.addEventListener('load', () => {
+                    try {
+                        const reqUrl = this.responseURL || this.__nasXhsUrl || '';
+                        if (this.status >= 200 && this.status < 300 && this.responseText && detectXhsApiMode(reqUrl)) {
+                            ingestXhsApiPayload(reqUrl, JSON.parse(this.responseText));
+                        }
+                    } catch {}
+                });
+                return RawXhrSend.apply(this, args);
+            };
+        }
+    } catch {}
 
     const findVueRef = name => {
         if (pageWin?.__INITIAL_STATE__?.[name]) {
@@ -256,7 +386,7 @@
     }
 
     const readNotesForMode = activeMode => {
-        const domMap = collectDomLinkMap();
+        const apiBucket = apiCaptured[activeMode];
         let raw;
         if (activeMode in indices) {
             if (!accountId(location.pathname)) throw new Error('请先打开要收录的小红书账号主页。');
@@ -275,13 +405,29 @@
                 );
             }
         }
+        const merged = new Map();
+        if (apiBucket && apiBucket.size > 0) {
+            for (const item of apiBucket.values()) merged.set(item.id.toLowerCase(), item);
+        }
+        const needsDom =
+            !Array.isArray(raw) ||
+            raw.length === 0 ||
+            raw.some(item => !(item?.xsecToken || item?.xsec_token || item?.noteCard?.xsecToken || item?.note_card?.xsec_token));
+        const domMap = needsDom ? collectDomLinkMap() : null;
         if (Array.isArray(raw)) {
-            const found = raw.map(item => normalizeNote(item, domMap)).filter(Boolean);
-            if (found.length > 0 || !domMap.size) {
-                return [...new Map(found.map(item => [item.id, item])).values()];
+            for (const entry of raw) {
+                const item = normalizeNote(entry, domMap);
+                if (!item) continue;
+                const key = item.id.toLowerCase();
+                if (!merged.has(key) || (item.url.includes('xsec_token=') && !merged.get(key).url.includes('xsec_token='))) {
+                    merged.set(key, item);
+                }
             }
         }
-        if (domMap.size > 0) {
+        if (merged.size > 0) {
+            return [...merged.values()];
+        }
+        if (domMap && domMap.size > 0) {
             return [...domMap.values()].map(d => ({
                 id: d.id,
                 url: d.url,
@@ -491,6 +637,9 @@
                     accepted: Number(report.accepted || 0),
                     skipped: Number(report.skipped || 0),
                     discovered: Number(report.discovered || 0),
+                    ...(report.item_count !== undefined ? {item_count: Number(report.item_count)} : {}),
+                    ...(report.category ? {category: report.category} : {}),
+                    ...(report.task_id ? {task_id: report.task_id} : {}),
                     message: String(report.message || '').slice(0, 300),
                 }
             );
@@ -618,26 +767,140 @@
                     else throw err;
                 }
 
-                const collected = new Map(loaded.map(it => [it.id, it]));
+                const collected = new Map();
+                const orderedIds = [];
+                const checkedStates = {};
+                const handledIds = new Set();
+                const pushedIds = new Set();
+                const pendingBuffer = [];
                 const maxBg = Math.max(1, Math.min(1000, Number(config.maxBgScrolls || 300)));
-                let idle = 0;
+                const stopThreshold = Math.max(0, Number(config.stopConsecutive ?? 30));
+                const streamBatchSize = Math.max(10, Math.min(500, Number(config.streamBatchSize || 50)));
+                const limited = targetMode === 'liked' || targetMode === 'saved';
+                const batchRoot = makeBatchId(`xhs_${targetMode}`);
+                let batchSeq = 0;
+                let totalDiscovered = 0;
+                let totalSent = 0;
+                let totalAccepted = 0;
+                let totalSkipped = 0;
+                let lastTaskId = '';
+                let soleBatchSentRunId = false;
+                let stoppedEarly = false;
 
-                for (let step = 0; step < maxBg; step += 1) {
+                const ingestList = list => {
+                    let addedHere = 0;
+                    for (const it of list) {
+                        const key = it?.id?.toLowerCase();
+                        if (!key) continue;
+                        if (!handledIds.has(key)) {
+                            handledIds.add(key);
+                            orderedIds.push(key);
+                            collected.set(key, it);
+                            totalDiscovered += 1;
+                            addedHere += 1;
+                        } else if (!pushedIds.has(key) && collected.has(key)) {
+                            const prev = collected.get(key);
+                            if (it.url.includes('xsec_token=') && !prev.url.includes('xsec_token=')) {
+                                collected.set(key, it);
+                            }
+                        }
+                    }
+                    return addedHere;
+                };
+
+                const flushBatch = async (chunkKeys, sendRunId) => {
+                    const chunk = chunkKeys.map(key => collected.get(key)).filter(Boolean);
+                    if (!chunk.length) return;
+                    batchSeq += 1;
+                    const body = await requestSubmit(config, {
+                        urls: chunk.map(item => item.url),
+                        destination: 'batch',
+                        ...(limited ? {category: targetMode} : {}),
+                        ...(sendRunId ? {run_id: bgRun.runId} : {}),
+                        batch_id: `${batchRoot}_p${batchSeq}`,
+                        source_mode: 'bg',
+                        account: acc ? `${acc}:${targetMode}` : targetMode,
+                        discovered: totalDiscovered,
+                    });
+                    if (sendRunId) soleBatchSentRunId = true;
+                    totalSent += chunk.length;
+                    totalAccepted += Number(body.accepted || 0);
+                    totalSkipped += Number(body.skipped || 0);
+                    if (body.task_id) lastTaskId = String(body.task_id);
+                    for (const item of chunk) {
+                        const key = item.id.toLowerCase();
+                        pushedIds.add(key);
+                        collected.delete(key);
+                    }
+                };
+
+                const reconcileAndFlush = async (forceFinal = false) => {
+                    do {
+                        const needIds = orderedIds.filter(id => !(id in checkedStates));
+                        if (needIds.length > 0) {
+                            const chunkItems = needIds.map(id => collected.get(id) || {id});
+                            const freshStates = await reconcileNotes(chunkItems, config);
+                            for (const id of needIds) {
+                                const st = freshStates[id];
+                                checkedStates[id] = st;
+                                if (st === 'missing' && !pushedIds.has(id) && collected.has(id)) {
+                                    pendingBuffer.push(id);
+                                } else {
+                                    collected.delete(id);
+                                }
+                            }
+                        }
+
+                        while (
+                            (!forceFinal && pendingBuffer.length >= streamBatchSize) ||
+                            (forceFinal && pendingBuffer.length > 0)
+                        ) {
+                            const isSoleRunBatch =
+                                forceFinal && batchSeq === 0 && pendingBuffer.length <= 500;
+                            const chunkKeys = forceFinal
+                                ? pendingBuffer.splice(0, 500)
+                                : pendingBuffer.splice(0, streamBatchSize);
+                            await flushBatch(chunkKeys, isSoleRunBatch);
+                        }
+
+                        if (!forceFinal && stopThreshold > 0) {
+                            const early = evaluateXhsEarlyStop(orderedIds, checkedStates, stopThreshold);
+                            if (early.shouldStop) {
+                                stoppedEarly = true;
+                            }
+                        }
+                    } while (
+                        forceFinal &&
+                        (pendingBuffer.length > 0 || orderedIds.some(id => !(id in checkedStates)))
+                    );
+                };
+
+                ingestList(loaded);
+                if (orderedIds.length > 0) {
+                    await reconcileAndFlush(false);
+                }
+
+                let idle = 0;
+                for (let step = 0; step < maxBg && !stoppedEarly; step += 1) {
                     anomaly = detectXhsAnomaly();
                     if (anomaly) throw new Error(anomaly);
-                    const before = collected.size;
+                    const before = totalDiscovered;
                     scrollContainers();
                     await sleep(1400);
                     try {
-                        readNotesForMode(targetMode).forEach(it => collected.set(it.id, it));
+                        ingestList(readNotesForMode(targetMode));
                     } catch {}
-                    idle = collected.size === before ? idle + 1 : 0;
+                    const delta = totalDiscovered - before;
+                    if (delta > 0) {
+                        await reconcileAndFlush(false);
+                    }
+                    idle = delta === 0 ? idle + 1 : 0;
                     if (idle >= 8) break;
                 }
 
-                const finalItems = [...collected.values()];
-                discoveredCount = finalItems.length;
-                if (!finalItems.length) {
+                await reconcileAndFlush(true);
+                discoveredCount = totalDiscovered;
+                if (!totalDiscovered) {
                     await reportToNas(config, {
                         source_mode: 'bg',
                         run_id: bgRun.runId,
@@ -645,7 +908,7 @@
                         status: 'empty',
                         discovered: 0,
                         message: `后台定时扫描小红书(${modes[targetMode]})为空，无新增作品`,
-                    });
+                    }, {strict: true});
                     await writeBgResult({
                         runId: bgRun.runId,
                         platform: 'xiaohongshu',
@@ -658,22 +921,29 @@
                     return;
                 }
 
-                const summary = await pushNotes(finalItems, {
-                    destination: 'batch',
-                    activeMode: targetMode,
-                    account: acc,
-                    discovered: finalItems.length,
-                    sourceMode: 'bg',
-                    runId: bgRun.runId,
-                });
-                if (!summary.sent) {
+                if (!totalSent) {
                     await reportToNas(config, {
                         source_mode: 'bg',
                         run_id: bgRun.runId,
                         account: `${acc}:${targetMode}`,
                         status: 'empty',
-                        discovered: finalItems.length,
-                        message: `已向 NAS 核对 ${finalItems.length} 个小红书作品 ID，没有待下载项`,
+                        discovered: totalDiscovered,
+                        message: `已向 NAS 核对 ${totalDiscovered} 个小红书作品 ID，没有待下载项`,
+                    }, {strict: true});
+                } else if (!soleBatchSentRunId || batchSeq > 1) {
+                    await reportToNas(config, {
+                        source_mode: 'bg',
+                        run_id: bgRun.runId,
+                        account: `${acc}:${targetMode}`,
+                        ...(limited ? {category: targetMode} : {}),
+                        status: 'ok',
+                        discovered: totalDiscovered,
+                        item_count: totalSent,
+                        accepted: totalAccepted,
+                        submitted: totalSent,
+                        skipped: totalSkipped,
+                        ...(lastTaskId ? {task_id: lastTaskId} : {}),
+                        message: `流式核对完成：共扫 ${totalDiscovered} 个作品，提交 ${totalSent} 个（新增 ${totalAccepted}）`,
                     }, {strict: true});
                 }
                 await writeBgResult({
@@ -681,11 +951,11 @@
                     platform: 'xiaohongshu',
                     mode: targetMode,
                     status: 'ok',
-                    reason: summary.sent ? 'pushed' : 'no_new_items',
-                    itemCount: summary.sent,
-                    accepted: summary.accepted,
-                    skipped: summary.skipped,
-                    taskId: summary.taskId,
+                    reason: totalSent ? 'pushed' : 'no_new_items',
+                    itemCount: totalSent,
+                    accepted: totalAccepted,
+                    skipped: totalSkipped,
+                    taskId: lastTaskId,
                     finishedAt: new Date().toISOString(),
                 });
             } catch (err) {
@@ -788,7 +1058,8 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
   <div class="row spread"><h3>批量收录</h3><small id="account"></small></div>
   <div class="tabs">${Object.entries(modes).map(([value, label]) => `<button data-mode="${value}">${label}</button>`).join('')}</div>
   <div class="row"><button id="scan" class="grow">读取已加载</button><button id="load" class="grow">自动加载</button><button id="stop" class="hidden">停止</button></div>
-  <p class="muted">按作品 ID 与 NAS 核对，已归档和正在处理的作品会自动跳过。</p>
+  <label class="inline" style="margin:6px 0"><input id="full-scan" type="checkbox"> 全量扫描（不早停，滚到底核对历史遗漏）</label>
+  <p class="muted">按作品 ID 与 NAS 实时核对，已归档和正在处理的作品会自动跳过。</p>
   <div class="row spread"><small id="count">尚未读取作品</small><button id="send-batch" class="primary">发送待下载作品</button></div>
   <div id="list" class="list"></div>
 </div>
@@ -805,6 +1076,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
 <details class="box"><summary>NAS 连接、授权与后台计划设置</summary>
   <label>Docker 主机<input id="host" placeholder="192.168.1.20 或 https://nas.example.com"></label>
   <div class="row"><label class="grow">端口<input id="port"></label><label class="grow">手动滚动上限<input id="max" type="number" min="1" max="1000"></label><label class="grow">后台滚动上限<input id="max-bg" type="number" min="1" max="1000"></label></div>
+  <div class="row"><label class="grow">早停连续已归档数（0=全量不早停）<input id="stop-consecutive" type="number" min="0" max="500"></label></div>
   <label>接收路径<input id="path"></label>
   <label>推送授权 (X-NAS-Submit-Token)<input id="token" type="password" autocomplete="off"></label>
   <label>每日后台个人主页 URL<input id="bg-url" placeholder="https://www.xiaohongshu.com/user/profile/..."></label>
@@ -937,25 +1209,61 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         states = {};
         const snapshot = context;
         const collected = new Map(items.map(item => [item.id, item]));
+        const fullScan = Boolean($('#full-scan')?.checked);
+        const stopThreshold = fullScan ? 0 : Math.max(0, Number(config.stopConsecutive ?? 30));
+
+        const reconcileUnchecked = async () => {
+            const currentList = [...collected.values()];
+            const need = currentList.filter(it => !(it.id?.toLowerCase() in states));
+            if (need.length > 0 && config.token) {
+                Object.assign(states, await reconcileNotes(need));
+            }
+            return currentList;
+        };
+
         if (auto) {
             let idle = 0;
+            if (items.length > 0 && config.token) {
+                await reconcileUnchecked();
+                render();
+            }
             for (let step = 0; step < config.max && !stopped; step++) {
                 guard();
+                if (stopThreshold > 0 && config.token) {
+                    const early = evaluateXhsEarlyStop([...collected.keys()], states, stopThreshold);
+                    if (early.shouldStop) {
+                        status(`已命中连续 ${stopThreshold} 个已处理作品，停止加载：${items.length} 个作品，${selectMissing(items, states).length} 个待下载。`);
+                        break;
+                    }
+                }
                 const count = collected.size;
                 scrollContainers();
                 await sleep(1200);
                 guard();
                 read().forEach(item => collected.set(item.id, item));
                 if (context !== snapshot) throw new Error('页面已切换，请重新读取。');
-                idle = collected.size === count ? idle + 1 : 0;
-                items = [...collected.values()];
+                const delta = collected.size - count;
+                idle = delta === 0 ? idle + 1 : 0;
+                items = await reconcileUnchecked();
                 render();
-                status(`正在加载 ${modes[mode]} · ${items.length} 个作品 · 第 ${step + 1} 次滚动`);
+                const missingCount = Object.keys(states).length ? selectMissing(items, states).length : items.length;
+                const early = stopThreshold > 0 && Object.keys(states).length
+                    ? evaluateXhsEarlyStop([...collected.keys()], states, stopThreshold)
+                    : {consecutiveSettled: 0, shouldStop: false};
+                const stopHint = stopThreshold > 0 ? ` · 连续已归档 ${early.consecutiveSettled}/${stopThreshold}` : '';
+                status(`正在加载 ${modes[mode]} · ${items.length} 个作品 · 待下载 ${missingCount}${stopHint} · 第 ${step + 1} 次滚动`);
+                if (early.shouldStop) {
+                    status(`已命中连续 ${stopThreshold} 个已处理作品，停止加载：${items.length} 个作品，${missingCount} 个待下载。`);
+                    break;
+                }
                 if (idle >= 5) break;
             }
         }
         items = [...collected.values()];
-        states = await reconcileNotes(items);
+        const remaining = items.filter(it => !(it.id?.toLowerCase() in states));
+        if (remaining.length > 0 || !Object.keys(states).length) {
+            Object.assign(states, await reconcileNotes(remaining.length ? remaining : items));
+        }
         guard();
         status(`${stopped ? '已停止加载' : '读取完成'}：${items.length} 个作品，${selectMissing(items, states).length} 个待下载。`);
     }
@@ -1042,6 +1350,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         $('#token').value = config.token;
         $('#max').value = String(config.max);
         $('#max-bg').value = String(config.maxBgScrolls);
+        $('#stop-consecutive').value = String(config.stopConsecutive ?? 30);
         $('#bg-url').value = config.bgProfileUrl;
         $('#daily-enabled').checked = config.dailyBgEnabled !== false;
         $('#bg-mode-liked').checked = config.bgModes.includes('liked');
@@ -1084,11 +1393,15 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         endpoint(nextHost, nextPort, nextPath);
         const nextMax = Number($('#max').value);
         const nextBgMax = Number($('#max-bg').value);
+        const nextStopConsecutive = Number($('#stop-consecutive').value);
         if (!Number.isInteger(nextMax) || nextMax < 1 || nextMax > 1000) {
             throw new Error('手动滚动次数应为 1–1000 的整数。');
         }
         if (!Number.isInteger(nextBgMax) || nextBgMax < 1 || nextBgMax > 1000) {
             throw new Error('后台滚动次数应为 1–1000 的整数。');
+        }
+        if (!Number.isInteger(nextStopConsecutive) || nextStopConsecutive < 0 || nextStopConsecutive > 500) {
+            throw new Error('早停连续数应为 0–500 的整数。');
         }
         const selectedModes = [];
         if ($('#bg-mode-liked').checked) selectedModes.push('liked');
@@ -1100,6 +1413,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             token: $('#token').value.trim(),
             max: nextMax,
             maxBgScrolls: nextBgMax,
+            stopConsecutive: nextStopConsecutive,
             idSync: true,
             bgProfileUrl: $('#bg-url').value.trim().split('#')[0],
             dailyBgEnabled: $('#daily-enabled').checked,
@@ -1131,9 +1445,16 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
     });
 
     let lastUrl = location.href;
+    let lastPath = location.pathname;
     setInterval(() => {
         if (lastUrl === location.href) return;
         lastUrl = location.href;
+        if (lastPath !== location.pathname) {
+            lastPath = location.pathname;
+            apiCaptured.liked.clear();
+            apiCaptured.saved.clear();
+            apiCaptured.published.clear();
+        }
         stopped = true;
         items = [];
         states = {};

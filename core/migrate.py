@@ -73,7 +73,7 @@ def import_legacy(store):
                 1, min(1440, float(config["max_job_runtime_seconds"]) / 60)
             )
         preferences["schedule"][key] = {
-            "enabled": bool(config),
+            "enabled": False if key == "x" else bool(config),
             "hours": max(0.1, min(720, float(seconds) / 3600)),
         }
     store.set("preferences", preferences)

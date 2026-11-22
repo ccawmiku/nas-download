@@ -471,6 +471,7 @@ def x_job(job):
                 client.request("/internal/checkpoint/x/likes", {"head": head})
         else:
             collector = None
+            direct_only = bool(job["payload"].get("direct_only"))
             for url in job["payload"].get("urls", []):
                 item = mod.item_from_url(url)
                 old_store.upsert_seen(item)
@@ -504,6 +505,12 @@ def x_job(job):
                         previous_rec=rec,
                     )
                     stats[outcome] += 1
+                    print(json.dumps(stats), flush=True)
+                    continue
+                if job["kind"] == "retry" and direct_only:
+                    stats["discovered"] += 1
+                    stats["skipped"] += 1
+                    log.write(f"跳过非直推旧记录（direct_only）：{url}")
                     print(json.dumps(stats), flush=True)
                     continue
                 if not manual and not old_store.should_download(item['tweet_id'], True, X_MAX_ATTEMPTS, False):

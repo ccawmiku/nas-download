@@ -27,7 +27,7 @@ from .config import (
     sanitize,
     write_json,
 )
-from .store import PLATFORMS, Store, XHS_ID
+from .store import PLATFORMS, Store, XHS_ID, X_TWEET_ID
 from .updates import check_updates
 from .x_direct import normalize_direct_payload
 from .x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS
@@ -37,6 +37,8 @@ SCRIPT_PUSH_ORIGINS = {
     "/api/xhs/links": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
     "/api/xhs/reconcile": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
     "/api/x/direct": {"https://x.com", "https://twitter.com"},
+    "/api/x/reconcile": {"https://x.com", "https://twitter.com"},
+    "/api/x/baseline": {"https://x.com", "https://twitter.com"},
     "/api/browser-push/report": {
         "https://www.xiaohongshu.com",
         "https://xiaohongshu.com",
@@ -234,7 +236,8 @@ async def guard(request: Request, call_next):
         if not submit_token or not hmac.compare_digest(provided, submit_token):
             inferred_platform = (
                 "x"
-                if path == "/api/x/direct" or origin in {"https://x.com", "https://twitter.com"}
+                if path in {"/api/x/direct", "/api/x/reconcile", "/api/x/baseline"}
+                or origin in {"https://x.com", "https://twitter.com"}
                 else "xhs"
             )
             if store.can_record_auth_error(inferred_platform):
@@ -762,6 +765,7 @@ def browser_push_status(
         "summary": store.browser_push_summary(),
         "history": store.list_browser_pushes(page, limit, platform),
         "token_configured": bool(store.get("browser_submit_token")),
+        "x_baseline_count": store.x_baseline_count(),
     }
 
 
@@ -801,18 +805,40 @@ def browser_push_report(payload: dict, request: Request):
             if status == "error"
             else "ok"
         )
+        accepted_count = max(0, int(payload.get("accepted") or 0))
+        submitted_count = max(0, int(payload.get("submitted") or 0))
+        skipped_count = max(0, int(payload.get("skipped") or 0))
+        raw_item_count = payload.get("item_count")
+        item_count = (
+            max(0, int(raw_item_count))
+            if raw_item_count is not None
+            else accepted_count
+            if payload.get("accepted") is not None
+            else submitted_count
+        )
+        run_payload = {
+            "reason": bg_reason,
+            "itemCount": item_count,
+            "submitted": submitted_count,
+            "skipped": skipped_count,
+            "discovered": discovered,
+            "anchorUpdated": False,
+            "message": message,
+            "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if platform == "xhs":
+            category = _normalize_xhs_category(payload.get("category", ""), account)
+            if category:
+                run_payload["category"] = category
+                run_payload["mode"] = category
+        task_id = str(payload.get("task_id") or "").strip()[:64]
+        if task_id:
+            run_payload["taskId"] = task_id
         store.save_bg_run(
             run_id,
             platform,
             bg_status,
-            {
-                "reason": bg_reason,
-                "itemCount": 0,
-                "discovered": discovered,
-                "anchorUpdated": False,
-                "message": message,
-                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
+            run_payload,
         )
     if status == "error":
         store.log(platform, f"浏览器脚本报告异常：{message or '未知原因'}", "warning")
@@ -825,12 +851,22 @@ def _existing_x_done_ids(identifiers: list[str]) -> set[str]:
     config = read_json(CONFIG_PATHS["x"])
     redownload_missing = bool(config.get("redownload_missing_files"))
     done: set[str] = set()
+    wanted = {str(i) for i in identifiers}
+    slots = ",".join("?" for _ in identifiers)
     with store.connect() as db:
+        done.update(
+            str(row[0])
+            for row in db.execute(
+                f"SELECT source_id FROM x_download_baseline WHERE source_id IN ({slots})",
+                identifiers,
+            ).fetchall()
+        )
         rows = db.execute(
-            "SELECT source_id,state,files FROM records WHERE platform='x' AND source_id IN ("
-            + ",".join("?" for _ in identifiers)
-            + ")",
+            f"SELECT source_id,state,files FROM records WHERE platform='x' AND source_id IN ({slots})",
             identifiers,
+        ).fetchall()
+        active_tasks = db.execute(
+            "SELECT payload FROM tasks WHERE platform='x' AND kind='direct' AND state IN ('queued','running')"
         ).fetchall()
     for row in rows:
         if row["state"] == "processing":
@@ -842,6 +878,11 @@ def _existing_x_done_ids(identifiers: list[str]) -> set[str]:
                 files = json.loads(row["files"] or "[]")
                 if files and all(Path(p).is_file() for p in files):
                     done.add(str(row["source_id"]))
+    for task_row in active_tasks:
+        for entry in json.loads(task_row[0] or "{}").get("items") or []:
+            tid = str(entry.get("tweet_id") or "")
+            if tid in wanted:
+                done.add(tid)
     return done
 
 
@@ -979,6 +1020,73 @@ def browser_x_direct(payload: dict, request: Request):
             },
         )
     return response
+
+
+@app.post("/api/x/reconcile")
+@app.post("/internal/x/reconcile")
+def browser_x_reconcile(payload: dict):
+    ids = payload.get("ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(ids, list)
+        or not 1 <= len(ids) <= 500
+        or any(
+            not isinstance(tid, (str, int))
+            or isinstance(tid, bool)
+            or not X_TWEET_ID.fullmatch(str(tid).strip())
+            for tid in ids
+        )
+    ):
+        raise HTTPException(422, "每批需要 1 至 500 个推文 ID")
+    clean_ids = [str(tid).strip() for tid in ids]
+    redownload_missing = bool(read_json(CONFIG_PATHS["x"]).get("redownload_missing_files"))
+    return {
+        "states": store.x_download_states(clean_ids, redownload_missing=redownload_missing)
+    }
+
+
+@app.post("/api/x/baseline")
+def browser_x_baseline(payload: dict, request: Request):
+    ids = payload.get("ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(ids, list)
+        or not 1 <= len(ids) <= 500
+        or any(
+            not isinstance(tid, (str, int))
+            or isinstance(tid, bool)
+            or not X_TWEET_ID.fullmatch(str(tid).strip())
+            for tid in ids
+        )
+    ):
+        raise HTTPException(422, "每批需要 1 至 500 个推文 ID")
+    clean_ids = [str(tid).strip() for tid in ids]
+    added, unique_count = store.add_x_baseline(clean_ids)
+    total = store.x_baseline_count()
+    account = sanitize(str(payload.get("account") or ""))[:100]
+    source_mode = str(payload.get("source_mode") or "workbench").strip().lower()
+    if source_mode not in {"bg", "workbench", "single"}:
+        source_mode = "workbench"
+    if added > 0:
+        store.log("x", f"X 基线导入：提交 {unique_count} 条，新增 {added} 条（累计 {total}）")
+    store.record_browser_push(
+        "x",
+        source_mode,
+        "ok",
+        account=account,
+        submitted=len(clean_ids),
+        accepted=added,
+        skipped=unique_count - added,
+        discovered=unique_count,
+        message=f"基线导入：提交 {unique_count} 条，新增 {added} 条，已存在 {unique_count - added} 条",
+        client_ip=request.client.host if request.client else "",
+    )
+    return {
+        "ok": True,
+        "submitted": len(clean_ids),
+        "unique": unique_count,
+        "added": added,
+        "existing": unique_count - added,
+        "baseline_total": total,
+    }
 
 
 @app.post("/api/xhs/reconcile")

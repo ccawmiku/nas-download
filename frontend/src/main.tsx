@@ -295,16 +295,82 @@ function PushBadge({ status }: { status: string }) {
     </span>
   );
 }
+type ConfirmSpec = {
+  title: string;
+  description: string;
+  primaryLabel: string;
+  onPrimary: () => void | Promise<void>;
+  secondaryLabel?: string;
+  onSecondary?: () => void | Promise<void>;
+  cancelLabel?: string;
+};
+function ConfirmDialog({
+  spec,
+  onClose,
+}: {
+  spec: ConfirmSpec | null;
+  onClose: () => void;
+}) {
+  if (!spec) return null;
+  return (
+    <div className="modal-backdrop">
+      <div className="dialog" role="dialog" aria-modal="true" aria-label={spec.title}>
+        <div className="drawer-heading">
+          <h2>{spec.title}</h2>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="关闭确认弹窗"
+            onClick={onClose}
+          >
+            <Close size={20} />
+          </button>
+        </div>
+        <div className="notice warning">{spec.description}</div>
+        <div className="button-group" style={{ justifyContent: "flex-end", flexWrap: "wrap" }}>
+          <button type="button" onClick={onClose}>
+            {spec.cancelLabel || "取消"}
+          </button>
+          {spec.secondaryLabel && spec.onSecondary && (
+            <button
+              type="button"
+              onClick={async () => {
+                const fn = spec.onSecondary!;
+                onClose();
+                await fn();
+              }}
+            >
+              {spec.secondaryLabel}
+            </button>
+          )}
+          <button
+            type="button"
+            className="primary"
+            onClick={async () => {
+              const fn = spec.onPrimary;
+              onClose();
+              await fn();
+            }}
+          >
+            {spec.primaryLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 function PushPlatformCard({
   platform,
   summary,
   open,
   onDetail,
+  baselineCount,
 }: {
   platform: "x" | "xhs";
   summary: any;
   open: Open;
   onDetail?: () => void;
+  baselineCount?: number;
 }) {
   const last = summary?.last_push;
   const okToday = (summary?.today_success_count || 0) > 0;
@@ -333,6 +399,9 @@ function PushPlatformCard({
             今日检查 {summary?.today_pushes || 0} 次 · 新入队{" "}
             {summary?.today_accepted || 0}
             {summary?.today_error_count ? ` · 异常 ${summary.today_error_count}` : ""}
+            {platform === "x" && Number(baselineCount || 0) > 0
+              ? ` · 基线 ${baselineCount} 条`
+              : ""}
           </small>
         </div>
         <span className={`push-pill ${pillClass}`}>{pillText}</span>
@@ -791,7 +860,8 @@ function Downloads({
     [platform, setPlatform] = useState(""),
     [q, setQ] = useState(""),
     [state, setState] = useState(""),
-    [page, setPage] = useState(1);
+    [page, setPage] = useState(1),
+    [confirmSpec, setConfirmSpec] = useState<ConfirmSpec | null>(null);
   const { value: data, error } = useData(
     `/api/tasks?page=${page}&platform=${platform}&state=${state}&q=${encodeURIComponent(q)}`,
   );
@@ -832,10 +902,34 @@ function Downloads({
               <button
                 className="link-button"
                 onClick={async () => {
-                  for (const key of platform
-                    ? [platform]
-                    : ["x", "pixiv", "douyin", "xhs"])
+                  const targets = platform ? [platform] : ["x", "pixiv", "douyin", "xhs"];
+                  if (targets.includes("x")) {
+                    setConfirmSpec({
+                      title: "确认重试 X 失败下载",
+                      description:
+                        "若库中混有早期旧链路（sync / links / v3 导入）失败的推文记录，普通重试会启动 Docker Playwright 无头浏览器并读取本地 x_cookies.txt。推荐选择「仅重试直推记录」（全程免 Cookie、免浏览器）。",
+                      primaryLabel: "仅重试直推记录（免 Cookie）",
+                      onPrimary: async () => {
+                        for (const key of targets) {
+                          await act("/api/tasks", {
+                            platform: key,
+                            kind: "retry",
+                            ...(key === "x" ? { payload: { direct_only: true } } : {}),
+                          });
+                        }
+                      },
+                      secondaryLabel: "包含旧链路记录（将使用无头浏览器与 Cookie）",
+                      onSecondary: async () => {
+                        for (const key of targets) {
+                          await act("/api/tasks", { platform: key, kind: "retry" });
+                        }
+                      },
+                    });
+                    return;
+                  }
+                  for (const key of targets) {
                     await act("/api/tasks", { platform: key, kind: "retry" });
+                  }
                 }}
               >
                 重试{names[platform] || "全部"}失败下载
@@ -898,7 +992,28 @@ function Downloads({
                       r.state,
                     ) && (
                       <button
-                        onClick={() => act(`/api/tasks/${r.id}/retry`, {})}
+                        onClick={() => {
+                          const isRiskyXTask =
+                            r.platform === "x" &&
+                            r.kind !== "direct" &&
+                            !(r.kind === "retry" && r.payload?.direct_only);
+                          const runTaskRetry = () =>
+                            act(`/api/tasks/${r.id}/retry`, {});
+                          if (isRiskyXTask) {
+                            const modeDesc =
+                              r.kind === "test"
+                                ? "读取本地 x_cookies.txt 并调用 yt-dlp --simulate 向 X 发请求（不启动无头浏览器）"
+                                : "启动 Docker Playwright 无头浏览器并读取本地 x_cookies.txt 访问 X";
+                            setConfirmSpec({
+                              title: `确认重试 X 旧链路任务（${kinds[r.kind] || r.kind}）？`,
+                              description: `该历史任务属于旧链路类型（非 direct 直推），重新入队执行将会${modeDesc}。确定要继续吗？`,
+                              primaryLabel: "确认重试",
+                              onPrimary: runTaskRetry,
+                            });
+                            return;
+                          }
+                          runTaskRetry();
+                        }}
                       >
                         重试
                       </button>
@@ -915,6 +1030,7 @@ function Downloads({
           )}
         </Panel>
       )}
+      <ConfirmDialog spec={confirmSpec} onClose={() => setConfirmSpec(null)} />
     </>
   );
 }
@@ -1101,7 +1217,8 @@ function Collection({
   const [platform, setPlatform] = useState(""),
     [state, setState] = useState(""),
     [q, setQ] = useState(""),
-    [page, setPage] = useState(1);
+    [page, setPage] = useState(1),
+    [confirmSpec, setConfirmSpec] = useState<ConfirmSpec | null>(null);
   const { value: data, error } = useData(
     `/api/${kind}?page=${page}&platform=${platform}&state=${state}&q=${encodeURIComponent(q)}`,
   );
@@ -1239,13 +1356,29 @@ function Collection({
                   r.metadata.url && (
                     <div className="row-actions">
                       <button
-                        onClick={() =>
-                          act("/api/tasks", {
-                            platform: r.platform,
-                            kind: "retry",
-                            payload: { urls: [r.metadata.url] },
-                          })
-                        }
+                        onClick={() => {
+                          const isLegacyX =
+                            r.platform === "x" &&
+                            r.metadata?.source_mode !== "direct" &&
+                            !(Array.isArray(r.metadata?.direct_media) && r.metadata.direct_media.length > 0);
+                          const runRetry = () =>
+                            act("/api/tasks", {
+                              platform: r.platform,
+                              kind: "retry",
+                              payload: { urls: [r.metadata.url] },
+                            });
+                          if (isLegacyX) {
+                            setConfirmSpec({
+                              title: "该 X 记录将使用无头浏览器与 Cookie 重试",
+                              description:
+                                "这条失败记录来自旧版抓取链路（不含直推媒体清单）。继续重试会在 Docker 中启动 Playwright 无头浏览器并读取本地 x_cookies.txt 访问推文页面。如不想动用服务端 Cookie，建议在 Chrome 打开推文后用油猴脚本直推。",
+                              primaryLabel: "确认继续重试",
+                              onPrimary: runRetry,
+                            });
+                            return;
+                          }
+                          runRetry();
+                        }}
                       >
                         重试下载
                       </button>
@@ -1268,6 +1401,7 @@ function Collection({
           <Pager page={page} total={data.total} limit={30} onPage={setPage} />
         )}
       </Panel>
+      <ConfirmDialog spec={confirmSpec} onClose={() => setConfirmSpec(null)} />
     </>
   );
 }
@@ -1559,6 +1693,10 @@ function PushTokenCard({
             <code>POST /api/x/direct</code>
           </div>
           <div className="endpoint-chip">
+            <strong>X 状态对账与基线</strong>
+            <code>POST /api/x/reconcile · /api/x/baseline</code>
+          </div>
+          <div className="endpoint-chip">
             <strong>小红书增量接口</strong>
             <code>POST /api/xhs/links</code>
           </div>
@@ -1610,7 +1748,12 @@ function BrowserPushCenter({
       </div>
       {error && <div className="notice warning">{error}</div>}
       <div className="push-summary-grid">
-        <PushPlatformCard platform="x" summary={summary.x} open={open} />
+        <PushPlatformCard
+          platform="x"
+          summary={summary.x}
+          open={open}
+          baselineCount={data?.x_baseline_count}
+        />
         <PushPlatformCard platform="xhs" summary={summary.xhs} open={open} />
       </div>
       <PushTokenCard act={act} />
@@ -1759,7 +1902,8 @@ function Settings({
     [credential, setCredential] = useState(""),
     [password, setPassword] = useState(""),
     [callback, setCallback] = useState(""),
-    [testUrl, setTestUrl] = useState("");
+    [testUrl, setTestUrl] = useState(""),
+    [confirmSpec, setConfirmSpec] = useState<ConfirmSpec | null>(null);
   useEffect(() => {
     if (prefs.value) {
       const cloned = structuredClone(prefs.value);
@@ -2049,12 +2193,24 @@ function Settings({
                           : "定时增量同步"
                       }
                       checked={preferences.schedule[tab].enabled}
-                      onChange={(v) =>
-                        prefChange("schedule", {
-                          ...preferences.schedule,
-                          [tab]: { ...preferences.schedule[tab], enabled: v },
-                        })
-                      }
+                      onChange={(v) => {
+                        const applyToggle = (nextVal: boolean) =>
+                          prefChange("schedule", {
+                            ...preferences.schedule,
+                            [tab]: { ...preferences.schedule[tab], enabled: nextVal },
+                          });
+                        if (tab === "x" && v && !preferences.schedule[tab].enabled) {
+                          setConfirmSpec({
+                            title: "开启旧版 X 定时抓取？",
+                            description:
+                              "开启并保存后，Docker 后台会按周期启动 Playwright 无头浏览器，读取本地 x_cookies.txt 访问 X 点赞页，并调用 yt-dlp / gallery-dl（携带 Cookie）下载及重试旧失败记录。如平时使用 Chrome 脚本直推，建议保持关闭。",
+                            primaryLabel: "确认开启",
+                            onPrimary: () => applyToggle(true),
+                          });
+                          return;
+                        }
+                        applyToggle(v);
+                      }}
                     />
                     <Field
                       spec={{
@@ -2108,10 +2264,17 @@ function Settings({
                           <button
                             disabled={!testUrl}
                             onClick={() =>
-                              act("/api/tasks", {
-                                platform: "x",
-                                kind: "test",
-                                payload: { url: testUrl },
+                              setConfirmSpec({
+                                title: "确认执行 X Cookie 测试？",
+                                description:
+                                  "该操作会读取服务端保存的 x_cookies.txt，并调用 yt-dlp --simulate 向 X 发送带 Cookie 的测试请求（不启动无头浏览器）。确定要继续吗？",
+                                primaryLabel: "确认测试",
+                                onPrimary: () =>
+                                  act("/api/tasks", {
+                                    platform: "x",
+                                    kind: "test",
+                                    payload: { url: testUrl },
+                                  }),
                               })
                             }
                           >
@@ -2366,6 +2529,7 @@ function Settings({
           )}
         </div>
       </div>
+      <ConfirmDialog spec={confirmSpec} onClose={() => setConfirmSpec(null)} />
     </>
   );
 }
@@ -2570,6 +2734,7 @@ function Drawer({
 function AddLinks({ close, act }: { close: () => void; act: Act }) {
   const [platform, setPlatform] = useState("xhs"),
     [text, setText] = useState(""),
+    [confirmXCookie, setConfirmXCookie] = useState(false),
     [pending, setPending] = useState(false);
   return (
     <div className="modal-backdrop">
@@ -2577,6 +2742,7 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
         className="dialog"
         onSubmit={async (e) => {
           e.preventDefault();
+          if (platform === "x" && !confirmXCookie) return;
           setPending(true);
           try {
             const result =
@@ -2610,7 +2776,10 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
           <span>平台</span>
           <select
             value={platform}
-            onChange={(e) => setPlatform(e.target.value)}
+            onChange={(e) => {
+              setPlatform(e.target.value);
+              setConfirmXCookie(false);
+            }}
           >
             {Object.entries(names).map(([k, v]) => (
               <option key={k} value={k}>
@@ -2619,6 +2788,29 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
             ))}
           </select>
         </label>
+        {platform === "x" && (
+          <>
+            <div className="notice warning">
+              注意：在控制台提交 X 链接会在 Docker 侧启动 Playwright 无头浏览器并使用本地 x_cookies.txt 访问推文页面。如不想动用服务端 Cookie，建议在 Chrome 打开推文后使用 X 油猴脚本直推。
+            </div>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                fontSize: "12px",
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={confirmXCookie}
+                onChange={(e) => setConfirmXCookie(e.target.checked)}
+              />
+              <span>我确认本次使用服务端 Cookie 与无头浏览器抓取 X 链接</span>
+            </label>
+          </>
+        )}
         <label className="field">
           <span>作品或消息链接</span>
           <textarea
@@ -2635,7 +2827,11 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
         </p>
         <button
           className="primary"
-          disabled={pending || !text.match(/https?:\/\//)}
+          disabled={
+            pending ||
+            !text.match(/https?:\/\//) ||
+            (platform === "x" && !confirmXCookie)
+          }
         >
           <Plus size={16} />
           {pending ? "正在提交…" : "加入下载队列"}

@@ -81,3 +81,46 @@ test('xhs report uses canonical xhs platform and surfaces HTTP 422 detail', () =
   );
 });
 
+const {extractXhsApiNotes, evaluateXhsEarlyStop} = require('../tools/userscripts/xhs-docker-queue.user.js');
+
+test('extracts XHS API page notes and evaluates consecutive archived early-stop', () => {
+  const apiNotes = extractXhsApiNotes({
+    data: {
+      notes: [
+        {
+          note_id: id,
+          xsec_token: 'tokA',
+          display_title: '笔记标题',
+          user: {nickname: '作者'},
+          cover: {url_default: 'https://sns-img.example/1.jpg'},
+        },
+        {note_id: 'invalid'},
+      ],
+    },
+  });
+  assert.equal(apiNotes.length, 1);
+  assert.equal(apiNotes[0].id, id);
+  assert.equal(apiNotes[0].url, `https://www.xiaohongshu.com/explore/${id}?xsec_token=tokA&xsec_source=pc_user`);
+
+  const ids = ['a1', 'a2', 'a3', 'a4', 'a5'];
+  const states = {a1: 'archived', a2: 'missing', a3: 'archived', a4: 'pending', a5: 'deferred'};
+  const hit = evaluateXhsEarlyStop(ids, states, 3);
+  assert.equal(hit.shouldStop, true);
+  assert.equal(hit.consecutiveSettled, 3);
+  assert.equal(hit.stopAtId, 'a5');
+
+  const noHit = evaluateXhsEarlyStop(ids, states, 4);
+  assert.equal(noHit.shouldStop, false);
+  assert.equal(noHit.consecutiveSettled, 3);
+
+  const full = evaluateXhsEarlyStop(ids, states, 0);
+  assert.equal(full.shouldStop, false);
+
+  // 50 missing items reconciled as missing must not trigger early-stop at threshold 30
+  const fiftyIds = Array.from({length: 50}, (_, i) => `${i + 1}`.padStart(24, '0'));
+  const missingStates = Object.fromEntries(fiftyIds.map(nid => [nid, 'missing']));
+  const batchCheck = evaluateXhsEarlyStop(fiftyIds, missingStates, 30);
+  assert.equal(batchCheck.shouldStop, false);
+  assert.equal(batchCheck.consecutiveSettled, 0);
+});
+

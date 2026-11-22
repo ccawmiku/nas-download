@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.0.2
-// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持触底自动翻页、5 锚点增量同步、NAS Token 直推与每日后台回执
+// @version      1.1.0
+// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持服务端 tweet_id 状态对账、连续已归档早停、流式推送、仅导入基线与每日后台回执
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @run-at       document-start
@@ -473,6 +473,88 @@
     return { items, matchedBy: '', stopId: '' };
   };
 
+  const extractTweetManifestIds = (tweet) => {
+    if (!tweet) return [];
+    const { manifests } = flattenDirectManifestItems([tweet]);
+    return manifests.map((m) => String(m.tweet_id || '')).filter(Boolean);
+  };
+
+  const evaluateReconcileStop = (tweets, statesMap = {}, stopThreshold = 15) => {
+    const threshold = Math.max(0, Number(stopThreshold || 0));
+    const settledSet = new Set(['archived', 'pending', 'deferred']);
+    const toPush = [];
+    let consecutiveSettled = 0;
+    let settledTweets = 0;
+    let textOnly = 0;
+    let shouldStop = false;
+    let stopAtTweetId = '';
+
+    for (const tweet of Array.isArray(tweets) ? tweets : []) {
+      if (!tweet || !tweet.id) continue;
+      const manifestIds = extractTweetManifestIds(tweet);
+      if (!manifestIds.length) {
+        textOnly += 1;
+        continue;
+      }
+      const allSettled = manifestIds.every((id) => settledSet.has(statesMap[id]));
+      if (allSettled) {
+        settledTweets += 1;
+        consecutiveSettled += 1;
+      } else {
+        consecutiveSettled = 0;
+        toPush.push(tweet);
+      }
+      if (threshold > 0 && consecutiveSettled >= threshold) {
+        shouldStop = true;
+        stopAtTweetId = String(tweet.id);
+        break;
+      }
+    }
+
+    return {
+      toPush,
+      consecutiveSettled,
+      settledTweets,
+      textOnly,
+      shouldStop,
+      stopAtTweetId,
+    };
+  };
+
+  const trimProcessedCache = (orderArr, mapObj, keepRecent = 120, protectedIds = null, eligibleIds = null) => {
+    if (!Array.isArray(orderArr)) return { removedCount: 0, keptCount: 0 };
+    const keepCount = Math.max(0, Number(keepRecent || 0));
+    if (orderArr.length <= keepCount) {
+      return { removedCount: 0, keptCount: orderArr.length };
+    }
+    const protectedSet = protectedIds instanceof Set
+      ? protectedIds
+      : Array.isArray(protectedIds)
+        ? new Set(protectedIds)
+        : new Set();
+    const eligibleSet = eligibleIds === null || eligibleIds === undefined
+      ? null
+      : eligibleIds instanceof Set
+        ? eligibleIds
+        : new Set(eligibleIds);
+    const cut = orderArr.length - keepCount;
+    const retained = [];
+    let removedCount = 0;
+
+    for (let i = 0; i < orderArr.length; i += 1) {
+      const id = orderArr[i];
+      if (i < cut && !protectedSet.has(id) && (!eligibleSet || eligibleSet.has(id))) {
+        if (mapObj instanceof Map) mapObj.delete(id);
+        else if (mapObj && typeof mapObj === 'object') delete mapObj[id];
+        removedCount += 1;
+      } else {
+        retained.push(id);
+      }
+    }
+    orderArr.splice(0, orderArr.length, ...retained);
+    return { removedCount, keptCount: orderArr.length };
+  };
+
   const nextAnchors = (sentItems, previousAnchors = []) => {
     const seen = new Set();
     const out = [];
@@ -634,6 +716,9 @@
       flattenDirectManifestItems,
       parseLikesPayload,
       parseTweetDetailPayload,
+      extractTweetManifestIds,
+      evaluateReconcileStop,
+      trimProcessedCache,
       computeIncrementalSlice,
       nextAnchors,
       endpoint,
@@ -647,36 +732,64 @@
   if (initialBgRun) {
     installBgVisibilityBypass(pageWin);
   }
-  const capturedMap = new Map();
-  const capturedOrder = [];
+  const likesMap = new Map();
+  const likesOrder = [];
+  const detailMap = new Map();
+  const detailOrder = [];
   const cursors = [];
   let likesGraphqlCount = 0;
+  let activeLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
 
-  const ingestTweets = (entries) => {
+  const resetLikesCache = (nextPath = '') => {
+    likesMap.clear();
+    likesOrder.length = 0;
+    cursors.length = 0;
+    likesGraphqlCount = 0;
+    activeLikesPath = nextPath;
+  };
+
+  const ingestLikesTweets = (entries, reqLikesPath = '') => {
+    if (reqLikesPath) {
+      const curLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
+      if (curLikesPath && curLikesPath !== reqLikesPath) return;
+      if (reqLikesPath !== activeLikesPath) resetLikesCache(reqLikesPath);
+    }
     for (const item of entries) {
       if (!item || !item.id) continue;
-      if (!capturedMap.has(item.id)) capturedOrder.push(item.id);
-      capturedMap.set(item.id, item);
+      if (!likesMap.has(item.id)) likesOrder.push(item.id);
+      likesMap.set(item.id, item);
     }
   };
 
-  // document-start Hook: 同步/异步捕获所有 /Likes 与 TweetDetail GraphQL 响应
+  const ingestDetailTweets = (entries) => {
+    for (const item of entries) {
+      if (!item || !item.id) continue;
+      if (!detailMap.has(item.id)) detailOrder.push(item.id);
+      detailMap.set(item.id, item);
+    }
+  };
+
+  // document-start Hook: 隔离捕获 /Likes 与 TweetDetail GraphQL 响应，避免 SPA 跳转串台
   const rawFetch = pageWin.fetch;
   if (typeof rawFetch === 'function') {
     pageWin.fetch = async function (...args) {
+      const reqLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
       const response = await rawFetch.apply(this, args);
       try {
         const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url || response?.url || '';
         if (isLikesGraphqlUrl(reqUrl)) {
           response.clone().json().then((json) => {
             const { entries, bottomCursor } = parseLikesPayload(json);
+            const curLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
+            if (reqLikesPath && curLikesPath && curLikesPath !== reqLikesPath) return;
+            if (reqLikesPath && reqLikesPath !== activeLikesPath) resetLikesCache(reqLikesPath);
             if (bottomCursor) cursors.push(bottomCursor);
             likesGraphqlCount += 1;
-            ingestTweets(entries);
+            ingestLikesTweets(entries, reqLikesPath);
           }).catch(() => {});
         } else if (isTweetDetailGraphqlUrl(reqUrl)) {
           response.clone().json().then((json) => {
-            ingestTweets(parseTweetDetailPayload(json));
+            ingestDetailTweets(parseTweetDetailPayload(json));
           }).catch(() => {});
         }
       } catch {}
@@ -689,9 +802,11 @@
   if (RawXhrOpen && RawXhrSend) {
     pageWin.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this.__nasReqUrl = String(url || '');
+      this.__nasReqLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
       return RawXhrOpen.call(this, method, url, ...rest);
     };
     pageWin.XMLHttpRequest.prototype.send = function (...args) {
+      const reqLikesPath = this.__nasReqLikesPath || '';
       this.addEventListener('load', () => {
         try {
           const reqUrl = this.responseURL || this.__nasReqUrl || '';
@@ -699,12 +814,15 @@
             if (isLikesGraphqlUrl(reqUrl)) {
               const json = JSON.parse(this.responseText);
               const { entries, bottomCursor } = parseLikesPayload(json);
+              const curLikesPath = isLikesPagePath(location.pathname) ? location.pathname : '';
+              if (reqLikesPath && curLikesPath && curLikesPath !== reqLikesPath) return;
+              if (reqLikesPath && reqLikesPath !== activeLikesPath) resetLikesCache(reqLikesPath);
               if (bottomCursor) cursors.push(bottomCursor);
               likesGraphqlCount += 1;
-              ingestTweets(entries);
+              ingestLikesTweets(entries, reqLikesPath);
             } else if (isTweetDetailGraphqlUrl(reqUrl)) {
               const json = JSON.parse(this.responseText);
-              ingestTweets(parseTweetDetailPayload(json));
+              ingestDetailTweets(parseTweetDetailPayload(json));
             }
           }
         } catch {}
@@ -720,6 +838,8 @@
     token: '',
     maxScrolls: 60,
     maxBgScrolls: 60,
+    stopConsecutive: 15,
+    flushBatchSize: 30,
     dailyBgEnabled: true,
     bgTargetUrl: 'https://x.com/i/history/likes',
   });
@@ -826,18 +946,85 @@
     return null;
   };
 
-  const reportToNas = async (cfg, payload) => {
-    if (!cfg.token) return;
+  const reportToNas = async (cfg, payload, { strict = false } = {}) => {
+    if (!cfg?.token) {
+      if (strict) throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+      return null;
+    }
     try {
-      await postToNas(endpoint(cfg.host, cfg.port, '/api/browser-push/report'), cfg.token, {
+      return await postToNas(endpoint(cfg.host, cfg.port, '/api/browser-push/report'), cfg.token, {
         platform: 'x',
         ...payload,
       });
-    } catch {}
+    } catch (err) {
+      if (strict) throw err;
+      return null;
+    }
   };
 
-  const getOrderedTweets = () =>
-    capturedOrder.map((id) => capturedMap.get(id)).filter(Boolean);
+  const getLikesTweets = () =>
+    likesOrder.map((id) => likesMap.get(id)).filter(Boolean);
+
+  const getDetailTweets = () =>
+    detailOrder.map((id) => detailMap.get(id)).filter(Boolean);
+
+  const getOrderedTweets = () => {
+    if (isLikesPagePath(location.pathname)) return getLikesTweets();
+    const details = getDetailTweets();
+    return details.length ? details : getLikesTweets();
+  };
+
+  const reconcileTweets = async (ids, cfg) => {
+    const cleanIds = [...new Set((Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter((x) => /^\d{1,30}$/.test(x)))];
+    const states = {};
+    if (!cleanIds.length) return states;
+    if (!cfg?.token) {
+      throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+    }
+    const url = endpoint(cfg.host, cfg.port, '/api/x/reconcile');
+    for (let offset = 0; offset < cleanIds.length; offset += 500) {
+      const part = cleanIds.slice(offset, offset + 500);
+      const reply = await postToNas(url, cfg.token, { ids: part });
+      for (const id of part) {
+        const st = reply?.states?.[id];
+        if (!['archived', 'pending', 'deferred', 'missing'].includes(st)) {
+          throw new Error('NAS 未完整返回推文 ID 对账状态。');
+        }
+        states[id] = st;
+      }
+    }
+    return states;
+  };
+
+  const pushBaselineIds = async (ids, { account, sourceMode = 'workbench', cfg, onProgress }) => {
+    const cleanIds = [...new Set((Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter((x) => /^\d{1,30}$/.test(x)))];
+    if (!cleanIds.length) return { submitted: 0, added: 0, existing: 0, baselineTotal: 0 };
+    if (!cfg?.token) {
+      throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+    }
+    const url = endpoint(cfg.host, cfg.port, '/api/x/baseline');
+    let submitted = 0;
+    let added = 0;
+    let existing = 0;
+    let baselineTotal = 0;
+    for (let offset = 0; offset < cleanIds.length; offset += 500) {
+      const part = cleanIds.slice(offset, offset + 500);
+      if (onProgress) onProgress(`正在导入基线 ${offset}/${cleanIds.length} 条推文 ID…`);
+      const reply = await postToNas(url, cfg.token, {
+        ids: part,
+        account,
+        source_mode: sourceMode,
+      });
+      if (!reply?.ok) {
+        throw new Error('NAS 基线导入未返回确认回执。');
+      }
+      submitted += part.length;
+      added += Number(reply.added || 0);
+      existing += Number(reply.existing || 0);
+      baselineTotal = Number(reply.baseline_total || baselineTotal);
+    }
+    return { submitted, added, existing, baselineTotal };
+  };
 
   const RESERVED_PATH_ROOTS = new Set(['i', 'home', 'explore', 'notifications', 'messages', 'settings', 'search']);
 
@@ -916,12 +1103,13 @@
 
     for (let offset = 0; offset < manifests.length; offset += CHUNK_SIZE) {
       const chunk = manifests.slice(offset, offset + CHUNK_SIZE);
+      const isLastChunk = offset + CHUNK_SIZE >= manifests.length;
       const chunkBatchId = manifests.length <= CHUNK_SIZE ? batchId : `${batchId}_${offset}`;
       if (onProgress) onProgress(`正在推送 ${offset}/${manifests.length} 条推文清单…`);
       const reply = await postToNas(url, cfg.token, {
         batch_id: chunkBatchId,
         source_mode: sourceMode,
-        ...(runId ? { run_id: runId } : {}),
+        ...(runId && isLastChunk ? { run_id: runId } : {}),
         account,
         discovered: discoveredTotal,
         items: chunk,
@@ -1103,30 +1291,135 @@
       const cfg = loadConfig();
       let anchorUpdated = false;
       let acct = '';
+      let totalDiscovered = 0;
       try {
+        if (!cfg.token) {
+          throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+        }
         await waitForBgInitialState(8000);
         if (/\/i\/flow\/login|\/login/.test(location.pathname)) {
           throw new Error('X 账号未登录或会话已失效，请在 Chrome 中重新登录 x.com');
         }
         acct = accountScopeKey();
-        const anchors = getAnchors(acct);
         const cutoff = getCutoff(acct);
         const maxScrolls = Math.max(1, Math.min(200, Number(cfg.maxBgScrolls || 60)));
-        let stableTicks = 0;
+        const stopThreshold = Math.max(0, Number(cfg.stopConsecutive ?? 15));
+        const flushBatchSize = Math.max(5, Math.min(200, Number(cfg.flushBatchSize || 30)));
+        const settledSet = new Set(['archived', 'pending', 'deferred']);
 
+        const evaluatedIds = new Set();
+        const queuedOrPushedIds = new Set();
+        const reconciledStates = {};
+        const pendingBuffer = [];
+        const headAnchorCandidates = [];
+        let consecutiveSettled = 0;
+        let stoppedByReconcile = false;
+        let stoppedByCutoff = false;
+        let totalSubmitted = 0;
+        let totalAccepted = 0;
+        let totalSkipped = 0;
+        let totalUnresolvable = 0;
+        let lastTaskId = '';
+
+        const syncNewTweetsAndFlush = async (forceFinal = false) => {
+          do {
+            const freshTweets =
+              !stoppedByReconcile && !stoppedByCutoff
+                ? getLikesTweets().filter((t) => t && t.id && !evaluatedIds.has(t.id))
+                : [];
+            if (freshTweets.length > 0) {
+              const needCheckIds = [];
+              for (const tweet of freshTweets) {
+                for (const mid of extractTweetManifestIds(tweet)) {
+                  if (!(mid in reconciledStates)) needCheckIds.push(mid);
+                }
+              }
+              if (needCheckIds.length > 0) {
+                Object.assign(reconciledStates, await reconcileTweets(needCheckIds, cfg));
+              }
+              for (const tweet of freshTweets) {
+                totalDiscovered += 1;
+                if (headAnchorCandidates.length < MAX_ANCHORS) headAnchorCandidates.push(tweet);
+                if (cutoff && tweet.id === cutoff) {
+                  stoppedByCutoff = true;
+                  evaluatedIds.add(tweet.id);
+                  break;
+                }
+                const mids = extractTweetManifestIds(tweet);
+                if (!mids.length) {
+                  evaluatedIds.add(tweet.id);
+                  continue;
+                }
+                const allSettled = mids.every((id) => settledSet.has(reconciledStates[id]));
+                if (allSettled) {
+                  consecutiveSettled += 1;
+                } else {
+                  consecutiveSettled = 0;
+                  if (!queuedOrPushedIds.has(tweet.id)) {
+                    queuedOrPushedIds.add(tweet.id);
+                    pendingBuffer.push(tweet);
+                  }
+                }
+                evaluatedIds.add(tweet.id);
+                if (stopThreshold > 0 && consecutiveSettled >= stopThreshold) {
+                  stoppedByReconcile = true;
+                  break;
+                }
+              }
+            }
+
+            while (
+              (!forceFinal && pendingBuffer.length >= flushBatchSize) ||
+              (forceFinal && pendingBuffer.length > 0)
+            ) {
+              const take = forceFinal
+                ? pendingBuffer.splice(0, CHUNK_SIZE)
+                : pendingBuffer.splice(0, flushBatchSize);
+              const summary = await pushTweetsBatch(take, {
+                sourceMode: 'bg',
+                updateAnchors: false,
+                account: acct,
+                cfg,
+                discovered: totalDiscovered,
+                runId: '',
+              });
+              totalSubmitted += summary.submitted;
+              totalAccepted += summary.accepted;
+              totalSkipped += summary.skipped;
+              totalUnresolvable += summary.unresolvable;
+              if (summary.taskIds?.length) {
+                lastTaskId = summary.taskIds[summary.taskIds.length - 1];
+              }
+              trimProcessedCache(
+                likesOrder,
+                likesMap,
+                120,
+                new Set(pendingBuffer.map((t) => t.id)),
+                evaluatedIds
+              );
+            }
+          } while (
+            forceFinal &&
+            (pendingBuffer.length > 0 ||
+              (!stoppedByReconcile &&
+                !stoppedByCutoff &&
+                getLikesTweets().some((t) => t && t.id && !evaluatedIds.has(t.id))))
+          );
+        };
+
+        let stableTicks = 0;
         for (let step = 0; step < maxScrolls; step += 1) {
           if (/\/i\/flow\/login|\/login/.test(location.pathname)) {
             throw new Error('X 跳转至登录页，账号会话已失效');
           }
-          const ordered = getOrderedTweets();
-          const anchorSet = new Set(anchors);
-          const hitStop = ordered.some((t) => anchorSet.has(t.id) || (cutoff && t.id === cutoff));
-          if (hitStop && ordered.length > 0) break;
-          const prevCount = ordered.length;
+          await syncNewTweetsAndFlush(false);
+          if (stoppedByReconcile || stoppedByCutoff) break;
+
+          const prevCount = getLikesTweets().length;
           const prevReqCount = likesGraphqlCount;
           const { moved, atBottom } = await scrollPageStep();
           await sleep(atBottom ? 1800 : 700);
-          const curCount = getOrderedTweets().length;
+          const curCount = getLikesTweets().length;
           const curReqCount = likesGraphqlCount;
           // 未滑到底部时处于单页内容区内部，不得累加静止次数以免提前中断翻页
           stableTicks =
@@ -1136,20 +1429,34 @@
           if (stableTicks >= 4) break;
         }
 
-        const ordered = getOrderedTweets();
-        if (!ordered.length) {
+        await syncNewTweetsAndFlush(true);
+        if (totalDiscovered === 0) {
           throw new Error('未拦截到 X /Likes 推文数据，请确认页面可访问且已登录');
         }
-        const sliced = computeIncrementalSlice(ordered, anchors, cutoff);
-        if (!sliced.items.length) {
-          await reportToNas(cfg, {
-            source_mode: 'bg',
-            run_id: bgRun.runId,
-            account: acct,
-            status: 'empty',
-            discovered: ordered.length,
-            message: `后台定时检查 ${ordered.length} 条点赞推文，命中断点无新增`,
+
+        if (totalSubmitted > 0 && headAnchorCandidates.length) {
+          await gmSetAll({
+            [STORAGE_KEYS.ANCHORS_PREFIX + acct]: nextAnchors(
+              headAnchorCandidates,
+              getAnchors(acct)
+            ),
           });
+          anchorUpdated = true;
+        }
+
+        if (totalSubmitted === 0) {
+          await reportToNas(
+            cfg,
+            {
+              source_mode: 'bg',
+              run_id: bgRun.runId,
+              account: acct,
+              status: 'empty',
+              discovered: totalDiscovered,
+              message: `后台对账 ${totalDiscovered} 条点赞推文（连续已归档 ${consecutiveSettled}），无新增媒体`,
+            },
+            { strict: true }
+          );
           await writeBgResult({
             runId: bgRun.runId,
             platform: 'x',
@@ -1162,24 +1469,33 @@
           return;
         }
 
-        const summary = await pushTweetsBatch(sliced.items, {
-          sourceMode: 'bg',
-          updateAnchors: true,
-          account: acct,
+        await reportToNas(
           cfg,
-          discovered: ordered.length,
-          runId: bgRun.runId,
-        });
-        anchorUpdated = true;
+          {
+            source_mode: 'bg',
+            run_id: bgRun.runId,
+            account: acct,
+            status: 'ok',
+            discovered: totalDiscovered,
+            item_count: totalAccepted,
+            accepted: totalAccepted,
+            submitted: totalSubmitted,
+            skipped: totalSkipped,
+            ...(lastTaskId ? { task_id: lastTaskId } : {}),
+            message: `流式同步完成：共检查 ${totalDiscovered} 条，提交 ${totalSubmitted} 组（新增 ${totalAccepted}）`,
+          },
+          { strict: true }
+        );
         await writeBgResult({
           runId: bgRun.runId,
           platform: 'x',
           status: 'ok',
           reason: 'pushed',
-          itemCount: summary.accepted,
-          submitted: summary.submitted,
-          skipped: summary.skipped,
-          anchorUpdated: true,
+          itemCount: totalAccepted,
+          submitted: totalSubmitted,
+          skipped: totalSkipped,
+          unresolvable: totalUnresolvable,
+          anchorUpdated,
           finishedAt: new Date().toISOString(),
         });
       } catch (err) {
@@ -1189,7 +1505,7 @@
           run_id: bgRun.runId,
           account: acct || accountScopeKey(),
           status: 'error',
-          discovered: getOrderedTweets().length,
+          discovered: totalDiscovered || getLikesTweets().length,
           message: `后台同步失败：${msg}`,
         });
         await writeBgResult({
@@ -1264,6 +1580,10 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       <button id="push-likes" class="accent grow">发送增量给 NAS</button>
     </div>
     <div class="row">
+      <button id="push-baseline-loaded" class="grow">已捕获导入基线</button>
+      <button id="scroll-baseline" class="grow">边滚边导基线（不下载）</button>
+    </div>
+    <div class="row">
       <button id="bg-run-now" class="grow">测试后台静默运行（忽略今日锁）</button>
     </div>
   </div>
@@ -1279,6 +1599,9 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       <label class="field grow">端口<input id="cfg-port"></label>
       <label class="field grow">最大手动滚动<input id="cfg-max-scroll" type="number" min="1" max="300"></label>
       <label class="field grow">后台最大滚动<input id="cfg-bg-scroll" type="number" min="1" max="200"></label>
+    </div>
+    <div class="row">
+      <label class="field grow">连续已归档早停数（0=全量）<input id="cfg-stop-consecutive" type="number" min="0" max="500"></label>
     </div>
     <label class="field">直连推送路径<input id="cfg-path"></label>
     <label class="field">推送授权 Token（从 NAS 控制台复制）<input id="cfg-token" type="password" autocomplete="off"></label>
@@ -1385,6 +1708,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       $('#cfg-token').value = cfg.token;
       $('#cfg-max-scroll').value = cfg.maxScrolls;
       $('#cfg-bg-scroll').value = cfg.maxBgScrolls;
+      $('#cfg-stop-consecutive').value = cfg.stopConsecutive ?? 15;
       $('#cfg-bg-url').value = cfg.bgTargetUrl;
       $('#cfg-bg-enabled').checked = cfg.dailyBgEnabled !== false;
     };
@@ -1415,27 +1739,52 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       const acct = accountScopeKey();
       const anchors = new Set(getAnchors(acct));
       const cutoff = getCutoff(acct);
+      const stopThreshold = Math.max(0, Number(cfg.stopConsecutive ?? 15));
+      const statesCache = {};
       let idle = 0;
       try {
         for (let step = 0; step < Number(cfg.maxScrolls || 60) && scrolling; step += 1) {
-          const ordered = getOrderedTweets();
-          if (ordered.some((t) => anchors.has(t.id) || (cutoff && t.id === cutoff))) {
-            setStatus(`已滚动命中截止位置，共缓存 ${ordered.length} 条。`);
+          const ordered = getLikesTweets();
+          if (cutoff && ordered.some((t) => t.id === cutoff)) {
+            setStatus(`已滚动命中手动截止位置，共缓存 ${ordered.length} 条。`);
+            break;
+          }
+          let statusExtra = '';
+          if (cfg.token && ordered.length > 0 && stopThreshold > 0) {
+            const needIds = [];
+            for (const t of ordered) {
+              for (const mid of extractTweetManifestIds(t)) {
+                if (!(mid in statesCache)) needIds.push(mid);
+              }
+            }
+            if (needIds.length > 0) {
+              Object.assign(statesCache, await reconcileTweets(needIds, cfg));
+            }
+            const evalRes = evaluateReconcileStop(ordered, statesCache, stopThreshold);
+            statusExtra = ` · 待推 ${evalRes.toPush.length} · 连续已归档 ${evalRes.consecutiveSettled}/${stopThreshold}`;
+            if (evalRes.shouldStop) {
+              setStatus(`已命中连续 ${stopThreshold} 条 NAS 已归档记录，停止加载（共 ${ordered.length} 条）。`);
+              break;
+            }
+          } else if (ordered.some((t) => anchors.has(t.id))) {
+            setStatus(`已滚动命中本地锚点，共缓存 ${ordered.length} 条。`);
             break;
           }
           const before = ordered.length;
           const prevReq = likesGraphqlCount;
           const { moved, atBottom } = await scrollPageStep();
           await sleep(atBottom ? 1600 : 700);
-          const after = getOrderedTweets().length;
+          const after = getLikesTweets().length;
           idle = after === before && likesGraphqlCount === prevReq && (atBottom || !moved) ? idle + 1 : 0;
-          setStatus(`正在加载点赞列表…第 ${step + 1} 次滚动，已捕获 ${after} 条推文`);
+          setStatus(`正在加载点赞列表…第 ${step + 1} 次滚动，已捕获 ${after} 条推文${statusExtra}`);
           refreshView();
           if (idle >= 5) {
-            setStatus(`连续多次无新增推文，停止自动加载（共 ${after} 条）。`);
+            setStatus(`连续多次无新增推文，停止自动加载（共 ${after} 条${statusExtra}）。`);
             break;
           }
         }
+      } catch (e) {
+        setStatus(e.message || String(e), true);
       } finally {
         scrolling = false;
         $('#stop-scroll').classList.add('hidden');
@@ -1448,35 +1797,158 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       if (busy) return;
       busy = true;
       try {
+        cfg = loadConfig();
         const acct = accountScopeKey();
-        const ordered = getOrderedTweets();
-        if (!ordered.length) throw new Error('暂未捕获到推文，请先在点赞页滚动加载。');
-        const sliced = computeIncrementalSlice(ordered, getAnchors(acct), getCutoff(acct));
-        if (!sliced.items.length) {
+        const ordered = getLikesTweets();
+        if (!ordered.length) throw new Error('暂未捕获到点赞推文，请先在点赞页滚动加载。');
+        const cutoff = getCutoff(acct);
+        const cutoffIdx = cutoff ? ordered.findIndex((it) => it.id === cutoff) : -1;
+        const scoped = cutoffIdx >= 0 ? ordered.slice(0, cutoffIdx) : ordered;
+        const checkIds = [];
+        for (const t of scoped) {
+          for (const mid of extractTweetManifestIds(t)) checkIds.push(mid);
+        }
+        const states = await reconcileTweets(checkIds, cfg);
+        const evalRes = evaluateReconcileStop(scoped, states, 0);
+        const toPush = evalRes.toPush;
+        if (!toPush.length) {
           await reportToNas(cfg, {
             source_mode: 'workbench',
             account: acct,
             status: 'empty',
-            discovered: ordered.length,
-            message: '工作台手动检查命中锚点，无新增内容',
+            discovered: scoped.length,
+            message: `工作台与 NAS 对账 ${scoped.length} 条点赞推文，无新增待下载内容`,
           });
-          return setStatus('范围内没有新推文（已发送「无新增」状态到 NAS）。');
+          return setStatus(`对账完成（共 ${scoped.length} 条），没有需要下载的新推文。`);
         }
-        const res = await pushTweetsBatch(sliced.items, {
+        const res = await pushTweetsBatch(toPush, {
           sourceMode: 'workbench',
           updateAnchors: true,
           account: acct,
           cfg,
-          discovered: ordered.length,
+          discovered: scoped.length,
           onProgress: (m) => setStatus(m),
         });
+        if (scoped.length) {
+          await gmSetAll({
+            [STORAGE_KEYS.ANCHORS_PREFIX + acct]: nextAnchors(scoped, getAnchors(acct)),
+          });
+        }
         setStatus(
-          `发送成功！范围 ${sliced.items.length} 条 → 清单 ${res.submitted} 组 · NAS 接收 ${res.accepted} · 重复跳过 ${res.skipped} · 异常直链 ${res.unresolvable}（已更新 5 锚点）`
+          `发送成功！对账 ${scoped.length} 条 → 待推 ${toPush.length} 条 · 清单 ${res.submitted} 组 · NAS 接收 ${res.accepted} · 重复跳过 ${res.skipped} · 异常直链 ${res.unresolvable}`
         );
       } catch (e) {
         setStatus(e.message || String(e), true);
       } finally {
         busy = false;
+        refreshView();
+      }
+    };
+
+    const collectAllTweetIdsFromItems = (list) => {
+      const ids = [];
+      for (const t of list) {
+        if (t?.id) ids.push(String(t.id));
+        if (t?.outerTweetId) ids.push(String(t.outerTweetId));
+        if (t?.quotedTweetId) ids.push(String(t.quotedTweetId));
+        if (t?.retweetedTweetId) ids.push(String(t.retweetedTweetId));
+        for (const mid of extractTweetManifestIds(t)) ids.push(mid);
+      }
+      return [...new Set(ids.filter((x) => /^\d{1,30}$/.test(x)))];
+    };
+
+    $('#push-baseline-loaded').onclick = async () => {
+      if (busy || scrolling) return;
+      busy = true;
+      try {
+        cfg = loadConfig();
+        const ordered = getOrderedTweets();
+        const ids = collectAllTweetIdsFromItems(ordered);
+        if (!ids.length) throw new Error('暂未捕获到推文 ID，请先在点赞页滚动加载。');
+        const res = await pushBaselineIds(ids, {
+          account: accountScopeKey(),
+          sourceMode: 'workbench',
+          cfg,
+          onProgress: (m) => setStatus(m),
+        });
+        setStatus(
+          `基线导入完成！提交 ${res.submitted} 条 ID · 新增 ${res.added} · 已存在 ${res.existing} · 累计基线 ${res.baselineTotal} 条`
+        );
+      } catch (e) {
+        setStatus(e.message || String(e), true);
+      } finally {
+        busy = false;
+        refreshView();
+      }
+    };
+
+    $('#scroll-baseline').onclick = async () => {
+      if (scrolling || busy) return;
+      cfg = loadConfig();
+      if (!cfg.token) return setStatus('请先填写并保存推送授权 Token。', true);
+      scrolling = true;
+      busy = true;
+      $('#stop-scroll').classList.remove('hidden');
+      const acct = accountScopeKey();
+      const sentBaselineIds = new Set();
+      const processedTweetIds = new Set();
+      let totalAdded = 0;
+      let totalSubmitted = 0;
+      let latestTotal = 0;
+      let idle = 0;
+      try {
+        for (let step = 0; step < Number(cfg.maxScrolls || 60) && scrolling; step += 1) {
+          const current = getLikesTweets();
+          const freshIds = collectAllTweetIdsFromItems(current).filter((id) => !sentBaselineIds.has(id));
+          if (freshIds.length > 0) {
+            const res = await pushBaselineIds(freshIds, {
+              account: acct,
+              sourceMode: 'workbench',
+              cfg,
+            });
+            for (const id of freshIds) sentBaselineIds.add(id);
+            for (const t of current) {
+              if (t?.id) processedTweetIds.add(t.id);
+            }
+            totalSubmitted += res.submitted;
+            totalAdded += res.added;
+            latestTotal = res.baselineTotal;
+            trimProcessedCache(likesOrder, likesMap, 120, null, processedTweetIds);
+          }
+          const before = getLikesTweets().length;
+          const prevReq = likesGraphqlCount;
+          const { moved, atBottom } = await scrollPageStep();
+          await sleep(atBottom ? 1600 : 700);
+          const after = getLikesTweets().length;
+          idle = after === before && likesGraphqlCount === prevReq && (atBottom || !moved) ? idle + 1 : 0;
+          setStatus(
+            `正在导入基线…第 ${step + 1} 次滚动 · 累计提交 ${totalSubmitted} · 新增 ${totalAdded} · 总基线 ${latestTotal}`
+          );
+          refreshView();
+          if (idle >= 5) break;
+        }
+        while (true) {
+          const tailIds = collectAllTweetIdsFromItems(getLikesTweets()).filter((id) => !sentBaselineIds.has(id));
+          if (!tailIds.length) break;
+          const res = await pushBaselineIds(tailIds, {
+            account: acct,
+            sourceMode: 'workbench',
+            cfg,
+          });
+          for (const id of tailIds) sentBaselineIds.add(id);
+          totalSubmitted += res.submitted;
+          totalAdded += res.added;
+          latestTotal = res.baselineTotal;
+        }
+        setStatus(
+          `边滚边导基线结束！共提交 ${totalSubmitted} 条唯一 ID · 新增 ${totalAdded} · 当前总基线 ${latestTotal} 条`
+        );
+      } catch (e) {
+        setStatus(e.message || String(e), true);
+      } finally {
+        scrolling = false;
+        busy = false;
+        $('#stop-scroll').classList.add('hidden');
         refreshView();
       }
     };
@@ -1528,6 +2000,8 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         token: $('#cfg-token').value.trim(),
         maxScrolls: Math.max(1, Math.min(300, Number($('#cfg-max-scroll').value || 60))),
         maxBgScrolls: Math.max(1, Math.min(200, Number($('#cfg-bg-scroll').value || 60))),
+        stopConsecutive: Math.max(0, Math.min(500, Number($('#cfg-stop-consecutive').value ?? 15))),
+        flushBatchSize: cfg.flushBatchSize || 30,
         bgTargetUrl: $('#cfg-bg-url').value.trim() || 'https://x.com/i/history/likes',
         dailyBgEnabled: $('#cfg-bg-enabled').checked,
       };
@@ -1570,6 +2044,9 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     hydrateSettingsForm();
     refreshView();
     setInterval(() => {
+      if (isLikesPagePath(location.pathname) && location.pathname !== activeLikesPath) {
+        resetLikesCache(location.pathname);
+      }
       if (!$('.panel').classList.contains('hidden')) refreshView();
       else $('#pill').textContent = String(getOrderedTweets().length);
     }, 2000);
