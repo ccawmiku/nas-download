@@ -174,8 +174,13 @@ class Store:
                 states[row[0]] = "deferred"
         wanted = set(ids)
         for row in db.execute("SELECT payload FROM tasks WHERE platform='xhs' AND state IN ('queued','running')"):
-            for url in json.loads(row[0]).get("urls") or []:
+            payload_obj = json.loads(row[0] or "{}")
+            for url in payload_obj.get("urls") or []:
                 note = xhs_link_id(url)
+                if note in wanted and note not in states:
+                    states[note] = "pending"
+            for entry in payload_obj.get("items") or []:
+                note = str(entry.get("note_id") or "").strip().lower()
                 if note in wanted and note not in states:
                     states[note] = "pending"
         return states, previous
@@ -261,12 +266,17 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             states, previous = self._xhs_states(db, [note for _, note in candidates if note])
+            force_retry = bool(payload.get("force_retry"))
             selected = []
             accepted_ids = set()
             for url, note in candidates:
                 meta = previous.get(note, {})
-                stale_token = meta.get("needs_fresh_token") and url == meta.get("url")
-                if note is not None and (note in states or note in accepted_ids or stale_token):
+                st = states.get(note)
+                if note is not None and (note in accepted_ids or st in {"archived", "pending"}):
+                    continue
+                if st == "deferred" and not force_retry and url == meta.get("url"):
+                    continue
+                if meta.get("needs_fresh_token") and url == meta.get("url") and not force_retry:
                     continue
                 selected.append(url)
                 if note is not None:
@@ -412,6 +422,55 @@ class Store:
         where = " WHERE " + " AND ".join(conditions)
         with self.connect() as db:
             return int(db.execute(f"SELECT count(*) FROM records{where}", list(PLATFORMS)).fetchone()[0] or 0)
+
+    def list_browser_errors(self, platform, limit=200):
+        where = " WHERE platform=? AND " + " AND ".join(self._error_where_clauses())
+        safe_limit = max(1, min(int(limit or 200), 500))
+        with self.connect() as db:
+            rows = db.execute(
+                f"SELECT source_id,state,metadata,updated FROM records{where} ORDER BY updated DESC LIMIT ?",
+                (platform, safe_limit),
+            ).fetchall()
+        items = []
+        for row in rows:
+            meta = json.loads(row["metadata"] or "{}")
+            sid = str(row["source_id"])
+            default_url = (
+                f"https://www.xiaohongshu.com/explore/{sid}"
+                if platform == "xhs"
+                else f"https://x.com/i/web/status/{sid}"
+                if platform == "x"
+                else ""
+            )
+            items.append(
+                {
+                    "platform": platform,
+                    "source_id": sid,
+                    "state": row["state"],
+                    "url": str(meta.get("url") or default_url),
+                    "title": str(meta.get("title") or ""),
+                    "author": str(meta.get("author") or ""),
+                    "error": str(meta.get("error") or ""),
+                    "attempts": int(meta.get("attempts") or 0),
+                    "updated": float(row["updated"] or 0),
+                    "category": str(meta.get("category") or ""),
+                    "destination": str(meta.get("destination") or "batch"),
+                    "needs_fresh_token": bool(meta.get("needs_fresh_token")),
+                    "retry_exhausted": bool(meta.get("retry_exhausted")),
+                    "failure_kind": str(meta.get("failure_kind") or ""),
+                    "source_mode": str(meta.get("source_mode") or ""),
+                }
+            )
+        return items
+
+    def dismiss_browser_error(self, platform, identifier):
+        where = " WHERE platform=? AND source_id=? AND " + " AND ".join(self._error_where_clauses())
+        with self.connect() as db:
+            updated = db.execute(
+                f"UPDATE records SET metadata=json_set(metadata,'$.error_dismissed',json('true')) {where}",
+                (platform, str(identifier)),
+            ).rowcount
+        return updated == 1
 
     def page(self, table, page=1, limit=30, platform="", state="", query="", errors=False):
         if table not in {"tasks", "assets", "logs", "records"}:

@@ -81,7 +81,7 @@ test('xhs report uses canonical xhs platform and surfaces HTTP 422 detail', () =
   );
 });
 
-const {extractXhsApiNotes, evaluateXhsEarlyStop} = require('../tools/userscripts/xhs-docker-queue.user.js');
+const {extractXhsApiNotes, evaluateXhsEarlyStop, extractXhsNoteMedia, pickFailedRefreshIds} = require('../tools/userscripts/xhs-docker-queue.user.js');
 
 test('extracts XHS API page notes and evaluates consecutive archived early-stop', () => {
   const apiNotes = extractXhsApiNotes({
@@ -135,5 +135,67 @@ test('xhs userscript metadata uses document-start and matches both www and apex 
   assert.match(src, /@match\s+https:\/\/www\.xiaohongshu\.com\/\*/);
   assert.match(src, /@match\s+https:\/\/xiaohongshu\.com\/\*/);
   assert.match(src, /ensureMounted/);
+});
+
+test('extractXhsNoteMedia parses images/videos and pickFailedRefreshIds detects refreshed xsec_token URLs', () => {
+  const imgNote = extractXhsNoteMedia(
+    {
+      note_id: id,
+      title: '多图详情',
+      user: {nickname: '小红薯'},
+      image_list: [
+        {
+          info_list: [
+            {image_scene: 'WB_PRV', url: 'http://sns-webpic-qc.xhscdn.com/prv.jpg'},
+            {image_scene: 'WB_DFT', url: 'http://sns-webpic-qc.xhscdn.com/dft.jpg'},
+          ],
+        },
+        {url_default: 'https://sns-webpic-qc.xhscdn.com/second.jpg'},
+      ],
+    },
+    `https://www.xiaohongshu.com/explore/${id}?xsec_token=tok123`
+  );
+  assert.equal(imgNote.note_id, id);
+  assert.equal(imgNote.title, '多图详情');
+  assert.equal(imgNote.author, '小红薯');
+  assert.deepEqual(imgNote.media, [
+    {type: 'image', url: 'https://sns-webpic-qc.xhscdn.com/dft.jpg'},
+    {type: 'image', url: 'https://sns-webpic-qc.xhscdn.com/second.jpg'},
+  ]);
+
+  const vidId = 'abcdefabcdefabcdefabcdef';
+  const vidNote = extractXhsNoteMedia({
+    noteId: vidId,
+    type: 'video',
+    displayTitle: '高清视频',
+    video: {
+      media: {
+        stream: {
+          h264: [
+            {masterUrl: 'http://sns-video-bd.xhscdn.com/low.mp4', videoBitrate: 500},
+            {master_url: 'http://sns-video-bd.xhscdn.com/high.mp4', video_bitrate: 1800},
+          ],
+        },
+      },
+    },
+  });
+  assert.equal(vidNote.note_id, vidId);
+  assert.deepEqual(vidNote.media, [{type: 'video', url: 'https://sns-video-bd.xhscdn.com/high.mp4'}]);
+
+  const staleUrl = `https://www.xiaohongshu.com/explore/${id}?xsec_token=old`;
+  const refreshedUrl = `https://www.xiaohongshu.com/explore/${id}?xsec_token=new`;
+  const failedMap = {
+    [id]: {source_id: id, url: staleUrl},
+    [vidId]: {source_id: vidId, url: `https://www.xiaohongshu.com/explore/${vidId}?xsec_token=same`},
+  };
+  const picked = pickFailedRefreshIds(
+    [
+      {id, url: refreshedUrl},
+      {id: vidId, url: `https://www.xiaohongshu.com/explore/${vidId}?xsec_token=same`},
+      {id: 'cccccccccccccccccccccccc', url: 'https://www.xiaohongshu.com/explore/cccccccccccccccccccccccc?xsec_token=x'},
+    ],
+    failedMap
+  );
+  assert.deepEqual(picked, [id]);
 });
 

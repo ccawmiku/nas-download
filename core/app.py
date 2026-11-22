@@ -31,14 +31,22 @@ from .store import PLATFORMS, Store, XHS_ID, X_TWEET_ID
 from .updates import check_updates
 from .x_direct import normalize_direct_payload
 from .x_errors import MAX_ATTEMPTS as X_MAX_ATTEMPTS
+from .xhs_direct import normalize_xhs_direct_payload
 
 DEFAULT_XHS_AUTO_RETRY_CAP = 5
 SCRIPT_PUSH_ORIGINS = {
     "/api/xhs/links": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
     "/api/xhs/reconcile": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
+    "/api/xhs/direct": {"https://www.xiaohongshu.com", "https://xiaohongshu.com"},
     "/api/x/direct": {"https://x.com", "https://twitter.com"},
     "/api/x/reconcile": {"https://x.com", "https://twitter.com"},
     "/api/x/baseline": {"https://x.com", "https://twitter.com"},
+    "/api/browser-push/errors/dismiss": {
+        "https://www.xiaohongshu.com",
+        "https://xiaohongshu.com",
+        "https://x.com",
+        "https://twitter.com",
+    },
     "/api/browser-push/report": {
         "https://www.xiaohongshu.com",
         "https://xiaohongshu.com",
@@ -249,7 +257,9 @@ async def guard(request: Request, call_next):
                     client_ip=request.client.host if request.client else "",
                 )
             return Response(status_code=401)
-    elif path.startswith("/api/browser-push/runs/") and request.method == "GET":
+    elif (
+        path.startswith("/api/browser-push/runs/") or path == "/api/browser-push/errors"
+    ) and request.method == "GET":
         submit_token = store.get("browser_submit_token", "")
         provided = request.headers.get("X-NAS-Submit-Token", "")
         token_ok = bool(submit_token and provided and hmac.compare_digest(provided, submit_token))
@@ -591,15 +601,7 @@ def dismiss_x_error(identifier: str):
 def dismiss_error(platform: str, identifier: str):
     if platform not in PLATFORMS:
         raise HTTPException(404)
-    with store.connect() as db:
-        updated = db.execute(
-            "UPDATE records SET metadata=json_set(metadata,'$.error_dismissed',json('true')) "
-            "WHERE platform=? AND source_id=? AND state IN ('failed','interrupted') "
-            "AND (platform!='x' OR json_extract(metadata,'$.retry_exhausted')=1) "
-            "AND COALESCE(json_extract(metadata,'$.error_dismissed'),0)=0",
-            (platform, identifier),
-        ).rowcount
-    if not updated:
+    if not store.dismiss_browser_error(platform, identifier):
         raise HTTPException(404, "错误记录不存在或已删除")
     return {"ok": True}
 
@@ -753,6 +755,32 @@ def browser_push_run_status(run_id: str):
     return {"found": True, "run": data}
 
 
+@app.get("/api/browser-push/errors")
+def browser_push_errors(
+    platform: str = "",
+    limit: int = Query(200, ge=1, le=500),
+):
+    if platform not in {"x", "xhs"}:
+        raise HTTPException(422, "平台筛选仅支持 x 或 xhs")
+    items = store.list_browser_errors(platform, limit=limit)
+    for item in items:
+        item["error"] = sanitize(item.get("error", ""))
+    return {"ok": True, "platform": platform, "items": items, "total": len(items)}
+
+
+@app.post("/api/browser-push/errors/dismiss")
+def browser_push_dismiss_error(payload: dict):
+    if not isinstance(payload, dict):
+        raise HTTPException(422, "请求格式无效")
+    platform = str(payload.get("platform") or "").strip().lower()
+    source_id = str(payload.get("source_id") or "").strip()
+    if platform not in {"x", "xhs"} or not source_id or len(source_id) > 120:
+        raise HTTPException(422, "平台或条目 ID 无效")
+    if not store.dismiss_browser_error(platform, source_id):
+        raise HTTPException(404, "错误记录不存在或已隐藏")
+    return {"ok": True}
+
+
 @app.get("/api/browser-push/status")
 def browser_push_status(
     platform: str = "",
@@ -896,8 +924,9 @@ def browser_x_direct(payload: dict, request: Request):
     batch_id = str(payload.get("batch_id") or "").strip()[:80]
     run_id = str(payload.get("run_id") or "").strip()[:100]
     source_mode = str(payload.get("source_mode") or "workbench").strip().lower()
-    if source_mode not in {"bg", "workbench", "single"}:
+    if source_mode not in {"bg", "workbench", "single", "error_retry"}:
         source_mode = "workbench"
+    force = bool(payload.get("force")) or source_mode == "error_retry"
     destination = str(payload.get("destination") or "batch").strip().lower()
     if destination not in {"batch", "single"}:
         raise HTTPException(422, "保存类型无效")
@@ -905,7 +934,11 @@ def browser_x_direct(payload: dict, request: Request):
     discovered = max(len(normalized), int(payload.get("discovered") or len(normalized)))
 
     payload_hash = hashlib.sha256(
-        json.dumps({"items": normalized, "destination": destination}, sort_keys=True, ensure_ascii=False).encode()
+        json.dumps(
+            {"items": normalized, "destination": destination, "force": force},
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode()
     ).hexdigest()
     if batch_id:
         cached = store.get_push_batch("x", batch_id)
@@ -956,7 +989,12 @@ def browser_x_direct(payload: dict, request: Request):
         task_id, created = store.enqueue(
             "x",
             "direct",
-            {"items": to_queue, "destination": destination, "source_mode": source_mode},
+            {
+                "items": to_queue,
+                "destination": destination,
+                "source_mode": source_mode,
+                **({"force": True} if force else {}),
+            },
         )
 
     accepted = len(to_queue) if created else 0
@@ -1112,8 +1150,9 @@ def browser_links(payload: dict, request: Request):
         payload.get("source_mode")
         or ("single" if destination == "single" else "workbench")
     ).strip().lower()
-    if source_mode not in {"bg", "workbench", "single"}:
+    if source_mode not in {"bg", "workbench", "single", "error_retry"}:
         source_mode = "workbench"
+    force_retry = bool(payload.get("force_retry")) or source_mode == "error_retry"
     account = sanitize(str(payload.get("account") or ""))[:100]
     raw_category = payload.get("category", "")
     if raw_category is not None and str(raw_category).strip():
@@ -1132,6 +1171,8 @@ def browser_links(payload: dict, request: Request):
         hash_obj = {"urls": canonical_urls, "destination": destination}
         if category:
             hash_obj["category"] = category
+        if force_retry:
+            hash_obj["force_retry"] = True
         payload_hash = hashlib.sha256(
             json.dumps(hash_obj, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
@@ -1146,6 +1187,8 @@ def browser_links(payload: dict, request: Request):
     task_payload = {"urls": urls, "destination": destination}
     if category:
         task_payload["category"] = category
+    if force_retry:
+        task_payload["force_retry"] = True
     result = add_task({
         "platform": "xhs",
         "kind": "links",
@@ -1195,6 +1238,124 @@ def browser_links(payload: dict, request: Request):
                 "accepted": accepted,
                 "skipped": skipped,
                 "taskId": result["id"],
+                "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+    return response
+
+
+@app.post("/api/xhs/direct")
+def browser_xhs_direct(payload: dict, request: Request):
+    try:
+        normalized = normalize_xhs_direct_payload(payload)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
+
+    batch_id = str(payload.get("batch_id") or "").strip()[:80]
+    run_id = str(payload.get("run_id") or "").strip()[:100]
+    source_mode = str(payload.get("source_mode") or "error_retry").strip().lower()
+    if source_mode not in {"bg", "workbench", "single", "error_retry"}:
+        source_mode = "error_retry"
+    destination = str(payload.get("destination") or "batch").strip().lower()
+    if destination not in {"batch", "single"}:
+        raise HTTPException(422, "保存类型无效")
+    account = sanitize(str(payload.get("account") or ""))[:100]
+    raw_category = payload.get("category", "")
+    if raw_category is not None and str(raw_category).strip():
+        if str(raw_category).strip().lower() not in {"liked", "saved"}:
+            raise HTTPException(422, "保存分类无效")
+    category = _normalize_xhs_category(raw_category, account)
+    discovered = max(len(normalized), int(payload.get("discovered") or len(normalized)))
+
+    payload_hash = hashlib.sha256(
+        json.dumps(
+            {"items": normalized, "destination": destination, "category": category},
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    if batch_id:
+        cached = store.get_push_batch("xhs_direct", batch_id)
+        if cached:
+            if cached["payload_hash"] != payload_hash:
+                raise HTTPException(409, "批次 ID 与提交清单不一致")
+            return {**cached["response"], "idempotent_replay": True}
+
+    states = store.xhs_download_states([item["note_id"] for item in normalized])
+    to_queue = []
+    skipped_count = 0
+    for item in normalized:
+        if states.get(item["note_id"]) in {"archived", "pending"}:
+            skipped_count += 1
+            continue
+        to_queue.append(item)
+
+    task_id = ""
+    created = False
+    if to_queue:
+        task_payload = {
+            "items": to_queue,
+            "destination": destination,
+            "source_mode": source_mode,
+            "force": True,
+        }
+        if category:
+            task_payload["category"] = category
+        task_id, created = store.enqueue("xhs", "direct", task_payload)
+
+    accepted = len(to_queue) if created else 0
+    if to_queue and not created:
+        skipped_count += len(to_queue)
+
+    response = {
+        "ok": True,
+        "submitted": len(normalized),
+        "valid": len(normalized),
+        "accepted": accepted,
+        "skipped": skipped_count,
+        "invalid": [],
+        "queue_file": "持久任务队列",
+        "triggered": {"ok": True},
+        "task_id": task_id,
+        "batch_id": batch_id,
+        "mode": "direct",
+    }
+    push_status = (
+        "queued"
+        if accepted > 0
+        else "duplicate"
+        if to_queue or skipped_count > 0
+        else "empty"
+    )
+    store.record_browser_push(
+        "xhs",
+        source_mode,
+        push_status,
+        batch_id=batch_id,
+        account=account,
+        submitted=len(normalized),
+        accepted=accepted,
+        skipped=skipped_count,
+        discovered=discovered,
+        task_id=task_id,
+        message=f"小红书浏览器直推：新增 {accepted}，跳过 {skipped_count}",
+        client_ip=request.client.host if request.client else "",
+    )
+    if batch_id:
+        store.save_push_batch("xhs_direct", batch_id, payload_hash, response)
+    if run_id:
+        store.save_bg_run(
+            run_id,
+            "xhs",
+            "ok",
+            {
+                "reason": "pushed",
+                "mode": category or "liked",
+                "category": category,
+                "itemCount": accepted,
+                "submitted": len(normalized),
+                "skipped": skipped_count,
+                "taskId": task_id,
                 "finishedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
         )
@@ -1508,6 +1669,63 @@ def record_file(platform: str, identifier: str, index: int = Query(0, ge=0)):
     if not path.is_file():
         raise HTTPException(404, "文件已被移动或删除")
     return FileResponse(path)
+
+
+IMAGE_THUMB_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic", ".heif"}
+)
+
+
+@app.get("/api/records/{platform}/{identifier}/thumb")
+def record_thumb(
+    platform: str,
+    identifier: str,
+    index: int = Query(0, ge=0),
+    w: int = Query(480, ge=120, le=1200),
+):
+    value = get_record(platform, identifier)
+    if index >= len(value["files"]):
+        raise HTTPException(404)
+    path = allowed_path(value["files"][index])
+    if not path.is_file():
+        raise HTTPException(404, "文件已被移动或删除")
+    if path.suffix.lower() not in IMAGE_THUMB_EXTENSIONS:
+        raise HTTPException(404, "仅支持图片缩略图")
+
+    stat = path.stat()
+    cache_key = hashlib.sha256(
+        f"{path}|{stat.st_mtime_ns}|{stat.st_size}|{w}".encode()
+    ).hexdigest()[:24]
+    thumb_dir = DATA / "thumbs"
+    thumb_path = thumb_dir / f"{cache_key}.webp"
+    if thumb_path.is_file() and thumb_path.stat().st_size > 0:
+        return FileResponse(
+            thumb_path,
+            media_type="image/webp",
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
+
+    tmp_thumb = thumb_dir / f"{cache_key}.{os.getpid()}.tmp.webp"
+    try:
+        from PIL import Image, ImageOps
+
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in {"RGB", "RGBA"}:
+                img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+            img.thumbnail((w, w * 3), Image.Resampling.LANCZOS)
+            img.save(tmp_thumb, "WEBP", quality=82, method=4)
+        tmp_thumb.replace(thumb_path)
+        return FileResponse(
+            thumb_path,
+            media_type="image/webp",
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
+    except Exception:
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+    finally:
+        tmp_thumb.unlink(missing_ok=True)
 
 
 def allowed_roots():

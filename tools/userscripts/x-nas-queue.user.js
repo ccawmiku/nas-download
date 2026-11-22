@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X · NAS 下载工作台
 // @namespace    https://yaemiko.lol/nas-download
-// @version      1.2.0
-// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持服务端 tweet_id 状态对账、连续已归档早停、流式推送、仅导入基线与每日后台回执
+// @version      1.3.0
+// @description  拦截 X GraphQL 响应直接提取无水印原图与最高码率 MP4 直链，按推文/引用双重归档（方案 A），支持服务端 tweet_id 状态对账、连续已归档早停、流式推送、失败列表同步/自动重推与每日后台回执
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @run-at       document-start
@@ -34,6 +34,7 @@
     LAST_ACCOUNT: 'nas_prod_x_last_account_v1',
     DAILY_STATE: 'nas_prod_x_daily_state',
     BG_RESULT: 'nas_prod_x_bg_result',
+    ERROR_CACHE: 'nas_prod_x_error_cache',
   };
 
   const MAX_ANCHORS = 5;
@@ -774,11 +775,15 @@
     }
   };
 
+  let onDetailIngestCallback = null;
   const ingestDetailTweets = (entries) => {
     for (const item of entries) {
       if (!item || !item.id) continue;
       if (!detailMap.has(item.id)) detailOrder.push(item.id);
       detailMap.set(item.id, item);
+    }
+    if (typeof onDetailIngestCallback === 'function') {
+      try { onDetailIngestCallback(entries); } catch {}
     }
   };
 
@@ -854,6 +859,7 @@
     stopConsecutive: 15,
     flushBatchSize: 30,
     dailyBgEnabled: true,
+    autoRetryErrorDetail: true,
     bgTargetUrl: 'https://x.com/i/history/likes',
   });
 
@@ -1039,6 +1045,27 @@
     return { submitted, added, existing, baselineTotal };
   };
 
+  const fetchNasXErrors = async (cfg) => {
+    if (!cfg?.token) {
+      throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+    }
+    const url = endpoint(cfg.host, cfg.port, '/api/browser-push/errors?platform=x&limit=200');
+    const data = await gmGetJson(url, cfg.token);
+    const list = Array.isArray(data?.items) ? data.items : [];
+    await gmSetAll({ [STORAGE_KEYS.ERROR_CACHE]: list });
+    return list;
+  };
+
+  const dismissNasXError = async (cfg, sourceId) => {
+    if (!cfg?.token) {
+      throw new Error('请先在设置中填写从 NAS 控制台复制的「推送授权 Token」。');
+    }
+    return postToNas(endpoint(cfg.host, cfg.port, '/api/browser-push/errors/dismiss'), cfg.token, {
+      platform: 'x',
+      source_id: String(sourceId || ''),
+    });
+  };
+
   const RESERVED_PATH_ROOTS = new Set(['i', 'home', 'explore', 'notifications', 'messages', 'settings', 'search']);
 
   const readLiveAccountHandle = () => {
@@ -1082,7 +1109,7 @@
 
   const pushTweetsBatch = async (
     tweets,
-    { sourceMode, updateAnchors, account, cfg, discovered, runId = '', onProgress }
+    { sourceMode, updateAnchors, account, cfg, discovered, runId = '', force = false, onProgress }
   ) => {
     const discoveredTotal = Number(discovered || tweets.length);
     const { manifests, textOnlySkipped } = flattenDirectManifestItems(tweets);
@@ -1122,6 +1149,7 @@
       const reply = await postToNas(url, cfg.token, {
         batch_id: chunkBatchId,
         source_mode: sourceMode,
+        ...(force ? { force: true } : {}),
         ...(runId && isLastChunk ? { run_id: runId } : {}),
         account,
         discovered: discoveredTotal,
@@ -1132,7 +1160,7 @@
         Number(reply.skipped || 0) +
         Number(reply.unresolvable || 0);
       if (!reply.ok || handledCount !== chunk.length) {
-        throw new Error('NAS 返回回执数量不完整，已保留断点，请勿重置锚点。');
+        throw new Error('NAS 返回回执数量不完整，请稍后重试。');
       }
       accepted += Number(reply.accepted || 0);
       skipped += Number(reply.skipped || 0);
@@ -1322,9 +1350,14 @@
 
         const evaluatedIds = new Set();
         const queuedOrPushedIds = new Set();
+        const forceRetryIds = new Set();
         const reconciledStates = {};
         const pendingBuffer = [];
         const headAnchorCandidates = [];
+        const failedErrorList = await fetchNasXErrors(cfg).catch(() => []);
+        const failedErrorIds = new Set(
+          failedErrorList.map((row) => String(row?.source_id || '').trim()).filter(Boolean)
+        );
         let consecutiveSettled = 0;
         let stoppedByReconcile = false;
         let stoppedByCutoff = false;
@@ -1363,11 +1396,18 @@
                   evaluatedIds.add(tweet.id);
                   continue;
                 }
-                const allSettled = mids.every((id) => settledSet.has(reconciledStates[id]));
+                const allArchived = mids.every((id) => reconciledStates[id] === 'archived');
+                const hitsFailedRetry =
+                  !allArchived &&
+                  Number(tweet.usableDirectCount || 0) > 0 &&
+                  mids.some((id) => failedErrorIds.has(id) && reconciledStates[id] !== 'archived' && reconciledStates[id] !== 'pending');
+                const allSettled =
+                  !hitsFailedRetry && mids.every((id) => settledSet.has(reconciledStates[id]));
                 if (allSettled) {
                   consecutiveSettled += 1;
                 } else {
                   consecutiveSettled = 0;
+                  if (hitsFailedRetry) forceRetryIds.add(tweet.id);
                   if (!queuedOrPushedIds.has(tweet.id)) {
                     queuedOrPushedIds.add(tweet.id);
                     pendingBuffer.push(tweet);
@@ -1395,6 +1435,7 @@
                 cfg,
                 discovered: totalDiscovered,
                 runId: '',
+                force: take.some((t) => forceRetryIds.has(t.id)),
               });
               totalSubmitted += summary.submitted;
               totalAccepted += summary.accepted;
@@ -1605,6 +1646,12 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     <div class="row spread"><strong>当前页面已捕获推文</strong><small id="list-summary"></small></div>
     <div id="tweet-list" class="list"></div>
   </div>
+  <div class="box">
+    <div class="row spread"><strong>NAS 失败重试（详情直抓）</strong><button id="sync-x-errors" class="quiet">同步 NAS 错误列表</button></div>
+    <label class="row muted"><input id="cfg-auto-retry-error" type="checkbox" style="width:auto">打开失败推文页时自动直推 NAS</label>
+    <div class="muted" id="x-error-summary"></div>
+    <div id="x-error-list" class="list"></div>
+  </div>
   <div id="status" role="status">就绪：打开点赞页 (/i/history/likes) 或推文详情页即可自动捕获高清直链。</div>
   <details class="box">
     <summary>NAS 连接与每日后台设置</summary>
@@ -1633,6 +1680,10 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     let cfg = loadConfig();
     let scrolling = false;
     let busy = false;
+    let errorCache = Array.isArray(GM_getValue(STORAGE_KEYS.ERROR_CACHE, []))
+      ? GM_getValue(STORAGE_KEYS.ERROR_CACHE, [])
+      : [];
+    const autoSubmittedXIds = new Set();
 
     const setStatus = (msg, isError = false) => {
       $('#status').textContent = msg;
@@ -1707,6 +1758,58 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         };
         listEl.append(div);
       }
+
+      const errRows = Array.isArray(errorCache) ? errorCache : [];
+      $('#x-error-summary').textContent = errRows.length
+        ? `已同步 ${errRows.length} 条失败推文（点开详情页自动直抓推送）`
+        : '点击右上角同步 NAS 失败列表';
+      const errListEl = $('#x-error-list');
+      errListEl.replaceChildren();
+      for (const errRow of errRows.slice(0, 60)) {
+        const sid = String(errRow?.source_id || '').trim();
+        if (!sid) continue;
+        const itemUrl = errRow.url || `https://x.com/i/web/status/${sid}`;
+        const rowDiv = document.createElement('div');
+        rowDiv.className = 'item';
+        const head = document.createElement('div');
+        head.className = 'row spread';
+        const strong = document.createElement('strong');
+        strong.textContent = `${errRow.author ? '@' + errRow.author + ' · ' : ''}${sid}`;
+        head.append(strong);
+        const desc = document.createElement('div');
+        desc.className = 'muted';
+        desc.textContent = errRow.error || '未能下载媒体';
+        const btnRow = document.createElement('div');
+        btnRow.className = 'row';
+        const openLink = document.createElement('a');
+        openLink.href = itemUrl;
+        openLink.target = '_blank';
+        openLink.rel = 'noopener noreferrer';
+        openLink.textContent = '打开推文';
+        openLink.style.fontSize = '12px';
+        openLink.style.marginRight = 'auto';
+        const dismissBtn = document.createElement('button');
+        dismissBtn.textContent = '忽略';
+        dismissBtn.disabled = busy;
+        dismissBtn.onclick = async () => {
+          if (busy) return;
+          busy = true;
+          try {
+            await dismissNasXError(cfg, sid);
+            errorCache = errorCache.filter((x) => String(x?.source_id || '') !== sid);
+            await gmSetAll({ [STORAGE_KEYS.ERROR_CACHE]: errorCache });
+            setStatus(`已忽略失败推文 ${sid}。`);
+          } catch (e) {
+            setStatus(e.message || String(e), true);
+          } finally {
+            busy = false;
+            refreshView();
+          }
+        };
+        btnRow.append(openLink, dismissBtn);
+        rowDiv.append(head, desc, btnRow);
+        errListEl.append(rowDiv);
+      }
     };
 
     const hydrateSettingsForm = () => {
@@ -1720,6 +1823,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       $('#cfg-stop-consecutive').value = cfg.stopConsecutive ?? 15;
       $('#cfg-bg-url').value = cfg.bgTargetUrl;
       $('#cfg-bg-enabled').checked = cfg.dailyBgEnabled !== false;
+      $('#cfg-auto-retry-error').checked = cfg.autoRetryErrorDetail !== false;
     };
 
     $('.launch').onclick = () => {
@@ -2013,6 +2117,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
         flushBatchSize: cfg.flushBatchSize || 30,
         bgTargetUrl: $('#cfg-bg-url').value.trim() || 'https://x.com/i/history/likes',
         dailyBgEnabled: $('#cfg-bg-enabled').checked,
+        autoRetryErrorDetail: $('#cfg-auto-retry-error').checked,
       };
       endpoint(next.host, next.port, next.path);
       cfg = next;
@@ -2045,6 +2150,74 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       }
     };
 
+    const checkAutoRetryDetailTweet = async () => {
+      cfg = loadConfig();
+      if (cfg.autoRetryErrorDetail === false || !cfg.token) return;
+      const statusMatch = location.pathname.match(/^\/(?:[^/]+\/)?status\/(\d{1,30})(?:[/?#]|$)/);
+      const curId = statusMatch?.[1] || '';
+      if (!curId || autoSubmittedXIds.has(curId)) return;
+      const latestCache = GM_getValue(STORAGE_KEYS.ERROR_CACHE, errorCache);
+      if (Array.isArray(latestCache)) errorCache = latestCache;
+      const isFailed = (Array.isArray(errorCache) ? errorCache : []).some(
+        (row) => String(row?.source_id || '').trim() === curId
+      );
+      if (!isFailed) return;
+      const candidate =
+        getDetailTweets().find(
+          (t) =>
+            String(t?.id || '') === curId ||
+            String(t?.quotedTweetId || '') === curId ||
+            extractTweetManifestIds(t).includes(curId)
+        ) || detailMap.get(curId);
+      if (!candidate || Number(candidate.usableDirectCount || 0) <= 0) return;
+      autoSubmittedXIds.add(curId);
+      try {
+        const res = await pushTweetsBatch([candidate], {
+          sourceMode: 'error_retry',
+          updateAnchors: false,
+          account: accountScopeKey(),
+          cfg,
+          discovered: 1,
+          force: true,
+        });
+        errorCache = (Array.isArray(errorCache) ? errorCache : []).filter(
+          (x) => String(x?.source_id || '').trim() !== curId
+        );
+        await gmSetAll({ [STORAGE_KEYS.ERROR_CACHE]: errorCache });
+        setStatus(
+          `失败推文 ${curId} 已自动直推 NAS：清单 ${res.submitted} · 新增 ${res.accepted} · 跳过 ${res.skipped}`
+        );
+        refreshView();
+      } catch (e) {
+        autoSubmittedXIds.delete(curId);
+        setStatus(`自动重推失败推文 ${curId} 出错：${e.message || e}`, true);
+      }
+    };
+
+    $('#sync-x-errors').onclick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        cfg = loadConfig();
+        errorCache = await fetchNasXErrors(cfg);
+        setStatus(`已同步 ${errorCache.length} 条 X 失败记录，点击任意一条打开详情页即可自动重推。`);
+      } catch (e) {
+        setStatus(e.message || String(e), true);
+      } finally {
+        busy = false;
+        refreshView();
+      }
+    };
+
+    $('#cfg-auto-retry-error').onchange = () => {
+      cfg = { ...loadConfig(), autoRetryErrorDetail: $('#cfg-auto-retry-error').checked };
+      saveConfig(cfg).catch(() => {});
+    };
+
+    onDetailIngestCallback = () => {
+      checkAutoRetryDetailTweet().catch(() => {});
+    };
+
     GM_registerMenuCommand('打开 X NAS 下载工作台', () => {
       $('.panel').classList.remove('hidden');
       hydrateSettingsForm();
@@ -2052,6 +2225,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
     });
     hydrateSettingsForm();
     refreshView();
+    checkAutoRetryDetailTweet().catch(() => {});
     setInterval(() => {
       if (!host.isConnected && document.body) {
         document.body.append(host);
@@ -2059,6 +2233,7 @@ details summary{cursor:pointer;font-weight:600;color:#334155;font-size:13px}
       if (isLikesPagePath(location.pathname) && location.pathname !== activeLikesPath) {
         resetLikesCache(location.pathname);
       }
+      checkAutoRetryDetailTweet().catch(() => {});
       if (!$('.panel').classList.contains('hidden')) refreshView();
       else $('#pill').textContent = String(getOrderedTweets().length);
     }, 2000);

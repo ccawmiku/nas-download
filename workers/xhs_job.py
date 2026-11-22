@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from core.config import CONFIG_PATHS, read_json, sanitize
 from core.media import publish
 from core.store import xhs_link_id
+from core.xhs_direct import download_xhs_direct_item
 from .client import Client, prepare, record, submit
 
 
@@ -158,7 +159,141 @@ def resolve_archive_target(
     return final_root / rel
 
 
+async def run_direct(job):
+    config = read_json(CONFIG_PATHS["xhs"])
+    settings_original = dict(
+        read_json(os.getenv("XHS_SETTINGS_PATH", "/app/Volume/settings.json"))
+    )
+    payload = job.get("payload") or {}
+    final_base = archive_root(
+        settings_original,
+        config,
+        payload.get("destination", "batch"),
+        payload.get("category", ""),
+    )
+    destination, enabled = prepare("xhs", final_base / "incoming", job["id"])
+    staging = destination.parent if enabled else final_base / ".incoming" / job["id"]
+    staging.mkdir(parents=True, exist_ok=True)
+    activity = staging / ".downloading"
+    activity.touch()
+    stats = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+    items = payload.get("items") or []
+    delay = max(0.0, float(config.get("request_delay_seconds", 0.5) or 0.5))
+
+    try:
+        for idx, entry in enumerate(items):
+            stats["discovered"] += 1
+            note_id = str(entry.get("note_id") or "").strip().lower()
+            if not note_id:
+                stats["failed"] += 1
+                print(json.dumps(stats), flush=True)
+                continue
+            try:
+                previous = Client().request(f"/internal/record/xhs/{note_id}")
+            except Exception:
+                previous = {}
+            prev_meta = previous.get("metadata", {}) if isinstance(previous, dict) else {}
+            dest_kind = str(
+                entry.get("destination")
+                or payload.get("destination")
+                or prev_meta.get("destination")
+                or "batch"
+            ).strip().lower()
+            if dest_kind not in {"batch", "single"}:
+                dest_kind = "batch"
+            raw_cat = str(
+                entry.get("category")
+                or payload.get("category")
+                or prev_meta.get("category")
+                or ""
+            ).strip().lower()
+            category = raw_cat if raw_cat in XHS_CATEGORY_DIRS else ""
+            raw_prev_cats = prev_meta.get("categories") or (
+                [prev_meta["category"]] if prev_meta.get("category") in XHS_CATEGORY_DIRS else []
+            )
+            existing_cats = {
+                str(c).strip().lower()
+                for c in raw_prev_cats
+                if str(c).strip().lower() in XHS_CATEGORY_DIRS
+            }
+            merged_cats = sorted(existing_cats | ({category} if category else set()))
+            entry_final = archive_root(settings_original, config, dest_kind, category)
+
+            status, files, err_msg = await asyncio.to_thread(
+                download_xhs_direct_item, entry, staging
+            )
+            delivered = []
+            processing = False
+            metadata = {
+                "url": entry.get("url")
+                or prev_meta.get("url")
+                or f"https://www.xiaohongshu.com/explore/{note_id}",
+                "destination": dest_kind,
+                "source_mode": "direct",
+                **({"category": category} if category else {}),
+                **({"categories": merged_cats} if merged_cats else {}),
+                "title": entry.get("title") or prev_meta.get("title", ""),
+                **({"author": entry.get("author")} if entry.get("author") else {}),
+            }
+            handoff_meta = {
+                "url": metadata["url"],
+                "destination": dest_kind,
+                "source_mode": "direct",
+                **({"category": category} if category else {}),
+                **({"categories": merged_cats} if merged_cats else {}),
+                **({"title": metadata["title"]} if metadata.get("title") else {}),
+            }
+            for raw_path in files:
+                source = Path(raw_path)
+                if not source.is_file() or not source.stat().st_size:
+                    continue
+                target = entry_final / source.relative_to(staging)
+                if enabled:
+                    submit(
+                        "xhs",
+                        source,
+                        target,
+                        {"source_id": note_id, "metadata": dict(handoff_meta)},
+                    )
+                    delivered.append(str(source))
+                    processing = True
+                else:
+                    saved = publish(source, source, target)
+                    delivered.append(str(saved))
+            if not enabled:
+                for raw_path in files:
+                    Path(raw_path).unlink(missing_ok=True)
+
+            failed = status != "done" or not delivered
+            if failed:
+                metadata.update(
+                    error=sanitize(err_msg) or "小红书浏览器直推下载失败",
+                    download_incomplete=True,
+                    attempts=int(prev_meta.get("attempts", 0) or 0) + 1,
+                )
+            else:
+                metadata["attempts"] = 1
+
+            record(
+                "xhs",
+                note_id,
+                "failed" if failed else "processing" if processing else "complete",
+                delivered,
+                metadata,
+            )
+            stats["failed" if failed else "downloaded"] += 1
+            print(json.dumps(stats), flush=True)
+            if idx + 1 < len(items) and delay > 0:
+                await asyncio.sleep(min(delay, 3.0))
+    finally:
+        activity.unlink(missing_ok=True)
+    stats["stop_reason"] = "direct"
+    return stats
+
+
 async def run(job):
+    if job.get("kind") == "direct":
+        return await run_direct(job)
     from source.application.app import XHS
 
     config = read_json(CONFIG_PATHS["xhs"])

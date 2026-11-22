@@ -324,4 +324,14 @@ test('safeSliceText avoids lone UTF-16 surrogates on Emoji truncation and xBg sc
 
   assert.equal(xBg.computeTabTimeout({maxBgScrolls: 60}), 270000);
   assert.equal(xBg.computeTabTimeout({maxBgScrolls: 1000}), 2620000);
+
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const xSrc = fs.readFileSync(
+    path.join(__dirname, '../tools/userscripts/x-nas-queue.user.js'),
+    'utf8'
+  );
+  assert.match(xSrc, /sync-x-errors/);
+  assert.match(xSrc, /autoRetryErrorDetail/);
+  assert.match(xSrc, /sourceMode:\s*'error_retry'/);
 });

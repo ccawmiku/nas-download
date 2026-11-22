@@ -1,10 +1,13 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { Component, useEffect, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   House,
   Download,
   Layers3,
   Images,
+  LayoutGrid,
+  List,
+  Film,
   SlidersHorizontal,
   ScrollText,
   Search,
@@ -1205,6 +1208,138 @@ function Telegram({ act, open }: { act: Act; open: Open }) {
     </>
   );
 }
+const IMAGE_EXT_RE = /\.(jpg|jpeg|png|webp|gif|bmp|avif|heic|heif)$/i;
+const VIDEO_EXT_RE = /\.(mp4|mkv|mov|webm|m4v)$/i;
+
+function pickRecordPreview(row: any) {
+  const files: string[] = Array.isArray(row?.files) ? row.files : [];
+  const imgIdx = files.findIndex((f) => IMAGE_EXT_RE.test(String(f || "")));
+  if (imgIdx >= 0) {
+    return {
+      kind: "image" as const,
+      index: imgIdx,
+      count: files.length,
+      src: `/api/records/${row.platform}/${encodeURIComponent(row.source_id)}/thumb?index=${imgIdx}&w=480`,
+      fallbackSrc: `/api/records/${row.platform}/${encodeURIComponent(row.source_id)}/file?index=${imgIdx}`,
+    };
+  }
+  const vidIdx = files.findIndex((f) => VIDEO_EXT_RE.test(String(f || "")));
+  if (vidIdx >= 0) {
+    return {
+      kind: "video" as const,
+      index: vidIdx,
+      count: files.length,
+      src: `/api/records/${row.platform}/${encodeURIComponent(row.source_id)}/file?index=${vidIdx}#t=0.1`,
+      fallbackSrc: "",
+    };
+  }
+  return {
+    kind: "none" as const,
+    index: -1,
+    count: files.length,
+    src: "",
+    fallbackSrc: "",
+  };
+}
+
+function RecordThumb({
+  preview,
+  title,
+  platform,
+}: {
+  preview: ReturnType<typeof pickRecordPreview>;
+  title: string;
+  platform: string;
+}) {
+  const [src, setSrc] = useState(preview.src);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setSrc(preview.src);
+    setFailed(false);
+  }, [preview.src]);
+  if (preview.kind === "image" && src && !failed) {
+    return (
+      <img
+        src={src}
+        alt={title}
+        loading="lazy"
+        decoding="async"
+        onError={() => {
+          if (preview.fallbackSrc && src !== preview.fallbackSrc) {
+            setSrc(preview.fallbackSrc);
+          } else {
+            setFailed(true);
+          }
+        }}
+      />
+    );
+  }
+  if (preview.kind === "video" && src) {
+    return <video src={src} muted preload="metadata" playsInline />;
+  }
+  return (
+    <div className="record-thumb-empty">
+      <Mark platform={platform} />
+      <span>
+        {preview.kind === "image"
+          ? "预览不可用"
+          : preview.count
+            ? `${preview.count} 个文件`
+            : "无媒体文件"}
+      </span>
+    </div>
+  );
+}
+
+function RecordRetryButton({
+  row,
+  act,
+  setConfirmSpec,
+}: {
+  row: any;
+  act: Act;
+  setConfirmSpec: (spec: ConfirmSpec | null) => void;
+}) {
+  if (
+    row.state !== "failed" ||
+    row.platform === "telegram" ||
+    !row.metadata?.url
+  ) {
+    return null;
+  }
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        const meta = row.metadata || {};
+        const isLegacyX =
+          row.platform === "x" &&
+          meta.source_mode !== "direct" &&
+          !(Array.isArray(meta.direct_media) && meta.direct_media.length > 0);
+        const runRetry = () =>
+          act("/api/tasks", {
+            platform: row.platform,
+            kind: "retry",
+            payload: { urls: [meta.url] },
+          });
+        if (isLegacyX) {
+          setConfirmSpec({
+            title: "该 X 记录将使用无头浏览器与 Cookie 重试",
+            description:
+              "这条失败记录来自旧版抓取链路（不含直推媒体清单）。继续重试会在 Docker 中启动 Playwright 无头浏览器并读取本地 x_cookies.txt 访问推文页面。如不想动用服务端 Cookie，建议在 Chrome 打开推文后用油猴脚本直推。",
+            primaryLabel: "确认继续重试",
+            onPrimary: runRetry,
+          });
+          return;
+        }
+        runRetry();
+      }}
+    >
+      重试下载
+    </button>
+  );
+}
+
 function Collection({
   kind,
   act,
@@ -1218,13 +1353,29 @@ function Collection({
     [state, setState] = useState(""),
     [q, setQ] = useState(""),
     [page, setPage] = useState(1),
-    [confirmSpec, setConfirmSpec] = useState<ConfirmSpec | null>(null);
+    [confirmSpec, setConfirmSpec] = useState<ConfirmSpec | null>(null),
+    [view, setView] = useState<"waterfall" | "list">(() => {
+      try {
+        return localStorage.getItem("nas_records_view") === "list"
+          ? "list"
+          : "waterfall";
+      } catch {
+        return "waterfall";
+      }
+    });
+  const toggleView = (next: "waterfall" | "list") => {
+    setView(next);
+    try {
+      localStorage.setItem("nas_records_view", next);
+    } catch {}
+  };
   const { value: data, error } = useData(
     `/api/${kind}?page=${page}&platform=${platform}&state=${state}&q=${encodeURIComponent(q)}`,
   );
   const status = useData("/api/workspace");
   useEffect(() => setPage(1), [platform, state, q]);
   const workspace = kind === "assets";
+  const items: any[] = Array.isArray(data?.items) ? data.items : [];
   return (
     <>
       <div className="page-title">
@@ -1280,7 +1431,31 @@ function Collection({
           </span>
         </div>
       )}
-      <Panel title={workspace ? "文件处理列表" : "内容与归档"}>
+      <Panel
+        title={workspace ? "文件处理列表" : "内容与归档"}
+        extra={
+          !workspace ? (
+            <div className="view-toggle" role="group" aria-label="视图切换">
+              <button
+                type="button"
+                className={view === "waterfall" ? "selected" : ""}
+                onClick={() => toggleView("waterfall")}
+              >
+                <LayoutGrid size={14} />
+                瀑布流
+              </button>
+              <button
+                type="button"
+                className={view === "list" ? "selected" : ""}
+                onClick={() => toggleView("list")}
+              >
+                <List size={14} />
+                列表
+              </button>
+            </div>
+          ) : undefined
+        }
+      >
         <FilterBar
           {...{ platform, setPlatform, q, setQ, state, setState }}
           states={
@@ -1298,95 +1473,142 @@ function Collection({
           }
         />
         {error && <p className="inline-error">{error}</p>}
-        {data?.items.length ? (
-          data.items.map((r: any) => {
-            const file = workspace
-              ? (r.target || r.source).split(/[\\/]/).pop()
-              : r.metadata.title || r.source_id;
-            return (
-              <div
-                className="data-row"
-                key={r.id || r.platform + ":" + r.source_id}
-              >
-                <button
-                  className="row-content"
-                  onClick={() => open(workspace ? "asset" : "record", r)}
+        {items.length ? (
+          !workspace && view === "waterfall" ? (
+            <div className="records-masonry">
+              {items.map((r: any) => {
+                const meta = r.metadata || {};
+                const fileTitle = String(
+                  meta.title || meta.author || r.source_id || "",
+                );
+                const preview = pickRecordPreview(r);
+                return (
+                  <article
+                    className={`record-card ${r.state || ""}`}
+                    key={`${r.platform}:${r.source_id}`}
+                    onClick={() => open("record", r)}
+                  >
+                    <div className="record-thumb">
+                      <RecordThumb
+                        preview={preview}
+                        title={fileTitle}
+                        platform={r.platform}
+                      />
+                      <span className="record-corner-left">
+                        <Mark platform={r.platform} />
+                      </span>
+                      <span className="record-corner-right">
+                        {preview.kind === "video" && (
+                          <span className="record-media-pill">
+                            <Film size={11} />
+                            视频
+                          </span>
+                        )}
+                        {preview.count > 1 && (
+                          <span className="record-media-pill">
+                            {preview.count}P
+                          </span>
+                        )}
+                        {r.state !== "complete" && <Badge state={r.state} />}
+                      </span>
+                    </div>
+                    <div className="record-card-body">
+                      <strong>{fileTitle}</strong>
+                      <div className="record-card-meta">
+                        <small>
+                          {names[r.platform] || r.platform} · {stamp(r.updated)}
+                        </small>
+                        <RecordRetryButton
+                          row={r}
+                          act={act}
+                          setConfirmSpec={setConfirmSpec}
+                        />
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            items.map((r: any) => {
+              const meta = r.metadata || {};
+              const files: string[] = Array.isArray(r.files) ? r.files : [];
+              const file = workspace
+                ? String(r.target || r.source || "")
+                    .split(/[\\/]/)
+                    .pop() || r.id
+                : meta.title || meta.author || r.source_id;
+              const preview = !workspace ? pickRecordPreview(r) : null;
+              return (
+                <div
+                  className="data-row"
+                  key={r.id || r.platform + ":" + r.source_id}
                 >
-                  <Mark platform={r.platform} />
-                  <div>
-                    <strong>{file}</strong>
-                    <small>
-                      {workspace
-                        ? r.reason || `${bytes(r.source_bytes)} · 等待处理`
-                        : `${names[r.platform]} · ${r.files.length} 个文件 · ${stamp(r.updated)}`}
-                    </small>
-                    {workspace && r.output_bytes > 0 && (
+                  <button
+                    className="row-content"
+                    onClick={() => open(workspace ? "asset" : "record", r)}
+                  >
+                    {preview && preview.kind === "image" ? (
+                      <div className="record-list-thumb">
+                        <RecordThumb
+                          preview={preview}
+                          title={String(file || "")}
+                          platform={r.platform}
+                        />
+                      </div>
+                    ) : (
+                      <Mark platform={r.platform} />
+                    )}
+                    <div>
+                      <strong>{file}</strong>
                       <small>
-                        {bytes(r.source_bytes)} → {bytes(r.output_bytes)}
-                        {r.output_bytes < r.source_bytes
-                          ? ` · 节省 ${((1 - r.output_bytes / r.source_bytes) * 100).toFixed(1)}%`
-                          : " · 保留原件"}
+                        {workspace
+                          ? r.reason || `${bytes(r.source_bytes)} · 等待处理`
+                          : `${names[r.platform] || r.platform} · ${files.length} 个文件 · ${stamp(r.updated)}`}
                       </small>
-                    )}
-                  </div>
-                </button>
-                <Badge state={r.state} />
-                {workspace && (
-                  <div className="row-actions">
-                    {["failed", "interrupted"].includes(r.state) && (
-                      <button
-                        onClick={() => act(`/api/assets/${r.id}/retry`, {})}
-                      >
-                        重试
-                      </button>
-                    )}
-                    {["queued", "failed", "interrupted"].includes(r.state) && (
-                      <button
-                        className="danger-text"
-                        onClick={() => open("delete", r)}
-                      >
-                        删除
-                      </button>
-                    )}
-                  </div>
-                )}
-                {!workspace &&
-                  r.state === "failed" &&
-                  r.platform !== "telegram" &&
-                  r.metadata.url && (
+                      {workspace && r.output_bytes > 0 && (
+                        <small>
+                          {bytes(r.source_bytes)} → {bytes(r.output_bytes)}
+                          {r.output_bytes < r.source_bytes
+                            ? ` · 节省 ${((1 - r.output_bytes / r.source_bytes) * 100).toFixed(1)}%`
+                            : " · 保留原件"}
+                        </small>
+                      )}
+                    </div>
+                  </button>
+                  <Badge state={r.state} />
+                  {workspace && (
                     <div className="row-actions">
-                      <button
-                        onClick={() => {
-                          const isLegacyX =
-                            r.platform === "x" &&
-                            r.metadata?.source_mode !== "direct" &&
-                            !(Array.isArray(r.metadata?.direct_media) && r.metadata.direct_media.length > 0);
-                          const runRetry = () =>
-                            act("/api/tasks", {
-                              platform: r.platform,
-                              kind: "retry",
-                              payload: { urls: [r.metadata.url] },
-                            });
-                          if (isLegacyX) {
-                            setConfirmSpec({
-                              title: "该 X 记录将使用无头浏览器与 Cookie 重试",
-                              description:
-                                "这条失败记录来自旧版抓取链路（不含直推媒体清单）。继续重试会在 Docker 中启动 Playwright 无头浏览器并读取本地 x_cookies.txt 访问推文页面。如不想动用服务端 Cookie，建议在 Chrome 打开推文后用油猴脚本直推。",
-                              primaryLabel: "确认继续重试",
-                              onPrimary: runRetry,
-                            });
-                            return;
-                          }
-                          runRetry();
-                        }}
-                      >
-                        重试下载
-                      </button>
+                      {["failed", "interrupted"].includes(r.state) && (
+                        <button
+                          onClick={() => act(`/api/assets/${r.id}/retry`, {})}
+                        >
+                          重试
+                        </button>
+                      )}
+                      {["queued", "failed", "interrupted"].includes(r.state) && (
+                        <button
+                          className="danger-text"
+                          onClick={() => open("delete", r)}
+                        >
+                          删除
+                        </button>
+                      )}
                     </div>
                   )}
-              </div>
-            );
-          })
+                  {!workspace && (
+                    <div className="row-actions">
+                      <RecordRetryButton
+                        row={r}
+                        act={act}
+                        setConfirmSpec={setConfirmSpec}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )
         ) : (
           <Empty
             title={workspace ? "工作区已清空" : "还没有媒体记录"}
@@ -2568,7 +2790,7 @@ function Drawer({
   const mediaUrl =
     kind === "asset"
       ? `/api/assets/${row.id}/file`
-      : kind === "record" && row.files.length
+      : kind === "record" && Array.isArray(row.files) && row.files.length
         ? `/api/records/${row.platform}/${encodeURIComponent(row.source_id)}/file`
         : kind === "telegram" && row.url
           ? row.url.replace(/^\/telegram\//, "/api/telegram/")
@@ -2577,7 +2799,7 @@ function Drawer({
     kind === "asset"
       ? row.target
       : kind === "record"
-        ? row.files[0]
+        ? row.files?.[0] || ""
         : row.file_name || "";
   const video = /\.(mp4|mkv|mov|webm|m4v)$/i.test(path || ""),
     image = /\.(jpg|jpeg|png|webp|gif)$/i.test(path || "");
@@ -2840,6 +3062,48 @@ function AddLinks({ close, act }: { close: () => void; act: Act }) {
     </div>
   );
 }
+class ErrorBoundary extends Component<
+  { resetKey?: string; children: ReactNode },
+  { error: string }
+> {
+  state = { error: "" };
+  static getDerivedStateFromError(err: Error) {
+    return { error: err?.message || "页面渲染出错" };
+  }
+  componentDidUpdate(prevProps: { resetKey?: string }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: "" });
+    }
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="error-boundary">
+          <TriangleAlert size={28} />
+          <strong>页面加载出现异常</strong>
+          <p>{this.state.error}</p>
+          <div className="row-actions">
+            <button
+              className="primary"
+              onClick={() => this.setState({ error: "" })}
+            >
+              重试渲染
+            </button>
+            <button
+              onClick={() => {
+                this.setState({ error: "" });
+                location.hash = "home";
+              }}
+            >
+              返回概览
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 function App() {
   const [route, setRoute] = useState(location.hash.slice(1) || "home"),
     [menu, setMenu] = useState(false),
@@ -3032,35 +3296,37 @@ function App() {
           </div>
         </header>
         <main>
-          {active === "home" ? (
-            <Home {...{ act, go, open }} />
-          ) : active === "push" ? (
-            <BrowserPushCenter
-              key={route}
-              initial={parameter}
-              act={act}
-              open={open}
-            />
-          ) : active === "downloads" ? (
-            <Downloads
-              key={route}
-              {...{ act, open }}
-              initial={parameter}
-              add={() => setAdd(true)}
-            />
-          ) : active === "workspace" ? (
-            <Collection kind="assets" {...{ act, open }} />
-          ) : active === "records" ? (
-            <Collection kind="records" {...{ act, open }} />
-          ) : active === "errors" ? (
-            <Errors act={act} />
-          ) : active === "settings" ? (
-            <Settings key={route} initial={parameter} act={act} go={go} />
-          ) : active === "logs" ? (
-            <Logs />
-          ) : (
-            <Home {...{ act, go, open }} />
-          )}
+          <ErrorBoundary resetKey={route}>
+            {active === "home" ? (
+              <Home {...{ act, go, open }} />
+            ) : active === "push" ? (
+              <BrowserPushCenter
+                key={route}
+                initial={parameter}
+                act={act}
+                open={open}
+              />
+            ) : active === "downloads" ? (
+              <Downloads
+                key={route}
+                {...{ act, open }}
+                initial={parameter}
+                add={() => setAdd(true)}
+              />
+            ) : active === "workspace" ? (
+              <Collection key="assets" kind="assets" {...{ act, open }} />
+            ) : active === "records" ? (
+              <Collection key="records" kind="records" {...{ act, open }} />
+            ) : active === "errors" ? (
+              <Errors act={act} />
+            ) : active === "settings" ? (
+              <Settings key={route} initial={parameter} act={act} go={go} />
+            ) : active === "logs" ? (
+              <Logs />
+            ) : (
+              <Home {...{ act, go, open }} />
+            )}
+          </ErrorBoundary>
         </main>
         <footer className="app-footer">
           NAS自动下载 <span>新内容增量同步 · 硬件处理 · 自动归档</span>

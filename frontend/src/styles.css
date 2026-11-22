@@ -2638,3 +2638,191 @@ progress::-webkit-progress-value {
     margin-left: 0;
   }
 }
+.view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px;
+  background: #f6f7fa;
+  gap: 2px;
+}
+.view-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+}
+.view-toggle button.selected {
+  background: #fff;
+  color: #111827;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  font-weight: 600;
+}
+.records-masonry {
+  padding: 16px 20px 20px;
+  column-count: 4;
+  column-gap: 16px;
+}
+@media (max-width: 1240px) {
+  .records-masonry {
+    column-count: 3;
+  }
+}
+@media (max-width: 860px) {
+  .records-masonry {
+    column-count: 2;
+  }
+}
+@media (max-width: 520px) {
+  .records-masonry {
+    column-count: 1;
+    padding: 12px;
+  }
+}
+.record-card {
+  break-inside: avoid;
+  margin-bottom: 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+.record-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+  border-color: #d6dae4;
+}
+.record-card.failed {
+  border-color: #f3c4c4;
+}
+.record-thumb {
+  position: relative;
+  background: #f4f5f8;
+  min-height: 110px;
+  overflow: hidden;
+}
+.record-thumb img,
+.record-thumb video {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 420px;
+  object-fit: cover;
+  background: #1118270a;
+}
+.record-thumb-empty {
+  height: 140px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #8a91a2;
+  font-size: 11px;
+}
+.record-corner-left {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+}
+.record-corner-right {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.record-media-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(15, 23, 42, 0.68);
+  backdrop-filter: blur(4px);
+}
+.record-card-body {
+  padding: 10px 12px 12px;
+  display: grid;
+  gap: 6px;
+}
+.record-card-body strong {
+  font-size: 12.5px;
+  font-weight: 550;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.record-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.record-card-meta small {
+  font-size: 10.5px;
+  color: #8a91a2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.record-card-meta button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.record-list-thumb {
+  width: 52px;
+  height: 52px;
+  border-radius: 10px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: #f3f4f7;
+}
+.record-list-thumb img,
+.record-list-thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.record-list-thumb .record-thumb-empty {
+  height: 100%;
+  font-size: 0;
+  gap: 0;
+}
+.error-boundary {
+  margin: 40px auto;
+  max-width: 460px;
+  padding: 28px 24px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #fff;
+  display: grid;
+  justify-items: center;
+  text-align: center;
+  gap: 10px;
+}
+.error-boundary p {
+  font-size: 12.5px;
+  color: #6b7280;
+  margin: 0;
+}

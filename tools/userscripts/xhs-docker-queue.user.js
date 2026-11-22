@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书 · NAS 下载工作台
 // @namespace    xhs_downloader
-// @version      3.5.0
-// @description  点赞和收藏按作品 ID 向 NAS 增量对账、连续已归档早停与流式推送，支持 API 响应拦截防 DOM 回收与每日后台回执
+// @version      3.6.0
+// @description  点赞和收藏按作品 ID 向 NAS 增量对账、连续已归档早停与流式推送，支持过期链接自动刷新、失败作品详情抓图直推与每日后台回执
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
 // @storageName  nas_prod_xhs_v1
@@ -34,6 +34,7 @@
         CONFIG: 'nas_prod_xhs_config_v1',
         DAILY_STATE: 'nas_prod_xhs_daily_state',
         BG_RESULT: 'nas_prod_xhs_bg_result',
+        ERROR_CACHE: 'nas_prod_xhs_error_cache',
     };
 
     const unwrap = value => value?._rawValue ?? value?.value ?? value;
@@ -163,6 +164,128 @@
         return {shouldStop: false, consecutiveSettled, stopAtId: ''};
     };
 
+    const toHttpsUrl = raw => {
+        const text = String(raw || '').trim();
+        if (!text) return '';
+        return /^http:\/\//i.test(text) ? `https://${text.slice(7)}` : text;
+    };
+
+    const extractXhsNoteMedia = (noteObj, fallbackUrl = '') => {
+        if (!noteObj || typeof noteObj !== 'object') return null;
+        const firstFeedCard = noteObj?.data?.items?.[0]?.note_card || noteObj?.items?.[0]?.note_card;
+        const node =
+            noteObj.note && typeof noteObj.note === 'object'
+                ? noteObj.note
+                : noteObj.note_card && typeof noteObj.note_card === 'object'
+                  ? noteObj.note_card
+                  : noteObj.noteCard && typeof noteObj.noteCard === 'object'
+                    ? noteObj.noteCard
+                    : firstFeedCard && typeof firstFeedCard === 'object'
+                      ? firstFeedCard
+                      : noteObj;
+        const id = noteId(
+            node.note_id || node.noteId || node.id || noteObj.id || fallbackUrl || ''
+        ).toLowerCase();
+        if (!id) return null;
+
+        const media = [];
+        const seen = new Set();
+        const pushMedia = (type, rawUrl) => {
+            const clean = toHttpsUrl(rawUrl);
+            if (!clean || !/^https:\/\//i.test(clean) || seen.has(clean)) return;
+            seen.add(clean);
+            media.push({type, url: clean});
+        };
+
+        const streamRoot = node.video?.media?.stream || {};
+        const streamCandidates = [];
+        for (const codec of ['h265', 'h264', 'av1', 'h266']) {
+            const list = streamRoot[codec];
+            if (Array.isArray(list)) {
+                for (const s of list) {
+                    const mUrl = s?.master_url || s?.masterUrl || s?.backup_urls?.[0] || s?.backupUrls?.[0] || '';
+                    if (mUrl) {
+                        streamCandidates.push({
+                            url: mUrl,
+                            bitrate: Number(s?.video_bitrate || s?.avg_bitrate || s?.bitrate || 0) || 0,
+                            preferH264: codec === 'h264' ? 1 : 0,
+                        });
+                    }
+                }
+            }
+        }
+        streamCandidates.sort((a, b) => b.bitrate - a.bitrate || b.preferH264 - a.preferH264);
+        if (streamCandidates.length > 0) {
+            pushMedia('video', streamCandidates[0].url);
+        } else {
+            const originKey = node.video?.consumer?.origin_video_key || node.video?.consumer?.originVideoKey || '';
+            if (originKey) {
+                pushMedia('video', `https://sns-video-bd.xhscdn.com/${String(originKey).replace(/^\/+/, '')}`);
+            }
+        }
+
+        if (media.length === 0) {
+            const images = node.image_list || node.imageList || [];
+            if (Array.isArray(images)) {
+                for (const img of images) {
+                    if (!img || typeof img !== 'object') continue;
+                    const infoList = img.info_list || img.infoList || [];
+                    let chosen = '';
+                    if (Array.isArray(infoList) && infoList.length) {
+                        const dft = infoList.find(
+                            x => (x?.image_scene || x?.imageScene || x?.scene) === 'WB_DFT' && (x?.url || '')
+                        );
+                        chosen = dft?.url || infoList[infoList.length - 1]?.url || infoList[0]?.url || '';
+                    }
+                    if (!chosen) {
+                        chosen = img.url_default || img.urlDefault || img.url_pre || img.urlPre || img.url || '';
+                    }
+                    pushMedia('image', chosen);
+                }
+            }
+        }
+
+        if (!media.length) return null;
+        const baseOrigin =
+            typeof location !== 'undefined' && location?.origin
+                ? location.origin
+                : 'https://www.xiaohongshu.com';
+        let noteUrl = `${baseOrigin}/explore/${id}`;
+        if (fallbackUrl && noteId(fallbackUrl).toLowerCase() === id) {
+            try {
+                const parsed = new URL(fallbackUrl, baseOrigin);
+                if (parsed.hostname.endsWith('xiaohongshu.com')) {
+                    noteUrl = parsed.href.split('#')[0];
+                }
+            } catch {}
+        }
+        return {
+            note_id: id,
+            url: noteUrl,
+            title: String(node.title || node.display_title || node.displayTitle || '').trim(),
+            author: String(
+                node.user?.nickname || node.user?.nick_name || node.user?.nickName || ''
+            ).trim(),
+            media,
+        };
+    };
+
+    const pickFailedRefreshIds = (orderedNotes, failedErrorMap = {}) => {
+        const refreshIds = [];
+        const errMap = failedErrorMap && typeof failedErrorMap === 'object' ? failedErrorMap : {};
+        for (const item of Array.isArray(orderedNotes) ? orderedNotes : []) {
+            const id = String(item?.id || '').toLowerCase();
+            if (!id) continue;
+            const errRow = errMap[id];
+            if (!errRow) continue;
+            const url = String(item?.url || '');
+            if (url.includes('xsec_token=') && url !== String(errRow.url || '')) {
+                refreshIds.push(id);
+            }
+        }
+        return refreshIds;
+    };
+
     // Pure helpers are also exercised by the Node regression tests.
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
@@ -177,6 +300,8 @@
             extractErrorMessage,
             extractXhsApiNotes,
             evaluateXhsEarlyStop,
+            extractXhsNoteMedia,
+            pickFailedRefreshIds,
         };
         return;
     }
@@ -209,6 +334,7 @@
             stopConsecutive: saved.stopConsecutive !== undefined ? Math.max(0, Number(saved.stopConsecutive) || 0) : 30,
             streamBatchSize: Math.max(10, Math.min(500, Number(saved.streamBatchSize || 50))),
             dailyBgEnabled: saved.dailyBgEnabled !== false,
+            autoRetryErrorDetail: saved.autoRetryErrorDetail !== false,
             bgModes: modesList.length ? modesList : ['liked', 'saved'],
             bgProfileUrl: String(saved.bgProfileUrl || ''),
         };
@@ -235,6 +361,7 @@
         saved: new Map(),
         published: new Map(),
     };
+    const detailCaptured = new Map();
 
     const detectXhsApiMode = reqUrl => {
         const u = String(reqUrl || '');
@@ -245,6 +372,22 @@
     };
 
     const ingestXhsApiPayload = (reqUrl, json) => {
+        const u = String(reqUrl || '');
+        if (/\/api\/sns\/web\/v\d+\/feed(?:[/?#]|$)/.test(u)) {
+            const list = json?.data?.items;
+            if (Array.isArray(list)) {
+                for (const entry of list) {
+                    const extracted = extractXhsNoteMedia(entry);
+                    if (extracted?.note_id) {
+                        detailCaptured.set(extracted.note_id, {
+                            raw: entry?.note_card || entry?.noteCard || entry,
+                            extracted,
+                        });
+                    }
+                }
+            }
+            return;
+        }
         const apiMode = detectXhsApiMode(reqUrl);
         if (!apiMode) return;
         const parsed = extractXhsApiNotes(json);
@@ -271,7 +414,7 @@
                 const response = await rawFetch.apply(this, args);
                 try {
                     const reqUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url || response?.url || '';
-                    if (detectXhsApiMode(reqUrl)) {
+                    if (detectXhsApiMode(reqUrl) || /\/api\/sns\/web\/v\d+\/feed(?:[/?#]|$)/.test(String(reqUrl || ''))) {
                         response.clone().json().then(json => ingestXhsApiPayload(reqUrl, json)).catch(() => {});
                     }
                 } catch {}
@@ -289,7 +432,12 @@
                 this.addEventListener('load', () => {
                     try {
                         const reqUrl = this.responseURL || this.__nasXhsUrl || '';
-                        if (this.status >= 200 && this.status < 300 && this.responseText && detectXhsApiMode(reqUrl)) {
+                        if (
+                            this.status >= 200 &&
+                            this.status < 300 &&
+                            this.responseText &&
+                            (detectXhsApiMode(reqUrl) || /\/api\/sns\/web\/v\d+\/feed(?:[/?#]|$)/.test(String(reqUrl || '')))
+                        ) {
                             ingestXhsApiPayload(reqUrl, JSON.parse(this.responseText));
                         }
                     } catch {}
@@ -622,6 +770,42 @@
         return body;
     };
 
+    const fetchNasErrors = async cfg => {
+        if (!cfg?.token) {
+            throw new Error('请先设置并保存「推送授权 (X-NAS-Submit-Token)」。');
+        }
+        const url = endpoint(cfg.host, cfg.port, '/api/browser-push/errors?platform=xhs&limit=200');
+        const data = await gmGetJson(url, cfg.token);
+        const list = Array.isArray(data?.items) ? data.items : [];
+        await gmSetAll({[STORAGE_KEYS.ERROR_CACHE]: list});
+        return list;
+    };
+
+    const dismissNasError = async (cfg, sourceId) => {
+        if (!cfg?.token) {
+            throw new Error('请先设置并保存「推送授权 (X-NAS-Submit-Token)」。');
+        }
+        return gmPostJson(endpoint(cfg.host, cfg.port, '/api/browser-push/errors/dismiss'), cfg.token, {
+            platform: 'xhs',
+            source_id: String(sourceId || ''),
+        });
+    };
+
+    const pushXhsDirect = async (cfg, items, opts = {}) => {
+        if (!cfg?.token) {
+            throw new Error('请先设置并保存「推送授权 (X-NAS-Submit-Token)」。');
+        }
+        return gmPostJson(endpoint(cfg.host, cfg.port, '/api/xhs/direct'), cfg.token, {
+            items,
+            destination: opts.destination || 'batch',
+            ...(opts.category ? {category: opts.category} : {}),
+            source_mode: opts.sourceMode || 'error_retry',
+            account: opts.account || '',
+            batch_id: makeBatchId('xhs_direct'),
+            discovered: items.length,
+        });
+    };
+
     const reportToNas = async (cfg, report, {strict = false} = {}) => {
         try {
             return await gmPostJson(
@@ -792,9 +976,17 @@
                 const collected = new Map();
                 const orderedIds = [];
                 const checkedStates = {};
+                const effectiveStates = {};
+                const refreshIds = new Set();
                 const handledIds = new Set();
                 const pushedIds = new Set();
                 const pendingBuffer = [];
+                const failedErrors = await fetchNasErrors(config).catch(() => []);
+                const failedErrorMap = Object.fromEntries(
+                    failedErrors
+                        .filter(row => row?.source_id)
+                        .map(row => [String(row.source_id).toLowerCase(), row])
+                );
                 const maxBg = Math.max(1, Math.min(1000, Number(config.maxBgScrolls || 300)));
                 const stopThreshold = Math.max(0, Number(config.stopConsecutive ?? 30));
                 const streamBatchSize = Math.max(10, Math.min(500, Number(config.streamBatchSize || 50)));
@@ -805,6 +997,7 @@
                 let totalSent = 0;
                 let totalAccepted = 0;
                 let totalSkipped = 0;
+                let totalRefreshed = 0;
                 let lastTaskId = '';
                 let soleBatchSentRunId = false;
                 let stoppedEarly = false;
@@ -834,10 +1027,14 @@
                     const chunk = chunkKeys.map(key => collected.get(key)).filter(Boolean);
                     if (!chunk.length) return;
                     batchSeq += 1;
+                    const refreshedHere = chunk.filter(item =>
+                        refreshIds.has(item.id.toLowerCase())
+                    ).length;
                     const body = await requestSubmit(config, {
                         urls: chunk.map(item => item.url),
                         destination: 'batch',
                         ...(limited ? {category: targetMode} : {}),
+                        ...(refreshedHere > 0 ? {force_retry: true} : {}),
                         ...(sendRunId ? {run_id: bgRun.runId} : {}),
                         batch_id: `${batchRoot}_p${batchSeq}`,
                         source_mode: 'bg',
@@ -848,6 +1045,7 @@
                     totalSent += chunk.length;
                     totalAccepted += Number(body.accepted || 0);
                     totalSkipped += Number(body.skipped || 0);
+                    if (refreshedHere > 0) totalRefreshed += refreshedHere;
                     if (body.task_id) lastTaskId = String(body.task_id);
                     for (const item of chunk) {
                         const key = item.id.toLowerCase();
@@ -865,7 +1063,20 @@
                             for (const id of needIds) {
                                 const st = freshStates[id];
                                 checkedStates[id] = st;
-                                if (st === 'missing' && !pushedIds.has(id) && collected.has(id)) {
+                                effectiveStates[id] = st;
+                                const item = collected.get(id);
+                                const errRow = failedErrorMap[id];
+                                const shouldRefresh =
+                                    Boolean(errRow) &&
+                                    st !== 'archived' &&
+                                    st !== 'pending' &&
+                                    Boolean(item?.url?.includes('xsec_token=')) &&
+                                    item.url !== String(errRow.url || '');
+                                if ((st === 'missing' || shouldRefresh) && !pushedIds.has(id) && collected.has(id)) {
+                                    if (shouldRefresh) {
+                                        refreshIds.add(id);
+                                        effectiveStates[id] = 'missing';
+                                    }
                                     pendingBuffer.push(id);
                                 } else {
                                     collected.delete(id);
@@ -886,7 +1097,7 @@
                         }
 
                         if (!forceFinal && stopThreshold > 0) {
-                            const early = evaluateXhsEarlyStop(orderedIds, checkedStates, stopThreshold);
+                            const early = evaluateXhsEarlyStop(orderedIds, effectiveStates, stopThreshold);
                             if (early.shouldStop) {
                                 stoppedEarly = true;
                             }
@@ -965,7 +1176,7 @@
                         submitted: totalSent,
                         skipped: totalSkipped,
                         ...(lastTaskId ? {task_id: lastTaskId} : {}),
-                        message: `流式核对完成：共扫 ${totalDiscovered} 个作品，提交 ${totalSent} 个（新增 ${totalAccepted}）`,
+                        message: `流式核对完成：共扫 ${totalDiscovered} 个作品，提交 ${totalSent} 个（新增 ${totalAccepted}${totalRefreshed ? `，含刷新过期链接 ${totalRefreshed} 个` : ''}）`,
                     }, {strict: true});
                 }
                 await writeBgResult({
@@ -977,6 +1188,7 @@
                     itemCount: totalSent,
                     accepted: totalAccepted,
                     skipped: totalSkipped,
+                    refreshed: totalRefreshed,
                     taskId: lastTaskId,
                     finishedAt: new Date().toISOString(),
                 });
@@ -1018,6 +1230,10 @@
     let busy = false;
     let stopped = false;
     let context = '';
+    let errorCache = Array.isArray(GM_getValue(STORAGE_KEYS.ERROR_CACHE, []))
+        ? GM_getValue(STORAGE_KEYS.ERROR_CACHE, [])
+        : [];
+    const autoSubmittedErrorIds = new Set();
 
     const activeAccount = () => accountId(location.pathname);
     const syncOwnProfileUrl = () => {
@@ -1085,6 +1301,12 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
   <p class="muted">按作品 ID 与 NAS 实时核对，已归档和正在处理的作品会自动跳过。</p>
   <div class="row spread"><small id="count">尚未读取作品</small><button id="send-batch" class="primary">发送待下载作品</button></div>
   <div id="list" class="list"></div>
+</div>
+<div class="box">
+  <div class="row spread"><h3>NAS 失败重试（详情抓图直推 · 方式 A）</h3><button id="sync-errors" class="quiet">同步 NAS 错误列表</button></div>
+  <label class="inline" style="margin:4px 0"><input id="auto-retry-error" type="checkbox"> 打开失败作品页时自动抓图直推 NAS</label>
+  <div class="row spread"><small id="error-summary"></small><button id="capture-detail-direct">抓取当前页原图/视频直推 NAS</button></div>
+  <div id="error-list" class="list"></div>
 </div>
 <div class="box">
   <div class="row spread"><h3>每日后台同步</h3><button id="set-bg-profile" class="quiet">设为我的后台主页</button></div>
@@ -1210,6 +1432,48 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             dailyText = `后台主页已绑定 · 今日已完成分类：[${doneList.join(', ') || '无'}]`;
         }
         $('#daily-summary').textContent = dailyText;
+
+        const errRows = Array.isArray(errorCache) ? errorCache : [];
+        $('#error-summary').textContent = errRows.length
+            ? `已同步 ${errRows.length} 条失败作品（点开后自动抓直链发给 NAS）`
+            : '点击右上角同步 NAS 失败列表';
+        const errListEl = $('#error-list');
+        errListEl.replaceChildren();
+        for (const errRow of errRows.slice(0, 60)) {
+            const rowEl = document.createElement('div');
+            rowEl.className = 'note';
+            const body = document.createElement('div');
+            body.className = 'grow';
+            const titleLink = document.createElement('a');
+            titleLink.className = 'title';
+            titleLink.href = errRow.url || `${location.origin}/explore/${errRow.source_id}`;
+            titleLink.target = '_blank';
+            titleLink.rel = 'noopener noreferrer';
+            titleLink.textContent = errRow.title || errRow.source_id;
+            const reasonEl = document.createElement('div');
+            reasonEl.className = 'muted';
+            reasonEl.textContent = `${errRow.source_id} · ${errRow.error || '下载失败'}`;
+            const actionsEl = document.createElement('div');
+            actionsEl.className = 'actions';
+            const openBtn = document.createElement('a');
+            openBtn.href = titleLink.href;
+            openBtn.target = '_blank';
+            openBtn.rel = 'noopener noreferrer';
+            openBtn.textContent = '打开作品';
+            const dismissBtn = document.createElement('button');
+            dismissBtn.textContent = '忽略';
+            dismissBtn.disabled = busy;
+            dismissBtn.onclick = () => execute(async () => {
+                await dismissNasError(config, errRow.source_id);
+                errorCache = errorCache.filter(x => x.source_id !== errRow.source_id);
+                await gmSetAll({[STORAGE_KEYS.ERROR_CACHE]: errorCache});
+                status(`已忽略失败记录 ${errRow.source_id}。`);
+            });
+            actionsEl.append(openBtn, dismissBtn);
+            body.append(titleLink, reasonEl, actionsEl);
+            rowEl.append(body);
+            errListEl.append(rowEl);
+        }
 
         shadow.querySelectorAll('button').forEach(button => {
             if (!button.matches('.launch,#close,#stop')) button.disabled = busy;
@@ -1383,6 +1647,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         $('#stop-consecutive').value = String(config.stopConsecutive ?? 30);
         $('#bg-url').value = config.bgProfileUrl;
         $('#daily-enabled').checked = config.dailyBgEnabled !== false;
+        $('#auto-retry-error').checked = config.autoRetryErrorDetail !== false;
         $('#bg-mode-liked').checked = config.bgModes.includes('liked');
         $('#bg-mode-saved').checked = config.bgModes.includes('saved');
     };
@@ -1409,6 +1674,92 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         await saveConfig({bgProfileUrl: cleanUrl});
         syncFormFields();
         status(`已将当前主页设为每日后台采集账号：${cleanUrl}`);
+    });
+    const extractCurrentDetailDirectItem = targetId => {
+        const vueNote = findVueRef('note');
+        const id = noteId(
+            targetId || unwrap(vueNote?.currentNoteId) || location.pathname
+        ).toLowerCase();
+        if (!id) return null;
+        const fromHook = detailCaptured.get(id);
+        const fromVue = unwrap(vueNote?.noteDetailMap)?.[id];
+        const candidate = fromHook?.raw || fromVue;
+        const extracted = fromHook?.extracted || extractXhsNoteMedia(candidate, location.href);
+        if (!extracted || !extracted.media?.length) return null;
+        const matchedErr = (Array.isArray(errorCache) ? errorCache : []).find(
+            x => String(x?.source_id || '').toLowerCase() === id
+        );
+        return {
+            ...extracted,
+            ...(matchedErr?.category ? {category: matchedErr.category} : {}),
+        };
+    };
+
+    const submitDetailDirectNote = async (targetId, sourceMode = 'error_retry') => {
+        const manifest = extractCurrentDetailDirectItem(targetId);
+        if (!manifest) {
+            throw new Error('暂未从当前页面捕获到原图或视频直链，请确认已打开作品详情页并等待加载完成。');
+        }
+        const res = await pushXhsDirect(config, [manifest], {
+            sourceMode,
+            category: manifest.category || '',
+            account: activeAccount(),
+        });
+        errorCache = (Array.isArray(errorCache) ? errorCache : []).filter(
+            x => String(x?.source_id || '').toLowerCase() !== manifest.note_id
+        );
+        await gmSetAll({[STORAGE_KEYS.ERROR_CACHE]: errorCache});
+        status(
+            `浏览器抓图直推成功！作品 ${manifest.note_id}（${manifest.media.length} 份媒体）→ NAS 新增 ${res.accepted} · 跳过 ${res.skipped}`
+        );
+        return {manifest, res};
+    };
+
+    const checkAutoRetryDetailPage = async () => {
+        if (config.autoRetryErrorDetail === false || !config.token) return;
+        const curId = noteId(location.pathname).toLowerCase();
+        if (!curId || autoSubmittedErrorIds.has(curId)) return;
+        const latestCache = GM_getValue(STORAGE_KEYS.ERROR_CACHE, errorCache);
+        if (Array.isArray(latestCache)) errorCache = latestCache;
+        const hit = (Array.isArray(errorCache) ? errorCache : []).some(
+            x => String(x?.source_id || '').toLowerCase() === curId
+        );
+        if (!hit) return;
+        autoSubmittedErrorIds.add(curId);
+        for (let attempt = 0; attempt < 16; attempt += 1) {
+            if (noteId(location.pathname).toLowerCase() !== curId) return;
+            if (extractCurrentDetailDirectItem(curId)) {
+                try {
+                    const {manifest, res} = await submitDetailDirectNote(curId, 'error_retry');
+                    render();
+                    if (typeof GM_notification === 'function') {
+                        try {
+                            GM_notification({
+                                title: '小红书失败作品已自动补传 NAS',
+                                text: `${manifest.title || manifest.note_id}（${manifest.media.length} 份媒体，新增 ${res.accepted}）`,
+                                timeout: 4500,
+                            });
+                        } catch {}
+                    }
+                } catch (err) {
+                    status(`自动直推作品 ${curId} 失败：${err?.message || err}`, true);
+                }
+                return;
+            }
+            await sleep(400);
+        }
+        status(`已进入失败作品页 ${curId}，但暂未捕获到媒体直链，可点「抓取当前页原图/视频直推 NAS」手动重试。`, true);
+    };
+
+    $('#sync-errors').onclick = () => execute(async () => {
+        errorCache = await fetchNasErrors(config);
+        status(`已同步 ${errorCache.length} 条小红书失败记录，点开任意一条即可自动抓图发给 NAS。`);
+    });
+    $('#auto-retry-error').onchange = () => {
+        saveConfig({autoRetryErrorDetail: Boolean($('#auto-retry-error').checked)}).catch(() => {});
+    };
+    $('#capture-detail-direct').onclick = () => execute(async () => {
+        await submitDetailDirectNote('', 'workbench');
     });
     $('#bg-test-liked').onclick = () => execute(() => triggerManualBgTab('liked'));
     $('#bg-test-saved').onclick = () => execute(() => triggerManualBgTab('saved'));
@@ -1447,6 +1798,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
             idSync: true,
             bgProfileUrl: $('#bg-url').value.trim().split('#')[0],
             dailyBgEnabled: $('#daily-enabled').checked,
+            autoRetryErrorDetail: $('#auto-retry-error').checked,
             bgModes: selectedModes.length ? selectedModes : ['liked'],
         });
         status('连接、授权与每日后台设置已保存。');
@@ -1493,6 +1845,7 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         syncFormFields();
         render();
         status('页面已切换，请重新读取作品。');
+        checkAutoRetryDetailPage().catch(() => {});
     }, 700);
     GM_registerMenuCommand('打开小红书 NAS 下载工作台', () => {
         ensureMounted();
@@ -1500,5 +1853,6 @@ progress{width:100%;height:5px;accent-color:#e94465}a{color:#ce3859;text-decorat
         render();
     });
     render();
+    checkAutoRetryDetailPage().catch(() => {});
     });
 })();

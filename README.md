@@ -1,43 +1,134 @@
 # NAS Download v4
 
-五个平台的新下载与媒体归档中心：Telegram、小红书、X、Pixiv、抖音。
+面向自托管 NAS 的五平台自动化下载与媒体归档中心，统一管理 **Telegram**、**小红书**、**X**、**Pixiv** 与 **抖音** 的增量采集、浏览器直推、去重对账、工作区转码与媒体预览。
 
-v4 重写了网页、调度、持久任务与媒体处理。平台下载能力通过独立适配器复用现有实现和固定上游版本，包括修复版 F2 和小红书下载器。
+v4 采用五容器解耦架构，将控制台与调度状态集中在核心服务，并与固定上游版本的平台下载引擎及独立媒体转码工作区隔离：
 
-## 日常使用
+| 服务 | 镜像文件 | 主要职责 |
+|---|---|---|
+| `console` | [containers/console.Dockerfile](containers/console.Dockerfile) | 唯一 Web 控制台与 REST API（端口 `14001`）、SQLite WAL 状态与历史记录、定时调度、浏览器推送校验、`Pillow` WEBP 缩略图缓存、上游版本巡检与 Bark 告警 |
+| `engines` | [containers/engines.Dockerfile](containers/engines.Dockerfile) | 执行 X / Pixiv / 抖音平台任务与 X 浏览器直推清单下载；独立子进程执行与分钟上限控制 |
+| `xhs` | [containers/xhs.Dockerfile](containers/xhs.Dockerfile) | 隔离运行固定版 XHS-Downloader，并承接小红书链接入队与浏览器直推清单下载（`direct`） |
+| `telegram-worker` | [containers/telegram.Dockerfile](containers/telegram.Dockerfile) | 长期在线维护 Telethon 连接、同步持久化下载历史与交付恢复（仅通过内部网络通信） |
+| `media` | [containers/media.Dockerfile](containers/media.Dockerfile) | 工作区文件转码、完整性校验与原子入库（Intel N95 核显 `hevc_qsv`、PNG→JPEG 质量 95、防膨胀） |
 
-- 总览：五个平台/执行服务、最近成功同步或下载时间、任务数量、最近任务、上游版本；失败任务区分全部失败、部分失败和无下载统计的执行失败。
-- 下载：链接、增量同步、任务进度、取消/重试；Telegram 下载控制与分页历史。
-- 工作区：新文件的转换、校验、入库结果、重试和删除；没有暂停操作。
-- 媒体记录：每份来源内容的下载结果、归档文件和预览，独立于采集边界。
-- 错误列表：统一收录五个平台尚未解决的下载错误，可按平台和链接/原因筛选。X 仍仅收录首次失败后重试 3 轮仍失败的推文，并停止自动重试；其他平台沿用原重试策略。隐藏只移除列表条目，保留记录与文件；其他平台恢复后再次失败会重新出现。Telegram 通过持久下载历史增量同步失败、重试和恢复，不扫描媒体文件。
-- 平台与设置：五个平台配置、工作区开关、分钟上限、同步周期、可选密码登录。
-- 日志：默认最近 30 行，全部日志可分页/导出。
-- Bark：通用设置中配置 `https://api.day.app/密钥/`，地址单独保存到核心状态目录的私有 `bark.json`（不回显、不提交仓库）。每 5 分钟检查异常，持续 10 分钟才通知；滚动 24 小时最多 1 条，同类故障至少间隔 72 小时。合并新增未处理错误、连续 3 次执行未完成、服务心跳/Telegram 凭证异常与磁盘不足（剩余低于 5 GiB 且低于 5%）。启用前已有错误不补发；成功与恢复不单独推送。通知只含平台、数量和服务/空间状态，不含作品、文件名、路径或凭证。使用 [Bark 官方接口](https://github.com/Finb/Bark#parameters)的 passive 静默级别，独立于网页刷新运行；隔离预览禁止推送。
+---
 
-Telegram/小红书默认经过工作区，其他平台可开启。视频使用 N95 核显 HEVC，PNG 转 JPEG 质量 95；不改变分辨率。候选不更小、透明/动画 PNG 保留原件。转换自动重试一次，仍失败则归档有效原件；封装损坏的原视频保留并标记失败。
+## 控制台功能总览
 
-工作区不可用时 bypass。仅在归档文件和持久记录确认后删除工作区原件。重启、接口确认丢失均有交付/入库恢复记录。
+Web 界面划分为八个功能页，支持可选控制台密码登录：
 
-X/Pixiv/抖音首次同步也正常处理内容，连续已下载达到阈值、触达来源边界或真实末页时结束；默认停止数为 10/20/50，网页可调整。另有分钟上限兜底，超限不标记成功。历史媒体不扫描、不转换。Telegram 自动保持在线，限速使用一个开关；工作区显示累计节省空间。
+- **总览**：查看各执行服务心跳、最近成功同步时间、任务数量、最近任务摘要，以及固定上游依赖的更新检测状态。
+- **浏览器推送**：查看并轮换浏览器推送授权 `X-NAS-Submit-Token`，统计 X / 小红书浏览器端推送记录与 X 基线库存量。
+- **下载**：手动投放下载链接、触发增量同步、查看任务进度与取消/重试，以及管理 Telegram 下载控制、速率限制（`limit_enabled` / `limit_mb`）与分页历史。
+- **工作区**：管理经工作区的待处理/失败转码文件并统计累计节省空间（`saved_bytes_total`）。
+  - 视频优先使用 `hevc_qsv` 转码，PNG 在实际可缩小且非透明/非动画时转为 `quality=95` 的 JPEG；不符合更小体积要求时自动保留原件。
+  - 媒体服务不可用时支持自动旁路（bypass）并在恢复后核对交付与入库收据。
+- **媒体记录**：按内容聚合展示已归档记录与全部文件。
+  - 支持 **瀑布流 / 列表双视图切换**（默认瀑布流，偏好持久化在浏览器 `localStorage`）。
+  - 图片自动请求服务端缓存接口 `GET /api/records/{platform}/{identifier}/thumb`（由 `Pillow` 生成 WEBP 缩略图并按文件 mtime/体积缓存于 `/state/core/thumbs`），视频使用 `<video preload="metadata">` 预览，多文件条目显示 `P` 角标。
+- **错误列表**：统一汇总五个平台尚未解决的下载失败项，支持按平台、链接或原因过滤及隐藏条目（隐藏仅移除列表显示，保留已下载文件与原始数据库记录）。
+- **平台与设置**：配置五平台凭证/保存目录、工作区开关、同步间隔（小时）、单次最大运行时长（分钟）、可选控制台登录密码以及 **Bark 静默告警**。
+  - Bark 推送地址 `https://api.day.app/密钥/` 单独保存在核心状态目录的私有 `bark.json`（接口不回显、不入库）。每 5 分钟检查一次异常，故障持续超过 10 分钟才以 `passive` 级别发出摘要；滚动 24 小时最多 1 条、同类问题间隔至少 72 小时，内容仅包含平台/数量与服务或磁盘健康状态，不泄露标题、链接、路径或凭证。
+- **日志**：实时查看系统运行日志（默认展示最近配置行数，支持完整日志分页与导出）。
 
-## 部署
+---
 
-Instagram 集成已按用户要求移除：网页和配置不再提供入口，旧任务无法重试或领取，旧调度设置在升级时忽略并取消未结束任务；新编排不再挂载其凭证或媒体目录，下载适配器已删除。已有下载文件和数据库历史保留，[旧使用说明](docs/INSTAGRAM.md)仅供查阅。升级时先验证新镜像，再停止并删除旧容器、清理旧版本镜像，最后启动新实例；配置、状态与媒体目录保留。
+## 浏览器直推、增量对账与错误重下
 
-新部署编排为 [compose.v4.yml](compose.v4.yml)，五个服务镜像。NAS 仅发布控制台 14001，Telegram/XHS 使用内部接口。运行数据放在 NAS 私有目录，凭证与 session 不提交到仓库。
+针对高风控站点（**X** 与 **小红书**），推荐使用配套 Tampermonkey 油猴脚本在已登录浏览器内完成列表核对与媒体提取，尽量减少或避免服务器端依赖 Cookie：
 
-发布标签 `v4.0.14` 对应五个 GHCR 镜像，`compose.v4.yml` 默认使用该版本；可通过 `NAS_DOWNLOAD_VERSION` 指定版本。新部署使用 [.env.v4.example](.env.v4.example)；已有部署在私有 `.env` 中设置 `NAS_DOWNLOAD_VERSION=v4.0.14`，保留原内部令牌。拉取后使用 `docker compose -f compose.v4.yml up -d --no-build` 启动。现有 NAS 切换步骤与回退限制见 [V4_MIGRATION.md](docs/V4_MIGRATION.md)，先备份并停止旧实例再接管正式数据。
+### 1. X（零 Cookie 优先 · Quote 方案 A）
+- **实时增量对账与流式直推**：浏览 `/i/history/likes` 或个人点赞页时，油猴脚本拦截 GraphQL 响应直接解析无水印原图（`pbs.twimg.com`）与最高码率 MP4（`video.twimg.com`），并发起 `POST /api/x/reconcile` 按 `tweet_id` 与 NAS 归档及基线库对账，达到连续已归档早停阈值时自动终止加载，同时通过 `POST /api/x/direct` 流式推送缺失媒体（支持外贴推文与引用推文 Quote 双重归档）。
+- **离线与浏览历史基线导入**：
+  - 浏览器端可在工作台执行「已捕获导入基线」或「边滚边导基线（不下载）」，调用 `POST /api/x/baseline` 将已收录推文 ID 写入 `x_download_baseline` 表。
+  - 服务器端可通过离线脚本 [tools/import_x_baseline.py](tools/import_x_baseline.py) 扫描本地已归档媒体目录及旧版历史库（默认仅依据实际媒体文件名/元数据按需导入，零 Cookie、零外网请求）。
+- **旧版 Cookie 入口隔离与防误触**：控制台发起 X 重试或全量操作时会弹出二次确认，默认推荐使用「仅重试直推记录（免 Cookie）」（`direct_only`），防止误触发旧版 Cookie 无头浏览器链路。
 
-v4.0.6 修复 X 已配置收藏页地址时仍强制解析用户名、工作区空目录被清理后图片写入失败的问题。页面无媒体卡片时使用 gallery-dl 补救，单条页面异常不会中断后续链接；同一次同步对同一推文最多尝试一次。已有失败记录沿用原尝试次数，超过重试上限的记录直接进入错误列表。下载器固定为 yt-dlp `2026.10.26` 与 gallery-dl `1.32.19`，镜像构建会核对实际安装版本。
+### 2. 小红书（作品 ID 对账 · 详情抓图直推 · 过期链接自动刷新）
+- **增量对账与保鲜入队**：[tools/userscripts/xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) 读取点赞与收藏列表，通过 `POST /api/xhs/reconcile` 按 24 位作品 ID 核对状态（`archived` / `pending` / `deferred` / `failed` / `missing`），流式提交缺失作品携带完整 `xsec_token` 的链接至 `POST /api/xhs/links`，支持分类保存与单个作品独立保存（`destination: "single"`）。
+- **详情抓图直推（方式 A）**：当服务端解析遇到 `xsec_token` 过期或网页限制时，可在小红书作品详情页通过 API Hook / 页面数据直接提取官方 CDN 媒体直链（`xhscdn.com` / `xhscdn.net` / `xiaohongshu.com`，后端 [core/xhs_direct.py](core/xhs_direct.py) 执行严格域名白名单、HTTPS 443 端口校验与防 SSRF 重定向检查）并提交至 `POST /api/xhs/direct` 下载归档。
+- **后台自动刷新过期 `xsec_token`**：每日后台脚本启动扫描前会自动查询 `GET /api/browser-push/errors?platform=xhs`；在列表流中重新遇到处于 `failed` / `deferred` / 暂缓状态的作品时，自动携带新鲜 `xsec_token` 与 `force_retry: true` 重新提交 NAS 入队解锁。
 
-- [需求约定](docs/REBUILD_CONTRACT.md)
-- [架构与数据流程](docs/V4_ARCHITECTURE.md)
-- [v3 → v4 切换](docs/V4_MIGRATION.md)
-- [NAS 验证记录](docs/V4_VALIDATION.md)
+### 3. 统一失败列表联动与重下闭环
+- X 与小红书油猴工作台均内置「NAS 失败重试」区块，通过 `GET /api/browser-push/errors` 拉取当前未解决失败记录。
+- 后台定时运行会在扫流期间顺带重推或刷新命中错误列表的作品；用户也可在油猴工作台逐条点开失败记录页面，脚本在详情页自动提取高清直链并直推 NAS 治愈错误，或经 `POST /api/browser-push/errors/dismiss` 在列表侧隐藏无需再试的条目。
 
-v3 原部署文件与旧平台源码仍保留，用于固定依赖和回退；v4 网页不再提供旧完整设置页。
+---
 
-### 小红书浏览器工作台
+## 油猴脚本一览
 
-[油猴脚本安装与使用说明](docs/XHS_BROWSER_WORKBENCH.md)：左侧工作台和每日后台脚本按作品 ID 向 NAS 核对，补下载缺失作品，并保留可配置的点赞、收藏和单个作品目录。
+全部脚本位于 [tools/userscripts/](tools/userscripts)，需配合 Tampermonkey（建议支持 `@crontab` 与 `GM_openInTab` 的桌面版浏览器）使用：
+
+| 脚本文件 | 当前版本 | 用途与主要能力 |
+|---|---|---|
+| [x-nas-queue.user.js](tools/userscripts/x-nas-queue.user.js) | `1.3.0` | X 浏览器直推工作台：GraphQL 直链拦截、Quote 方案 A 归档、实时 `tweet_id` 对账与早停、基线导入、NAS 失败列表同步与详情自动重推 |
+| [x-nas-bg.user.js](tools/userscripts/x-nas-bg.user.js) | `1.1.0` | X 每日一次后台自动采集调度脚本（`@crontab * * once * *`）：自动打开点赞页增量推流、轮询 NAS 入队与错误回执 |
+| [xhs-docker-queue.user.js](tools/userscripts/xhs-docker-queue.user.js) | `3.6.0` | 小红书 NAS 下载工作台：点赞/收藏增量对账、单条 `single` 发送、过期链接自动刷新、详情抓图直推（方式 A）与 NAS 失败重试联动 |
+| [xhs-nas-bg.user.js](tools/userscripts/xhs-nas-bg.user.js) | `1.1.0` | 小红书每日一次后台自动采集调度脚本（`@crontab * * once * *`）：按配置分类依次巡检点赞与收藏并上报结果 |
+
+详细使用说明另见 [小红书浏览器工作台文档](docs/XHS_BROWSER_WORKBENCH.md)。
+
+---
+
+## 部署、构建与升级
+
+### 目录与环境准备
+1. 编排文件为 [compose.v4.yml](compose.v4.yml)，仅向外发布控制台端口 `14001`。运行配置、凭证、Cookie、session、SQLite 状态库与媒体目录全部留在宿主 NAS 私有路径，不提交至仓库。
+2. 参考 [.env.v4.example](.env.v4.example) 创建私有 `.env`，设置 `INTERNAL_API_TOKEN`、`NAS_DOWNLOAD_ROOT`、`NAS_WORKSPACE_HOST`、`NAS_DOWNLOAD_PORT`、`NAS_DOWNLOAD_VERSION` 与 `NAS_SCHEDULER` 等变量。
+3. 全新切换 v4 时以 root 执行一次 [scripts/prepare-v4.sh](scripts/prepare-v4.sh) 初始化 `v4/core`、`v4/execution` 与工作区目录。
+
+### 启动与源码重建
+- **拉取发布镜像运行**：
+  ```sh
+  docker compose -f compose.v4.yml pull
+  docker compose -f compose.v4.yml up -d --no-build
+  ```
+- **基于当前源码重建测试（开发分支必做）**：
+  ```sh
+  docker compose -f compose.v4.yml up -d --build
+  ```
+  > 提示：本次更新在控制台新增了 `Pillow==13.0.0` 缩略图依赖与前端瀑布流视图，在小红书服务新增了 `run_direct` 直推执行逻辑；从源码测试务必重新构建 `console` 与 `xhs` 镜像（建议连同 `engines` 一起重建）。
+
+### 核心固定依赖与兼容说明
+- 核心与下载引擎固定版本：`Pillow 13.0.0`、`pillow-heif 1.8.1`、`yt-dlp 2026.10.26`、`gallery-dl 1.32.19`，以及固定版本 F2 与 XHS-Downloader（来源信息见 [PROVENANCE.md](PROVENANCE.md)）。
+- **Instagram 已于 v4 移除**：不再提供网页配置入口、采集适配器或媒体目录挂载；升级时会自动忽略旧定时配置，已有历史文件与数据库记录保留只读历史。
+
+---
+
+## 相关文档
+
+- [v4 架构与数据流程](docs/V4_ARCHITECTURE.md)
+- [v3 → v4 升级与迁移指南](docs/V4_MIGRATION.md)
+- [小红书浏览器工作台使用说明](docs/XHS_BROWSER_WORKBENCH.md)
+- [上游来源与固定修订说明](PROVENANCE.md)
+
+---
+
+## 本地验证与测试
+
+在提交或打包前可执行以下验证命令：
+
+```sh
+# 1. Python 语法与单元测试
+python -m compileall -q core workers _common _src tools services/telegram/app
+python -m pytest tests -q
+python -m unittest test_integration.py
+
+# 2. 需完整集成依赖（含 pixivpy3 / PyYAML）时补充运行
+python -m unittest test_integrated.py
+
+# 3. 油猴脚本语法与核心逻辑测试
+node -c tools/userscripts/x-nas-queue.user.js
+node -c tools/userscripts/x-nas-bg.user.js
+node -c tools/userscripts/xhs-docker-queue.user.js
+node -c tools/userscripts/xhs-nas-bg.user.js
+node --test tests/test_xhs_userscript.cjs tests/test_x_userscript.cjs
+node --experimental-strip-types --test tests/test_task_outcome.mjs
+
+# 4. 前端构建校验
+cd frontend && npm ci && npm run build
+
+# 5. 可选：安装 Node playwright 与 chromium 后运行浏览器冒烟测试
+node tests/xhs_browser_smoke.cjs
+```
