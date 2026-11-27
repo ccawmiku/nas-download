@@ -9,11 +9,10 @@ from threading import Lock
 SOURCES = {
     "f2": {
         "repo": "Johnserf-Seed/f2",
-        "installed": "0.0.1.7 · 5828ea7",
+        "installed": "v0.0.1.8-pw3 · f6be8c0",
         "version": "0.0.1.7",
-        "baseline": "7dab3e2ffffaa2535834d28fca99dbc2e89fa9d3",
-        "fork": "ccawmiku/f2",
-        "fork_commit": "5828ea7edb52e8148cbd8dff2c778cf305152fc9",
+        "branch": "v0.0.1.8-pw3",
+        "baseline": "f6be8c0ffba9a127075bbeafe4838716650b6325",
     },
     "xhs": {
         "repo": "JoeanAmier/XHS-Downloader",
@@ -70,12 +69,21 @@ def check_one(key, spec, previous):
             else "current",
         )
         if spec.get("baseline"):
-            latest = github(spec["repo"] + "/commits?per_page=1")[0]["sha"]
+            commit_query = (
+                f"{spec['repo']}/commits?sha={spec['branch']}&per_page=1"
+                if spec.get("branch")
+                else f"{spec['repo']}/commits?per_page=1"
+            )
+            commits = github(commit_query)
+            latest = commits[0]["sha"] if commits else spec["baseline"]
             item["upstream_commit"] = latest[:7]
             branch_changed = latest != spec["baseline"]
             fork_changed = False
             if spec.get("fork"):
-                fork_latest = github(spec["fork"] + "/commits?per_page=1")[0]["sha"]
+                fork_commits = github(spec["fork"] + "/commits?per_page=1")
+                fork_latest = (
+                    fork_commits[0]["sha"] if fork_commits else spec["fork_commit"]
+                )
                 fork_changed = fork_latest != spec["fork_commit"]
                 item["fork_commit"] = fork_latest[:7]
             if branch_changed or fork_changed:

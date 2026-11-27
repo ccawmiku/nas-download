@@ -41,7 +41,7 @@ PNG 转 JPEG quality=95、subsampling=0，尺寸不变，保留 ICC/EXIF。实�
 
 ## 上游管理
 
-F2 固定使用 ccawmiku/f2 的 5828ea7；XHS 固定使用 JoeanAmier/XHS-Downloader（`master` 分支）的 e4fc8a6，继续隔离。核心通过适配器调用公开接口，并保留现有修复；不把上游源码变成核心的一部分。首页每 6 小时检查官方 release/分支以及修复分支 commit，展示候选，由人工评估和验证后升级。
+F2 固定使用 Johnserf-Seed/f2（`v0.0.1.8-pw3` 分支）的 f6be8c0；XHS 固定使用 JoeanAmier/XHS-Downloader（`master` 分支）的 e4fc8a6，继续隔离。核心通过适配器调用公开接口，并保留现有修复；不把上游源码变成核心的一部分。首页每 6 小时检查官方 release/分支以及修复分支 commit，展示候选，由人工评估和验证后升级。
 
 五个 v4 镜像分别构建。平台基础依赖目前由 v3.0.3 已发布镜像固定提供，后续可以迁出独立依赖构建，当前不会同时重写平台协议与签名实现。
 

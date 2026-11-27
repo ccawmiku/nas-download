@@ -962,6 +962,40 @@ def test_intake_allows_custom_platform_work_paths(client, monkeypatch, tmp_path)
     assert response.json().get("id")
 
 
+def test_upstream_baseline_tracking_works_without_fork(monkeypatch):
+    from core import updates
+
+    spec = updates.SOURCES["f2"]
+    assert "fork" not in spec
+    seen_paths = []
+
+    def fake_github(path):
+        seen_paths.append(path)
+        if path.endswith("/releases/latest"):
+            return {"tag_name": "0.0.1.7", "html_url": f"https://github.com/{spec['repo']}"}
+        return [{"sha": spec["baseline"]}]
+
+    monkeypatch.setattr(updates, "github", fake_github)
+    current = updates.check_one("f2", spec, {})
+    assert current["status"] == "current"
+    assert current["upstream_commit"] == spec["baseline"][:7]
+    assert current["note"] == "已与上游分支同步"
+    assert f"sha={spec['branch']}" in seen_paths[-1]
+
+    monkeypatch.setattr(
+        updates,
+        "github",
+        lambda path: (
+            {"tag_name": "0.0.1.7", "html_url": f"https://github.com/{spec['repo']}"}
+            if path.endswith("/releases/latest")
+            else [{"sha": "0" * 40}]
+        ),
+    )
+    changed = updates.check_one("f2", spec, {})
+    assert changed["status"] == "review"
+    assert changed["note"] == "上游分支有变化"
+
+
 def test_xhs_upstream_baseline_tracking_works_without_fork(monkeypatch):
     from core import updates
 
