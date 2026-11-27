@@ -1,4 +1,4 @@
-FROM node:22.14.0-bookworm-slim AS frontend-build
+FROM node:26.13.1-bookworm-slim AS frontend-build
 
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
