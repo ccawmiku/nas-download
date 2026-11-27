@@ -74,12 +74,16 @@ def check_one(key, spec, previous):
                 if spec.get("branch")
                 else f"{spec['repo']}/commits?per_page=1"
             )
-            latest = github(commit_query)[0]["sha"]
+            commits = github(commit_query)
+            latest = commits[0]["sha"] if commits else spec["baseline"]
             item["upstream_commit"] = latest[:7]
             branch_changed = latest != spec["baseline"]
             fork_changed = False
             if spec.get("fork"):
-                fork_latest = github(spec["fork"] + "/commits?per_page=1")[0]["sha"]
+                fork_commits = github(spec["fork"] + "/commits?per_page=1")
+                fork_latest = (
+                    fork_commits[0]["sha"] if fork_commits else spec["fork_commit"]
+                )
                 fork_changed = fork_latest != spec["fork_commit"]
                 item["fork_commit"] = fork_latest[:7]
             if branch_changed or fork_changed:
