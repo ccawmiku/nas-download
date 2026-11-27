@@ -1,5 +1,5 @@
 # Same tested Intel driver / QSV runtime as the NAS Jellyfin installation.
-FROM jellyfin/jellyfin:10.11.8
+FROM jellyfin/jellyfin:12.4.20261026-211555
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pil util-linux && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
