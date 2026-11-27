@@ -268,13 +268,16 @@ def test_f2_first_run_exact_files_partial_gallery_and_multiple_sources(
         async def close(self):
             pass
 
+    created_handlers = []
+
     class Handler:
         def __init__(self, kwargs):
             self.kwargs = kwargs
             self.downloader = Downloader()
+            created_handlers.append(self)
 
-        async def get_or_add_user_data(self, *a):
-            return root
+        async def get_or_add_user_data(self, kwargs, sec_id, db):
+            return None if sec_id == "ad-sec" else root
 
         async def pages(self, *a):
             pages = specs[self.kwargs["mode"]]
@@ -382,3 +385,153 @@ def test_f2_missing_or_new_files_do_not_count_as_already_downloaded(tmp_path):
         [(image, image, False, True), (missing, missing, False, True)]
     )
     assert not jobs.f2_already_downloaded([(image, image, False, False)])
+
+
+def test_f2_upstream_pw3_mode_registry_post_args_and_ad_profile(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "archive"
+    root.mkdir()
+    catalog = Catalog()
+    post_calls = []
+
+    class Downloader:
+        def __init__(self):
+            self.m3u8_kwargs = []
+
+        async def initiate_download(self, kind, payload, base, name, suffix):
+            (Path(base) / (name + suffix)).write_bytes(b"new")
+
+        initiate_static_download = initiate_download
+
+        async def initiate_m3u8_download(
+            self, kind, payload, base, name, suffix, **options
+        ):
+            self.m3u8_kwargs.append(options)
+            (Path(base) / (name + suffix)).write_bytes(b"live")
+
+        async def create_download_tasks(self, kwargs, item, base):
+            await self.initiate_download("image", "url", base, item["aweme_id"], ".webp")
+            if item["aweme_id"] == "p1":
+                await self.initiate_m3u8_download(
+                    "live", "m3u8", base, "live_p1", ".ts", stream_status_callback="cb"
+                )
+
+        async def close(self):
+            pass
+
+    created_handlers = []
+
+    class Handler:
+        def __init__(self, kwargs):
+            self.kwargs = kwargs
+            self.downloader = Downloader()
+            created_handlers.append(self)
+
+        async def fetch_user_profile(self, sec_id):
+            return None
+
+        async def get_or_add_user_data(self, kwargs, sec_id, db):
+            return None if sec_id == "ad-sec" else root
+
+        async def fetch_user_post_videos(
+            self, sec_id, min_cursor=0, max_cursor=0, page_counts=20, max_counts=None
+        ):
+            post_calls.append((sec_id, min_cursor, max_cursor, page_counts, max_counts))
+            yield SimpleNamespace(
+                _to_raw=lambda: {"status_code": 0, "has_more": False},
+                _to_list=lambda: [{"aweme_id": "p1"}],
+                has_more=False,
+            )
+
+        async def fetch_user_mix_videos(self):
+            yield SimpleNamespace(_to_list=lambda: [{"aweme_id": "m1"}])
+
+    class DB:
+        def __init__(self, *a):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+    async def mix_handler(handler):
+        async for page in handler.fetch_user_mix_videos():
+            await handler.downloader.create_download_tasks(
+                handler.kwargs, page._to_list(), root
+            )
+
+    monkeypatch.setitem(
+        sys.modules, "f2.apps.douyin.handler", SimpleNamespace(DouyinHandler=Handler)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "f2.utils.core.decorators",
+        SimpleNamespace(
+            get_mode_handlers=lambda module_name: (
+                {"mix": mix_handler}
+                if module_name == "f2.apps.douyin.handler"
+                else {}
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "f2.apps.douyin.utils",
+        SimpleNamespace(
+            SecUserIdFetcher=SimpleNamespace(
+                get_sec_user_id=AsyncMock(side_effect=["sec-1", "ad-sec", "sec-1"])
+            ),
+            AwemeIdFetcher=None,
+            ClientConfManager=SimpleNamespace(headers=lambda: {}),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules, "f2.apps.douyin.db", SimpleNamespace(AsyncUserDB=DB)
+    )
+    cfg = {
+        "f2_state_dir": str(tmp_path / "state"),
+        "fallback_stop_consecutive_skipped": 2,
+        "jobs": [
+            {"url": "https://www.douyin.com/user/sec-1", "mode": "post", "name": "posts"},
+            {"url": "https://www.douyin.com/user/ad-sec", "mode": "post", "name": "ad"},
+            {"url": "https://www.douyin.com/collection/123", "mode": "mix", "name": "mixes"},
+        ],
+    }
+    monkeypatch.setattr(
+        jobs,
+        "module",
+        lambda p: SimpleNamespace(
+            load_config=lambda p: cfg,
+            load_f2_runtime_conf=lambda: {},
+            build_douyin_job_payload=lambda cfg, spec: {
+                "path": str(root),
+                "page_counts": 20,
+                "max_counts": 0,
+                **spec,
+            },
+        ),
+    )
+    monkeypatch.setattr(jobs, "Client", lambda: catalog)
+    monkeypatch.setattr(jobs, "prepare", lambda p, path, *a: (path, False))
+    monkeypatch.setattr(
+        jobs,
+        "record",
+        lambda p, i, state, files, meta: catalog.records.update(
+            {i: {"state": state, "files": files, "metadata": meta}}
+        ),
+    )
+
+    result = asyncio.run(jobs.f2_job({"id": "task-sync", "kind": "sync", "payload": {}}))
+    assert post_calls == [("sec-1", 0, 0, 20, 0)]
+    assert result["downloaded"] == 2
+    assert (root / "p1.webp").exists() and (root / "live_p1.ts").exists()
+    assert (root / "m1.webp").exists()
+    assert created_handlers[0].downloader.m3u8_kwargs == [
+        {"stream_status_callback": "cb"}
+    ]
+
+    with pytest.raises(RuntimeError, match="Cookie"):
+        asyncio.run(jobs.f2_job({"id": "task-test", "kind": "test", "payload": {}}))
+
