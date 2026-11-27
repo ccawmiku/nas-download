@@ -772,7 +772,7 @@ async def f2_job(job):
         try:
             identifier = await SecUserIdFetcher.get_sec_user_id(kwargs["url"])
             profile = await handler.fetch_user_profile(identifier)
-            if profile.status_code != 0:
+            if profile is None or profile.status_code != 0:
                 raise RuntimeError("抖音来源或 Cookie 验证未通过")
             return {"message": "抖音来源与 Cookie 请求成功"}
         finally:
@@ -811,7 +811,9 @@ async def f2_job(job):
         ):
             original = getattr(handler.downloader, method_name)
 
-            async def tracked(kind, payload, base, name, suffix, _original=original):
+            async def tracked(
+                kind, payload, base, name, suffix, *args, _original=original, **options
+            ):
                 final = Path(base).resolve() / (name + (suffix or ""))
                 if final.is_file() and final.stat().st_size:
                     captured.append((final, final, False, True))
@@ -822,7 +824,13 @@ async def f2_job(job):
                 staged.parent.mkdir(parents=True, exist_ok=True)
                 captured.append((staged, final, enabled, False))
                 await _original(
-                    kind, payload, staged.parent, staged.stem, staged.suffix
+                    kind,
+                    payload,
+                    staged.parent,
+                    staged.stem,
+                    staged.suffix,
+                    *args,
+                    **options,
                 )
 
             setattr(handler.downloader, method_name, tracked)
@@ -888,12 +896,21 @@ async def f2_job(job):
                     root = await handler.get_or_add_user_data(
                         kwargs, data.sec_user_id, database
                     )
+                if root is None:
+                    stats["skipped"] += 1
+                    print(json.dumps(stats), flush=True)
+                    continue
                 await download_item(data._to_dict(), root)
                 continue
             if mode not in {"like", "collection", "post"}:
-                # Retain the fork's dispatch for mixes/collections/music/live;
+                # Retain upstream dispatch for mixes/collects/music/live;
                 # stop batched modes at the same per-work boundary.
-                from f2.apps.douyin.handler import mode_function_map
+                douyin_handler_module = sys.modules["f2.apps.douyin.handler"]
+                mode_handlers = getattr(douyin_handler_module, "mode_function_map", None)
+                if mode_handlers is None:
+                    from f2.utils.core.decorators import get_mode_handlers
+
+                    mode_handlers = get_mode_handlers("f2.apps.douyin.handler")
 
                 groups, stop_page = {}, False
                 # Each upstream generator stops its own source; an enclosing
@@ -957,7 +974,7 @@ async def f2_job(job):
                             return
 
                 handler.downloader.create_download_tasks = dispatch_items
-                await mode_function_map[mode](handler)
+                await mode_handlers[mode](handler)
                 outcomes = [outcome for guard, outcome in groups.values() if outcome]
                 stats.setdefault("sources", []).extend(outcomes)
                 if outcomes:
@@ -977,6 +994,8 @@ async def f2_job(job):
             sec_id = await SecUserIdFetcher.get_sec_user_id(kwargs["url"])
             async with AsyncUserDB("douyin_users.db") as database:
                 root = await handler.get_or_add_user_data(kwargs, sec_id, database)
+            if root is None:
+                continue
             if mode == "like":
                 pages = handler.fetch_user_like_videos(
                     sec_id, 0, kwargs["page_counts"], kwargs["max_counts"]
@@ -987,7 +1006,7 @@ async def f2_job(job):
                 )
             else:
                 pages = handler.fetch_user_post_videos(
-                    sec_id, 0, kwargs["page_counts"], kwargs["max_counts"]
+                    sec_id, 0, 0, kwargs["page_counts"], kwargs["max_counts"]
                 )
             head, bounded, reason, last_id = "", False, "end", ""
             guard = KnownRun(threshold("douyin", config))
