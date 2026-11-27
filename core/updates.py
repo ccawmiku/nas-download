@@ -17,11 +17,9 @@ SOURCES = {
     },
     "xhs": {
         "repo": "JoeanAmier/XHS-Downloader",
-        "installed": "2.8-nas.2",
+        "installed": "master · e4fc8a6",
         "version": "2.8",
-        "baseline": "3261312721f0b37c705ba6515885bc7f34349f2f",
-        "fork": "ccawmiku/XHS-Downloader",
-        "fork_commit": "5336169fe5d2f3a6dcb171309a14d273b917286d",
+        "baseline": "e4fc8a61630bbe59c5002e1461302ff90eb1172b",
     },
     "yt-dlp": {
         "repo": "yt-dlp/yt-dlp",
@@ -75,9 +73,11 @@ def check_one(key, spec, previous):
             latest = github(spec["repo"] + "/commits?per_page=1")[0]["sha"]
             item["upstream_commit"] = latest[:7]
             branch_changed = latest != spec["baseline"]
-            fork_latest = github(spec["fork"] + "/commits?per_page=1")[0]["sha"]
-            fork_changed = fork_latest != spec["fork_commit"]
-            item["fork_commit"] = fork_latest[:7]
+            fork_changed = False
+            if spec.get("fork"):
+                fork_latest = github(spec["fork"] + "/commits?per_page=1")[0]["sha"]
+                fork_changed = fork_latest != spec["fork_commit"]
+                item["fork_commit"] = fork_latest[:7]
             if branch_changed or fork_changed:
                 item["status"] = "review"
             parts = []
@@ -85,8 +85,12 @@ def check_one(key, spec, previous):
                 parts.append("上游分支有变化")
             if fork_changed:
                 parts.append("修复分支有变化")
-            parts.append("升级时保留现有修复补丁")
-            item["note"] = " · ".join(parts)
+            if spec.get("fork"):
+                parts.append("升级时保留现有修复补丁")
+            elif not branch_changed:
+                parts.append("已与上游分支同步")
+            if parts:
+                item["note"] = " · ".join(parts)
     except Exception as error:
         old = next(
             (entry for entry in previous.get("items", []) if entry["key"] == key), {}

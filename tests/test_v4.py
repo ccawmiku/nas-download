@@ -961,3 +961,37 @@ def test_intake_allows_custom_platform_work_paths(client, monkeypatch, tmp_path)
     assert response.status_code == 200
     assert response.json().get("id")
 
+
+def test_xhs_upstream_baseline_tracking_works_without_fork(monkeypatch):
+    from core import updates
+
+    spec = updates.SOURCES["xhs"]
+    assert "fork" not in spec
+    monkeypatch.setattr(
+        updates,
+        "github",
+        lambda path: (
+            {"tag_name": "2.8", "html_url": f"https://github.com/{spec['repo']}"}
+            if path.endswith("/releases/latest")
+            else [{"sha": spec["baseline"]}]
+        ),
+    )
+    current = updates.check_one("xhs", spec, {})
+    assert current["status"] == "current"
+    assert current["upstream_commit"] == spec["baseline"][:7]
+    assert current["note"] == "已与上游分支同步"
+
+    monkeypatch.setattr(
+        updates,
+        "github",
+        lambda path: (
+            {"tag_name": "2.8", "html_url": f"https://github.com/{spec['repo']}"}
+            if path.endswith("/releases/latest")
+            else [{"sha": "0" * 40}]
+        ),
+    )
+    changed = updates.check_one("xhs", spec, {})
+    assert changed["status"] == "review"
+    assert changed["note"] == "上游分支有变化"
+
+
