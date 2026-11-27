@@ -961,3 +961,20 @@ def test_intake_allows_custom_platform_work_paths(client, monkeypatch, tmp_path)
     assert response.status_code == 200
     assert response.json().get("id")
 
+
+def test_ytdlp_and_gallery_dl_versions_match_pinned_updates(monkeypatch):
+    from core import updates
+
+    for key, tag in (("yt-dlp", "2026.11.23"), ("gallery-dl", "v1.32.21")):
+        spec = updates.SOURCES[key]
+        monkeypatch.setattr(
+            updates,
+            "github",
+            lambda path, tag=tag, spec=spec: {
+                "tag_name": tag,
+                "html_url": f"https://github.com/{spec['repo']}/releases/tag/{tag}",
+            },
+        )
+        assert updates.check_one(key, spec, {})["status"] == "current"
+
+
