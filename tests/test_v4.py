@@ -1029,3 +1029,27 @@ def test_xhs_upstream_baseline_tracking_works_without_fork(monkeypatch):
     assert changed["note"] == "上游分支有变化"
 
 
+def test_ytdlp_and_gallery_dl_versions_match_pinned_updates(monkeypatch):
+    from core import updates
+
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "_integrated" / "requirements.txt").read_text(encoding="utf-8")
+    engines_dockerfile = (root / "containers" / "engines.Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    for key, tag in (("yt-dlp", "2026.11.23"), ("gallery-dl", "v1.32.21")):
+        spec = updates.SOURCES[key]
+        pinned = f"{key}=={spec['version']}"
+        assert pinned in requirements
+        assert pinned in engines_dockerfile
+        monkeypatch.setattr(
+            updates,
+            "github",
+            lambda path, tag=tag, spec=spec: {
+                "tag_name": tag,
+                "html_url": f"https://github.com/{spec['repo']}/releases/tag/{tag}",
+            },
+        )
+        assert updates.check_one(key, spec, {})["status"] == "current"
+
+

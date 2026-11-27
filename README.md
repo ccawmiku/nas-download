@@ -100,7 +100,7 @@ Web 界面划分为八个功能页，支持可选控制台密码登录：
   首次全量从源码构建启动全部服务可执行 `docker compose -f compose.v4.yml up -d --build`。
 
 ### 核心固定依赖与兼容说明
-- 核心与下载引擎固定版本：`Pillow 13.0.0`、`pillow-heif 1.8.1`、`yt-dlp 2026.10.26`、`gallery-dl 1.32.19`，以及固定版本 F2（`Johnserf-Seed/f2` `v0.0.1.8-pw3`）与 XHS-Downloader（`JoeanAmier/XHS-Downloader` `master`）（来源信息见 [PROVENANCE.md](PROVENANCE.md)）。
+- 核心与下载引擎固定版本：`Pillow 13.0.0`、`pillow-heif 1.8.1`、`yt-dlp 2026.11.23`、`gallery-dl 1.32.21`，以及固定版本 F2（`Johnserf-Seed/f2` `v0.0.1.8-pw3`）与 XHS-Downloader（`JoeanAmier/XHS-Downloader` `master`）（来源信息见 [PROVENANCE.md](PROVENANCE.md)）。
 - **Instagram 已于 v4 移除**：不再提供网页配置入口、采集适配器或媒体目录挂载；升级时会自动忽略旧定时配置，已有历史文件与数据库记录保留只读历史。
 
 ---

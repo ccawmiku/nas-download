@@ -5,7 +5,7 @@ USER root
 RUN pip uninstall -y f2 \
     && pip install --no-cache-dir \
         "f2 @ git+https://github.com/Johnserf-Seed/f2.git@f6be8c0ffba9a127075bbeafe4838716650b6325" \
-        Pillow==13.0.0 gallery-dl==1.32.19 yt-dlp==2026.10.26 pillow-heif==1.8.1
+        Pillow==13.0.0 gallery-dl==1.32.21 yt-dlp==2026.11.23 pillow-heif==1.8.1
 WORKDIR /opt/nas-auto
 COPY core/ ./core/
 COPY workers/ ./workers/

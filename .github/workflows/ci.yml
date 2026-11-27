@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: python -m pip install -r _integrated/requirements.txt -r core/requirements.txt Pillow pytest PyYAML gallery-dl==1.32.19 pillow-heif==1.8.1
+      - run: python -m pip install -r _integrated/requirements.txt -r core/requirements.txt Pillow pytest PyYAML pillow-heif==1.8.1
       - run: python -m playwright install --with-deps chromium
       - run: python -m compileall -q core workers _common _src tools services/telegram/app
       - run: python -m pytest tests -q
@@ -53,7 +53,7 @@ jobs:
             context: .
             file: containers/engines.Dockerfile
             executable: python
-            smoke: "import workers.platform_job, gallery_dl, yt_dlp, f2, pillow_heif; from f2.apps.douyin.utils import GatewayHeaderManager; from f2.utils.core.decorators import get_mode_handlers; from gallery_dl import version; from yt_dlp.version import __version__; assert version.__version__ == '1.32.19'; assert __version__ == '2026.10.26'; from PIL import __version__ as pillow_version; assert pillow_version == '13.0.0'"
+            smoke: "import workers.platform_job, gallery_dl, yt_dlp, f2, pillow_heif; from f2.apps.douyin.utils import GatewayHeaderManager; from f2.utils.core.decorators import get_mode_handlers; from gallery_dl import version; from yt_dlp.version import __version__; assert version.__version__ == '1.32.21'; assert __version__ == '2026.11.23'; from PIL import __version__ as pillow_version; assert pillow_version == '13.0.0'"
           - image: telegram
             context: .
             file: containers/telegram.Dockerfile
