@@ -16,11 +16,9 @@ SOURCES = {
     },
     "xhs": {
         "repo": "JoeanAmier/XHS-Downloader",
-        "installed": "2.8-nas.2",
+        "installed": "master · e4fc8a6",
         "version": "2.8",
-        "baseline": "3261312721f0b37c705ba6515885bc7f34349f2f",
-        "fork": "ccawmiku/XHS-Downloader",
-        "fork_commit": "5336169fe5d2f3a6dcb171309a14d273b917286d",
+        "baseline": "e4fc8a61630bbe59c5002e1461302ff90eb1172b",
     },
     "yt-dlp": {
         "repo": "yt-dlp/yt-dlp",
